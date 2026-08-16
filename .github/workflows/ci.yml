@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# Third-party actions are pinned to a commit rather than a tag. A tag is a
+# mutable pointer, and these workflows check out the source that becomes the
+# binaries people install with sudo: a moved tag would be arbitrary code
+# execution in a job holding a release token. The tag stays in a trailing
+# comment because a bare SHA is unreadable, and Dependabot updates both
+# together (see .github/dependabot.yml).
+
 jobs:
   test:
     # Both platforms, because clipd's code is genuinely split by build tag:
@@ -17,21 +24,27 @@ jobs:
     # do not even compile into a Linux build. Testing on Linux alone would
     # leave the macOS half unverified; testing on macOS alone would not prove
     # the client still builds for the machine it actually runs on.
+    #
+    # Both Go versions, because the two answer different questions. The floor
+    # declared in go.mod is a promise to anyone running `go install`, and it
+    # only stays true if something keeps compiling against it. `stable` is what
+    # releases are built with, and it is where a new vet check or a behaviour
+    # change shows up first.
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        go: ["1.24", "stable"]
 
     runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          # Read the version from go.mod rather than pinning it here, so there
-          # is one place to bump it.
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
 
       - name: Check formatting
         run: |
@@ -57,17 +70,41 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+  vulncheck:
+    # clipd has no third-party dependencies, so this is entirely about the
+    # standard library it is linked against — crypto/tls above all. A daemon
+    # that terminates TLS on the LAN should not be shipped against a stdlib
+    # with a known hole in it, and "we would have noticed" is not a control.
+    #
+    # Run via `go run` rather than added to go.mod, so the module itself stays
+    # dependency-free.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   cross-compile:
     # A separate job so a broken build for one target is reported as its own
     # failure rather than hiding behind the test results.
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: go.mod
+          # Releases are built with the current toolchain, so the build that
+          # gates them should use it too.
+          go-version: stable
 
       - name: Build every release target
         run: make dist

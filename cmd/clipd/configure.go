@@ -24,7 +24,7 @@ func cmdConfigure(_ context.Context, e *env, g *globalOptions, args []string) in
 	token := flags.String("token", "", `authentication token, or "-" to read it from stdin`)
 	fingerprint := flags.String("fingerprint", "", "server key fingerprint, as printed by `clipd setup`")
 	maxPayload := flags.String("max-payload", "", "maximum payload to send, e.g. 10MB")
-	if code, ok := parseFlags(flags, e, args); !ok {
+	if code, ok := flags.parse(args); !ok {
 		return code
 	}
 
@@ -63,6 +63,11 @@ func cmdConfigure(_ context.Context, e *env, g *globalOptions, args []string) in
 	if *token != "" {
 		value := *token
 		if value == "-" {
+			// On a terminal, say what is being waited for: a command that
+			// silently blocks on a read looks like one that has hung.
+			if !e.stdinIsPipe {
+				fmt.Fprint(e.stdout, "Authentication token (from 'clipd setup' on the Mac): ")
+			}
 			line, err := readLine(e)
 			if err != nil {
 				return failf(e, exitConfig, "read token from stdin: %v", err)

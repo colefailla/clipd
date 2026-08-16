@@ -24,7 +24,7 @@ func cmdSetup(_ context.Context, e *env, g *globalOptions, args []string) int {
 	maxPayload := flags.String("max-payload", "", "maximum accepted payload, e.g. 10MB")
 	rotate := flags.Bool("rotate", false, "generate a new token, invalidating the current one")
 	rotateCert := flags.Bool("rotate-cert", false, "generate a new TLS keypair; every client must be reconfigured")
-	if code, ok := parseFlags(flags, e, args); !ok {
+	if code, ok := flags.parse(args); !ok {
 		return code
 	}
 
@@ -117,8 +117,15 @@ func cmdSetup(_ context.Context, e *env, g *globalOptions, args []string) int {
 	fmt.Fprintf(out, "  1. On this Mac:  clipd install\n")
 	fmt.Fprintf(out, "  2. On the client machine:\n\n")
 	fmt.Fprintf(out, "       clipd configure -server %s -port %d \\\n", suggestedServerAddress(), cfg.Port)
-	fmt.Fprintf(out, "         -token %s \\\n", cfg.Token)
-	fmt.Fprintf(out, "         -fingerprint %s\n\n", fingerprint)
+	fmt.Fprintf(out, "         -fingerprint %s \\\n", fingerprint)
+	fmt.Fprintf(out, "         -token -\n\n")
+	// The token is deliberately absent from the suggested command. A command
+	// line is not private: on Linux any local user can read another process's
+	// argv out of /proc, and the shell writes it to history besides. Reading
+	// the secret from stdin costs one paste and keeps it out of both.
+	fmt.Fprintf(out, "     and paste the token when it asks. Passing it as -token <value>\n")
+	fmt.Fprintf(out, "     instead would expose it: other local users can read a command\n")
+	fmt.Fprintf(out, "     line from ps, and the shell records it in history.\n\n")
 	fmt.Fprintf(out, "  3. Test it:  echo hello | clipd\n")
 
 	if certCreated && !*rotateCert {

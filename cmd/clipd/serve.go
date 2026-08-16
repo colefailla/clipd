@@ -23,7 +23,7 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	flags := newFlagSet(e, g, "serve", "Usage: clipd serve [options]")
 	bind := flags.String("bind", "", "listen address (default from config)")
 	port := flags.Int("port", 0, "listen port (default from config)")
-	if code, ok := parseFlags(flags, e, args); !ok {
+	if code, ok := flags.parse(args); !ok {
 		return code
 	}
 
@@ -73,12 +73,14 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	logger := slog.New(slog.NewTextHandler(e.stderr, &slog.HandlerOptions{Level: level}))
 
 	srv, err := server.New(server.Options{
-		Token:      cfg.Token,
-		TLS:        tlsConfig,
-		Clipboard:  clip,
-		MaxPayload: cfg.MaxPayloadBytes,
-		Timeout:    cfg.Timeout(),
-		Logger:     logger,
+		Token:         cfg.Token,
+		TLS:           tlsConfig,
+		Clipboard:     clip,
+		MaxPayload:    cfg.MaxPayloadBytes,
+		MaxMemory:     cfg.MemoryBudget(),
+		MaxConcurrent: cfg.Concurrency(),
+		Timeout:       cfg.Timeout(),
+		Logger:        logger,
 	})
 	if err != nil {
 		return fail(e, exitConfig, err)
@@ -101,7 +103,13 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		"version", version,
 		"listen", ln.Addr().String(),
 		"config", cfgPath,
-		"fingerprint", fingerprintOf(certPath))
+		"fingerprint", fingerprintOf(certPath),
+		// The resolved limits, not the configured ones: both have defaults
+		// that depend on other fields, so the effective value is the only one
+		// worth recording when diagnosing a busy daemon.
+		"max_payload_bytes", cfg.MaxPayloadBytes,
+		"memory_budget_bytes", cfg.MemoryBudget(),
+		"max_concurrent", cfg.Concurrency())
 	if cfg.BindAddress == "0.0.0.0" || cfg.BindAddress == "::" {
 		logger.Info("listening on all interfaces; clients connect to this Mac's LAN address",
 			"port", cfg.Port)

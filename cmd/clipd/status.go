@@ -21,7 +21,7 @@ import (
 // whether the configured server answers.
 func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int {
 	flags := newFlagSet(e, g, "status", "Usage: clipd status [options]")
-	if code, ok := parseFlags(flags, e, args); !ok {
+	if code, ok := flags.parse(args); !ok {
 		return code
 	}
 
@@ -36,7 +36,7 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 	fmt.Fprintf(out, "configuration\n")
 	if config.Exists(path) {
 		fmt.Fprintf(out, "  file         %s\n", path)
-		if warning := permissionWarning(path); warning != "" {
+		if warning := permissionWarning(path, "the token"); warning != "" {
 			fmt.Fprintf(out, "  warning      %s\n", warning)
 		}
 	} else {
@@ -49,7 +49,17 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 	if runtime.GOOS == "darwin" {
 		fmt.Fprintf(out, "\ndaemon (this machine)\n")
 		fmt.Fprintf(out, "  listen       %s\n", cfg.ListenAddress())
+		// Effective values: both fall back to defaults that depend on other
+		// settings, so printing what is stored would mislead more than help.
+		fmt.Fprintf(out, "  memory       %s across %d concurrent copies\n",
+			config.FormatSize(cfg.MemoryBudget()), cfg.Concurrency())
 		reportCertificate(out, cfg.CertPath(path))
+		// The private key is the daemon's identity: anyone holding it can
+		// impersonate this Mac to every client pinned to it, and unlike the
+		// token there is no way to notice that from the client side.
+		if warning := permissionWarning(cfg.KeyPath(path), "the daemon's private key"); warning != "" {
+			fmt.Fprintf(out, "  warning      %s\n", warning)
+		}
 		reportAgent(ctx, out)
 	}
 
@@ -195,15 +205,21 @@ func probeTCP(address string, timeout time.Duration) string {
 	return fmt.Sprintf("yes (%dms)", time.Since(start).Milliseconds())
 }
 
-// permissionWarning flags a config file readable by anyone but its owner,
-// since it holds the token in plaintext.
-func permissionWarning(path string) string {
+// permissionWarning flags a file readable by anyone but its owner.
+//
+// Both files it is used on are secrets that clipd creates 0600, so a loose
+// mode means something outside clipd changed it: a restore from backup, a cp
+// that did not preserve modes, an editor writing through a new inode. what
+// names the secret, because "permissions are 0644" is only alarming if the
+// reader knows what is in the file.
+func permissionWarning(path, what string) string {
 	info, err := os.Stat(path)
 	if err != nil {
 		return ""
 	}
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		return fmt.Sprintf("permissions are %04o; the token is world- or group-readable (chmod 600 %s)", mode, path)
+		return fmt.Sprintf("permissions are %04o; %s is readable by other users (chmod 600 %s)",
+			mode, what, path)
 	}
 	return ""
 }

@@ -486,3 +486,164 @@ func TestExists(t *testing.T) {
 		t.Error("Exists reported an existing file as missing")
 	}
 }
+
+func TestMemoryBudgetDerivation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		payload int64
+		memory  int64
+		want    int64
+	}{
+		{"unset uses the default", DefaultMaxPayloadBytes, 0, DefaultMaxMemoryBytes},
+		{"explicit value wins", DefaultMaxPayloadBytes, 128 << 20, 128 << 20},
+		// A payload limit above the default budget has to raise the budget, or
+		// the server would reject copies at the very limit it advertises.
+		{"large payload raises the floor", 512 << 20, 0, 512 << 20},
+		{"payload just under the default", 63 << 20, 0, DefaultMaxMemoryBytes},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := Default()
+			cfg.MaxPayloadBytes = tc.payload
+			cfg.MaxMemoryBytes = tc.memory
+			if got := cfg.MemoryBudget(); got != tc.want {
+				t.Errorf("MemoryBudget() = %d, want %d", got, tc.want)
+			}
+			if got := cfg.MemoryBudget(); got < cfg.MaxPayloadBytes {
+				t.Errorf("budget %d is below the payload limit %d; no copy at the limit could run",
+					got, cfg.MaxPayloadBytes)
+			}
+		})
+	}
+}
+
+func TestConcurrencyDerivation(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	if got := cfg.Concurrency(); got != DefaultMaxConcurrent {
+		t.Errorf("Concurrency() = %d, want the default %d", got, DefaultMaxConcurrent)
+	}
+	cfg.MaxConcurrent = 8
+	if got := cfg.Concurrency(); got != 8 {
+		t.Errorf("Concurrency() = %d, want 8", got)
+	}
+}
+
+func TestValidateServerChecksResourceLimits(t *testing.T) {
+	t.Parallel()
+
+	base := func() Config {
+		c := Default()
+		c.Token = "token-of-sufficient-length"
+		return c
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{"budget below one payload", func(c *Config) {
+			c.MaxPayloadBytes = 10 << 20
+			c.MaxMemoryBytes = 1 << 20
+		}, "smaller than max payload"},
+		{"budget over the ceiling", func(c *Config) {
+			c.MaxMemoryBytes = MaxAllowedMemoryBytes + 1
+		}, "ceiling"},
+		{"negative budget", func(c *Config) { c.MaxMemoryBytes = -1 }, "must be positive"},
+		{"negative concurrency", func(c *Config) { c.MaxConcurrent = -1 }, "out of range"},
+		{"absurd concurrency", func(c *Config) { c.MaxConcurrent = MaxAllowedConcurrent + 1 }, "out of range"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := base()
+			tc.mutate(&cfg)
+			err := cfg.ValidateServer()
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+
+	// The defaults, and an explicit budget at exactly one payload, are fine.
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"defaults", func(*Config) {}},
+		{"budget exactly one payload", func(c *Config) { c.MaxMemoryBytes = c.MaxPayloadBytes }},
+		{"budget at the ceiling", func(c *Config) { c.MaxMemoryBytes = MaxAllowedMemoryBytes }},
+		{"concurrency at the ceiling", func(c *Config) { c.MaxConcurrent = MaxAllowedConcurrent }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := base()
+			tc.mutate(&cfg)
+			if err := cfg.ValidateServer(); err != nil {
+				t.Errorf("ValidateServer() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestParseSizeUpToRespectsItsCeiling(t *testing.T) {
+	t.Parallel()
+
+	// The memory ceiling is above the payload ceiling, so a value legal for one
+	// must be rejected by the other.
+	const twoGiB = "2GB"
+	if _, err := ParseSize(twoGiB); err == nil {
+		t.Error("ParseSize accepted a value above the payload ceiling")
+	}
+	got, err := ParseSizeUpTo(twoGiB, MaxAllowedMemoryBytes)
+	if err != nil {
+		t.Fatalf("ParseSizeUpTo(%q): %v", twoGiB, err)
+	}
+	if want := int64(2 << 30); got != want {
+		t.Errorf("= %d, want %d", got, want)
+	}
+
+	// A value large enough to overflow int64 when multiplied by its suffix
+	// must be rejected, not wrapped into something that looks acceptable.
+	if _, err := ParseSizeUpTo("9000000000000000000GB", MaxAllowedMemoryBytes); err == nil {
+		t.Error("an overflowing size was accepted")
+	}
+}
+
+func TestEnvOverridesResourceLimits(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	env := map[string]string{
+		EnvMaxConn:   "32",
+		EnvMaxMemory: "256MB",
+	}
+	if err := cfg.ApplyEnv(func(k string) string { return env[k] }); err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+	if cfg.MaxConcurrent != 32 {
+		t.Errorf("MaxConcurrent = %d, want 32", cfg.MaxConcurrent)
+	}
+	if want := int64(256 << 20); cfg.MaxMemoryBytes != want {
+		t.Errorf("MaxMemoryBytes = %d, want %d", cfg.MaxMemoryBytes, want)
+	}
+
+	bad := map[string]string{EnvMaxConn: "lots"}
+	broken := Default()
+	if err := broken.ApplyEnv(func(k string) string { return bad[k] }); err == nil {
+		t.Error("a non-numeric concurrency was accepted")
+	}
+}

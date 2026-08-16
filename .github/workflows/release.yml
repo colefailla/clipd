@@ -10,29 +10,49 @@ on:
   push:
     tags: ["v*"]
 
-# Creating a release means writing to the repository.
-permissions:
-  contents: write
+# Default to nothing; each job opts in to exactly what it needs. This workflow
+# is the one that produces binaries people install with sudo, so the blast
+# radius of a compromised step is worth keeping small.
+permissions: {}
 
 jobs:
   release:
     runs-on: ubuntu-latest
 
+    permissions:
+      # Creating a release means writing to the repository.
+      contents: write
+      # Build provenance: id-token mints the signing certificate, attestations
+      # records the result. Together they let anyone verify that a downloaded
+      # binary came out of this workflow, from this commit, rather than off
+      # someone's laptop.
+      id-token: write
+      attestations: write
+
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to a commit rather than a tag; see the note in ci.yml.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # The Makefile derives the version from `git describe --tags`. The
           # default shallow clone has no tags, so without this every release
           # would be stamped "dev".
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: go.mod
+          # Explicitly the current toolchain, not the floor declared in go.mod.
+          # These binaries are what users actually run, and they should not be
+          # linked against a standard library that has stopped receiving
+          # security fixes.
+          go-version: stable
 
       # A tag that cannot pass its own tests should not become a release.
       - name: Test
         run: go test -race ./...
+
+      # Nor should one shipping a known stdlib vulnerability.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: Build
         run: make dist
@@ -42,6 +62,11 @@ jobs:
         #   shasum -a 256 -c SHA256SUMS
         working-directory: dist
         run: sha256sum clipd_* > SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/clipd_*
 
       - name: Publish
         env:

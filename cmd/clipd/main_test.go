@@ -673,3 +673,108 @@ func splitHostPort(t *testing.T, addr string) (string, int) {
 	}
 	return host, port
 }
+
+// TestSubcommandHelpGoesToStdout checks that -h is treated as a request rather
+// than a mistake. Help on stderr cannot be piped into a pager without
+// redirection, which is the whole reason the convention exists.
+func TestSubcommandHelpGoesToStdout(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"copy", "configure", "serve", "setup", "status", "install"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := exec(t, "", false, name, "-h")
+			if got.code != exitOK {
+				t.Errorf("exit code = %d, want %d", got.code, exitOK)
+			}
+			if !strings.Contains(got.stdout, "Options:") {
+				t.Errorf("help did not reach stdout:\nstdout: %q\nstderr: %q", got.stdout, got.stderr)
+			}
+			if got.stderr != "" {
+				t.Errorf("help wrote to stderr as well:\n%s", got.stderr)
+			}
+		})
+	}
+}
+
+// TestUsageErrorGoesToStderr is the other half: an unrecognised flag is a
+// mistake, so its usage text must not contaminate the command's output.
+func TestUsageErrorGoesToStderr(t *testing.T) {
+	t.Parallel()
+
+	got := exec(t, "", false, "copy", "-nonsense")
+	if got.code != exitUsage {
+		t.Errorf("exit code = %d, want %d", got.code, exitUsage)
+	}
+	if got.stdout != "" {
+		t.Errorf("a usage error wrote to stdout:\n%s", got.stdout)
+	}
+	if !strings.Contains(got.stderr, "Options:") {
+		t.Errorf("usage text did not reach stderr:\n%s", got.stderr)
+	}
+}
+
+func TestPermissionWarning(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if w := permissionWarning(path, "the token"); w != "" {
+		t.Errorf("0600 file warned: %s", w)
+	}
+
+	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o666} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatalf("chmod %04o: %v", mode, err)
+		}
+		w := permissionWarning(path, "the daemon's private key")
+		if w == "" {
+			t.Errorf("mode %04o did not warn", mode)
+			continue
+		}
+		if !strings.Contains(w, "the daemon's private key") {
+			t.Errorf("mode %04o warned without naming the secret: %s", mode, w)
+		}
+	}
+
+	// A file that is not there is not a problem: a client machine has no
+	// keypair, and status must not invent a warning for it.
+	if w := permissionWarning(filepath.Join(dir, "absent"), "the token"); w != "" {
+		t.Errorf("missing file warned: %s", w)
+	}
+}
+
+// TestSetupDoesNotPutTheTokenOnASuggestedCommandLine guards the pairing
+// instructions: a command line is readable by other local users and is kept in
+// shell history, so the token must be shown as a value to paste rather than
+// baked into a command to run.
+func TestSetupDoesNotPutTheTokenOnASuggestedCommandLine(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	got := exec(t, "", false, "-config", path, "setup")
+	if got.code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	for _, line := range strings.Split(got.stdout, "\n") {
+		if !strings.Contains(line, "clipd configure") {
+			continue
+		}
+		if strings.Contains(line, cfg.Token) {
+			t.Errorf("the suggested command line carries the token:\n  %s", strings.TrimSpace(line))
+		}
+	}
+	if !strings.Contains(got.stdout, "-token -") {
+		t.Error("setup did not suggest reading the token from stdin")
+	}
+}

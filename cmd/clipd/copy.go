@@ -18,7 +18,7 @@ import (
 func cmdCopy(ctx context.Context, e *env, g *globalOptions, args []string) int {
 	flags := newFlagSet(e, g, "copy", "Usage: clipd copy [options] [file]")
 	maxPayload := flags.String("max-payload", "", "override the maximum payload for this copy, e.g. 20MB")
-	if code, ok := parseFlags(flags, e, args); !ok {
+	if code, ok := flags.parse(args); !ok {
 		return code
 	}
 

@@ -27,6 +27,9 @@ type harness struct {
 	addr string
 	clip *clipboard.Fake
 	pin  []byte
+	// srv is exposed so tests can assert on internal admission bookkeeping,
+	// which has no observable effect on the wire until it starts rejecting.
+	srv *Server
 }
 
 type harnessOption func(*Options)
@@ -39,6 +42,7 @@ func withClipboardError(err error) harnessOption {
 	return func(o *Options) { o.Clipboard.(*clipboard.Fake).Err = err }
 }
 func withMaxConcurrent(n int) harnessOption { return func(o *Options) { o.MaxConcurrent = n } }
+func withMaxMemory(n int64) harnessOption   { return func(o *Options) { o.MaxMemory = n } }
 
 func newHarness(t *testing.T, opts ...harnessOption) *harness {
 	t.Helper()
@@ -87,7 +91,7 @@ func newHarness(t *testing.T, opts ...harnessOption) *harness {
 		}
 	})
 
-	return &harness{t: t, addr: ln.Addr().String(), clip: clip, pin: pin}
+	return &harness{t: t, addr: ln.Addr().String(), clip: clip, pin: pin, srv: srv}
 }
 
 // send performs a full client exchange and returns the server's response.
@@ -755,5 +759,449 @@ func TestPayloadTimeoutScalesWithSize(t *testing.T) {
 	large := srv.payloadTimeout(10 << 20)
 	if large <= small {
 		t.Errorf("timeout for 10 MiB (%s) is not greater than for 1 KiB (%s)", large, small)
+	}
+}
+
+// TestSilentConnectionsCannotStarveTheServer is the regression test for the
+// slot-exhaustion denial of service: peers that completed a TCP handshake and
+// then sent nothing used to occupy the entire connection budget until their
+// deadlines expired, stalling real copies for the whole timeout — longer than a
+// client's own deadline, so copies did not merely slow down, they failed.
+//
+// The flood here is the size of the old budget. Everything runs from 127.0.0.1,
+// so this exercises the enlarged pool rather than per-host rationing; that
+// rationing is tested in TestAdmissionRationsOnlyUnderPressure, which needs
+// distinct source addresses that loopback cannot portably provide.
+func TestSilentConnectionsCannotStarveTheServer(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, withTimeout(3*time.Second))
+
+	const hogs = 16
+	for range hogs {
+		conn, err := net.DialTimeout("tcp", h.addr, 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+	}
+	// Let the server accept them all before measuring.
+	time.Sleep(300 * time.Millisecond)
+
+	// A real copy must still go through promptly rather than waiting out the
+	// hogs' deadlines.
+	start := time.Now()
+	status, message := h.send(testToken, []byte("still working"))
+	elapsed := time.Since(start)
+
+	if !status.OK() {
+		t.Fatalf("copy during connection flood returned %v: %s", status, message)
+	}
+	if elapsed > time.Second {
+		t.Errorf("copy took %v while %d silent connections were held; the server is being starved",
+			elapsed, hogs)
+	}
+	if got := string(h.clip.Data()); got != "still working" {
+		t.Errorf("clipboard = %q, want %q", got, "still working")
+	}
+}
+
+// TestAdmissionRationsOnlyUnderPressure tests the per-host limiter directly.
+//
+// Driving it over real sockets would need many distinct source addresses, which
+// loopback does not offer portably — macOS has only 127.0.0.1 unless an alias is
+// configured — and a test that flooded from one address could not tell a
+// working limiter from a broken one, since victim and attacker would share a
+// host key.
+func TestAdmissionRationsOnlyUnderPressure(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	s := h.srv
+
+	// Below the soft limit, one host may hold far more than its rationed
+	// share: an unattacked daemon throttles nobody.
+	for i := range unauthSoftLimit {
+		if !s.admit("10.0.0.1") {
+			t.Fatalf("connection %d from a single host was rationed below the soft limit", i)
+		}
+	}
+
+	// At the soft limit that host is over its share and gets refused.
+	if s.admit("10.0.0.1") {
+		t.Error("a host already holding its share was admitted under pressure")
+	}
+
+	// A host that is not hoarding still gets in, which is the whole point:
+	// pressure from one peer must not lock everyone else out.
+	if !s.admit("10.0.0.2") {
+		t.Error("an innocent host was refused because another host was flooding")
+	}
+
+	// Releasing back below the soft limit lifts rationing again.
+	for range unauthSoftLimit {
+		s.release("10.0.0.1")
+	}
+	if !s.admit("10.0.0.1") {
+		t.Error("rationing did not lift after the flood drained")
+	}
+
+	s.release("10.0.0.1")
+	s.release("10.0.0.2")
+	s.release("10.0.0.1")
+
+	s.unauthMu.Lock()
+	defer s.unauthMu.Unlock()
+	if s.unauthTotal != 0 || len(s.unauth) != 0 {
+		t.Errorf("after releasing everything: unauthTotal = %d, %d host entries; want 0 and 0",
+			s.unauthTotal, len(s.unauth))
+	}
+}
+
+// TestParallelCopiesFromOneHostAreNotRationed guards the other side of the
+// trade: admission control must not throttle a legitimate burst, which is the
+// failure mode of a flat per-host cap.
+func TestParallelCopiesFromOneHostAreNotRationed(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	const clients = unauthSoftLimit - 4
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+
+	// Released together so they contend in the pre-authentication phase at
+	// once, which is exactly what a flat cap would reject.
+	start := make(chan struct{})
+	for range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+
+			conn := dialTLS(t, h.addr, h.pin, 20*time.Second)
+			defer conn.Close()
+			if err := protocol.WriteRequest(conn, testToken, []byte("x")); err != nil {
+				errs <- err
+				return
+			}
+			status, message, err := protocol.ReadResponse(conn)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !status.OK() {
+				errs <- errors.New(message)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("parallel copy from one host was rejected: %v", err)
+	}
+	if h.clip.Writes != clients {
+		t.Errorf("clipboard writes = %d, want %d", h.clip.Writes, clients)
+	}
+}
+
+// TestAuthenticationReleasesTheAdmissionSlot checks the bookkeeping directly:
+// a proven client must not still be counted against its host's share, or a
+// long copy would ration the next one.
+func TestAuthenticationReleasesTheAdmissionSlot(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, message := h.send(testToken, []byte("done")); message == "" {
+		t.Fatal("expected an acknowledgement")
+	}
+
+	// Give the handler a moment to return, then confirm nothing is still held.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.srv.unauthMu.Lock()
+		total, entries := h.srv.unauthTotal, len(h.srv.unauth)
+		h.srv.unauthMu.Unlock()
+		if total == 0 && entries == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	h.srv.unauthMu.Lock()
+	defer h.srv.unauthMu.Unlock()
+	t.Errorf("after a completed copy, unauthTotal = %d and %d host entries remain, want 0 and 0",
+		h.srv.unauthTotal, len(h.srv.unauth))
+}
+
+func TestWarnLimiterBoundsOutputAndReportsDrops(t *testing.T) {
+	t.Parallel()
+
+	var l warnLimiter
+	now := time.Now()
+
+	for i := range warnBudget {
+		ok, dropped := l.allow(now)
+		if !ok {
+			t.Fatalf("warning %d was suppressed while still within the budget", i)
+		}
+		if dropped != 0 {
+			t.Fatalf("warning %d reported %d drops before any window rolled", i, dropped)
+		}
+	}
+
+	// Everything past the budget is dropped rather than logged.
+	const excess = 500
+	for range excess {
+		if ok, _ := l.allow(now); ok {
+			t.Fatal("a warning was logged after the budget was spent")
+		}
+	}
+
+	// The next window reports what the previous one swallowed, so throttling
+	// hides the volume of an attack but never the fact of one.
+	ok, dropped := l.allow(now.Add(warnWindow))
+	if !ok {
+		t.Error("the first warning of a new window was suppressed")
+	}
+	if dropped != excess {
+		t.Errorf("dropped = %d, want %d", dropped, excess)
+	}
+}
+
+// TestCopiesQueueWithinTheMemoryBudget checks that a budget smaller than the
+// concurrent demand slows copies down rather than failing them: the daemon's
+// memory ceiling stops being connections times payload, without turning a
+// burst into errors.
+func TestCopiesQueueWithinTheMemoryBudget(t *testing.T) {
+	t.Parallel()
+
+	const payload = 64 << 10
+	// Room for two payloads at a time, against eight arriving at once.
+	h := newHarness(t, withMaxPayload(payload), withMaxMemory(2*payload), withTimeout(10*time.Second))
+
+	const clients = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+	body := bytes.Repeat([]byte("x"), payload)
+
+	start := make(chan struct{})
+	for range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+
+			conn := dialTLS(t, h.addr, h.pin, 30*time.Second)
+			defer conn.Close()
+			if err := protocol.WriteRequest(conn, testToken, body); err != nil {
+				errs <- err
+				return
+			}
+			status, message, err := protocol.ReadResponse(conn)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !status.OK() {
+				errs <- errors.New(message)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("copy was rejected instead of queued: %v", err)
+	}
+	if h.clip.Writes != clients {
+		t.Errorf("clipboard writes = %d, want %d", h.clip.Writes, clients)
+	}
+	if got := h.srv.mem.inUse(); got != 0 {
+		t.Errorf("%d bytes of budget still reserved after every copy finished", got)
+	}
+}
+
+// TestMemoryBudgetIsReleasedOnFailure guards the accounting on the paths that
+// do not end in a successful copy. A budget that leaked on error would shrink
+// with every failure until the daemon wedged.
+func TestMemoryBudgetIsReleasedOnFailure(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, withClipboardError(errors.New("pbcopy exploded")))
+
+	for range 5 {
+		status, _ := h.send(testToken, []byte("payload that will not stick"))
+		if status != protocol.StatusInternalError {
+			t.Fatalf("status = %v, want %v", status, protocol.StatusInternalError)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.srv.mem.inUse() == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("%d bytes of budget leaked across failed copies", h.srv.mem.inUse())
+}
+
+func TestNewRejectsABudgetSmallerThanOnePayload(t *testing.T) {
+	t.Parallel()
+
+	tlsConfig, _, err := transport.Ephemeral()
+	if err != nil {
+		t.Fatalf("ephemeral: %v", err)
+	}
+	_, err = New(Options{
+		Token:      testToken,
+		TLS:        tlsConfig,
+		Clipboard:  &clipboard.Fake{},
+		MaxPayload: 10 << 20,
+		MaxMemory:  1 << 20,
+		Timeout:    time.Second,
+	})
+	if err == nil {
+		t.Fatal("a budget too small for one payload was accepted")
+	}
+	if !strings.Contains(err.Error(), "memory budget") {
+		t.Errorf("error does not explain the problem: %v", err)
+	}
+}
+
+func TestDefaultBudgetGrowsWithThePayloadLimit(t *testing.T) {
+	t.Parallel()
+
+	tlsConfig, _, err := transport.Ephemeral()
+	if err != nil {
+		t.Fatalf("ephemeral: %v", err)
+	}
+	// A payload limit above the default budget must raise the budget rather
+	// than produce a server that rejects every copy at its own stated limit.
+	const huge = 512 << 20
+	srv, err := New(Options{
+		Token:      testToken,
+		TLS:        tlsConfig,
+		Clipboard:  &clipboard.Fake{},
+		MaxPayload: huge,
+		Timeout:    time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if srv.mem.capacity < huge {
+		t.Errorf("budget = %d, want at least the payload limit of %d", srv.mem.capacity, huge)
+	}
+}
+
+// TestUnauthenticatedPeersDoNotConsumeTheCopyBudget is the regression test for
+// the budget split. The copy budget is deliberately tiny here and the flood is
+// well below the rationing threshold, so the only thing keeping the real client
+// alive is that silent peers never reach that budget at all. Before the split
+// they held it, and two silent sockets were enough to stall everyone.
+func TestUnauthenticatedPeersDoNotConsumeTheCopyBudget(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, withMaxConcurrent(2), withTimeout(3*time.Second))
+
+	const hogs = 32 // below unauthSoftLimit, so per-host rationing stays out of it
+	for range hogs {
+		conn, err := net.DialTimeout("tcp", h.addr, 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	start := time.Now()
+	status, message := h.send(testToken, []byte("unblocked"))
+	elapsed := time.Since(start)
+
+	if !status.OK() {
+		t.Fatalf("copy returned %v: %s", status, message)
+	}
+	if elapsed > time.Second {
+		t.Errorf("copy took %v behind %d silent peers; they are still holding copy capacity",
+			elapsed, hogs)
+	}
+}
+
+// TestUnprovenPeersGetTheShorterDeadline covers the other half: a peer that has
+// not authenticated must not inherit a timeout raised for slow payload
+// transfers. Otherwise raising the timeout for a bad link also lengthens how
+// long an unproven peer can sit on resources.
+func TestUnprovenPeersGetTheShorterDeadline(t *testing.T) {
+	t.Parallel()
+
+	// Far longer than handshakeTimeout, so the two are clearly distinguishable.
+	h := newHarness(t, withTimeout(30*time.Second))
+
+	conn, err := net.DialTimeout("tcp", h.addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+
+	start := time.Now()
+	buf := make([]byte, 16)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("the server answered a peer that sent nothing")
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > handshakeTimeout+2*time.Second {
+		t.Errorf("silent peer held for %v; it inherited the %v timeout instead of the %v handshake bound",
+			elapsed, 30*time.Second, handshakeTimeout)
+	}
+}
+
+// TestAuthenticatedClientKeepsTheFullTimeout guards the other direction: the
+// shorter bound must apply only before the token arrives, or a slow payload
+// transfer over a link the operator raised the timeout for would be cut off.
+func TestAuthenticatedClientKeepsTheFullTimeout(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, withTimeout(10*time.Second))
+	payload := []byte("sent in slow motion after authenticating\n")
+
+	var frame bytes.Buffer
+	if err := protocol.WriteRequest(&frame, testToken, payload); err != nil {
+		t.Fatalf("WriteRequest: %v", err)
+	}
+	raw := frame.Bytes()
+
+	conn := h.dial()
+	defer conn.Close()
+
+	// Everything through the token in one write, so authentication completes
+	// promptly and the deadline is extended...
+	authLen := protocol.PrologueSize + len(testToken)
+	if _, err := conn.Write(raw[:authLen]); err != nil {
+		t.Fatalf("write prologue: %v", err)
+	}
+	// ...then stall for longer than the handshake bound before sending the
+	// rest. A peer that had not authenticated would be gone by now.
+	time.Sleep(handshakeTimeout + 500*time.Millisecond)
+	if _, err := conn.Write(raw[authLen:]); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+
+	status, message, err := readResponse(conn)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if !status.OK() {
+		t.Fatalf("status = %v (%s)", status, message)
+	}
+	if got := h.clip.Data(); !bytes.Equal(got, payload) {
+		t.Errorf("clipboard = %q, want %q", got, payload)
 	}
 }

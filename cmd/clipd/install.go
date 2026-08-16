@@ -20,7 +20,7 @@ import (
 func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) int {
 	flags := newFlagSet(e, g, "install", "Usage: clipd install [options]")
 	execPath := flags.String("exec", "", "binary path to record in the plist (default: this binary)")
-	if code, ok := parseFlags(flags, e, args); !ok {
+	if code, ok := flags.parse(args); !ok {
 		return code
 	}
 	if runtime.GOOS != "darwin" {
@@ -91,8 +91,11 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 
 	fmt.Fprintf(out, "\nOn the client machine:\n\n")
 	fmt.Fprintf(out, "  clipd configure -server %s -port %d \\\n", suggestedServerAddress(), cfg.Port)
-	fmt.Fprintf(out, "    -token <token> \\\n")
-	fmt.Fprintf(out, "    -fingerprint %s\n\n", fingerprint)
+	fmt.Fprintf(out, "    -fingerprint %s \\\n", fingerprint)
+	fmt.Fprintf(out, "    -token -\n\n")
+	fmt.Fprintf(out, "Paste the token when it asks, rather than passing -token <value>:\n")
+	fmt.Fprintf(out, "other local users can read a command line from ps, and the shell\n")
+	fmt.Fprintf(out, "records it in history.\n\n")
 	fmt.Fprintf(out, "The daemon starts at login and restarts if it exits. Check it with\n")
 	fmt.Fprintf(out, "'clipd status'.\n")
 	return exitOK
@@ -104,7 +107,7 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 // discard a token the user may still want, and removing it is one rm away.
 func cmdUninstall(ctx context.Context, e *env, g *globalOptions, args []string) int {
 	flags := newFlagSet(e, g, "uninstall", "Usage: clipd uninstall")
-	if code, ok := parseFlags(flags, e, args); !ok {
+	if code, ok := flags.parse(args); !ok {
 		return code
 	}
 	if runtime.GOOS != "darwin" {

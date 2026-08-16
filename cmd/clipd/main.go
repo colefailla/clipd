@@ -152,28 +152,55 @@ func registerGlobalFlags(fs *flag.FlagSet, g *globalOptions) {
 	fs.StringVar(&g.timeout, "timeout", g.timeout, "network timeout, e.g. 5s")
 }
 
+// cmdFlags is a subcommand's flag set together with its usage text.
+//
+// The flag package prints usage to one fixed destination, but the same text
+// serves two purposes: an answer when the user typed -h, and a complaint when
+// they typed something wrong. Keeping the text here lets parse route it to
+// stdout or stderr accordingly. Embedding the flag set means callers declare
+// flags exactly as they would on a *flag.FlagSet.
+type cmdFlags struct {
+	*flag.FlagSet
+	usage string
+	e     *env
+}
+
 // newFlagSet builds a subcommand flag set that also accepts the global flags.
-func newFlagSet(e *env, g *globalOptions, name, usage string) *flag.FlagSet {
+func newFlagSet(e *env, g *globalOptions, name, usage string) *cmdFlags {
 	fs := flag.NewFlagSet("clipd "+name, flag.ContinueOnError)
 	fs.SetOutput(e.stderr)
 	registerGlobalFlags(fs, g)
-	fs.Usage = func() {
-		fmt.Fprintf(e.stderr, "%s\n\nOptions:\n", usage)
-		fs.PrintDefaults()
-	}
-	return fs
+	// Suppressed here and printed by parse, which is where it is known whether
+	// the usage text is being asked for or imposed.
+	fs.Usage = func() {}
+	return &cmdFlags{FlagSet: fs, usage: usage, e: e}
 }
 
-// parseFlags parses a subcommand's arguments, translating flag package
-// outcomes into exit codes. ok is false when the caller should return code.
-func parseFlags(fs *flag.FlagSet, e *env, args []string) (code int, ok bool) {
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return exitOK, false
-		}
+// parse handles a subcommand's arguments, translating flag package outcomes
+// into exit codes. ok is false when the caller should return code.
+func (c *cmdFlags) parse(args []string) (code int, ok bool) {
+	switch err := c.FlagSet.Parse(args); {
+	case err == nil:
+		return exitOK, true
+	case errors.Is(err, flag.ErrHelp):
+		// -h is a request, and its output is what the user asked for, so it
+		// goes to stdout where it can be piped into a pager like any other
+		// command's help.
+		c.printUsage(c.e.stdout)
+		return exitOK, false
+	default:
+		// Parse has already written the error to stderr; the usage text
+		// belongs beside it rather than in the command's output.
+		c.printUsage(c.e.stderr)
 		return exitUsage, false
 	}
-	return exitOK, true
+}
+
+func (c *cmdFlags) printUsage(w io.Writer) {
+	fmt.Fprintf(w, "%s\n\nOptions:\n", c.usage)
+	c.FlagSet.SetOutput(w)
+	defer c.FlagSet.SetOutput(c.e.stderr)
+	c.FlagSet.PrintDefaults()
 }
 
 // loadConfig resolves and loads configuration for a command, applying
@@ -277,7 +304,7 @@ Global options:
 Environment:
   CLIPD_CONFIG, CLIPD_SERVER, CLIPD_PORT, CLIPD_BIND, CLIPD_TOKEN,
   CLIPD_FINGERPRINT, CLIPD_TLS_CERT, CLIPD_TLS_KEY, CLIPD_MAX_PAYLOAD,
-  CLIPD_TIMEOUT
+  CLIPD_MAX_CONCURRENT, CLIPD_MAX_MEMORY, CLIPD_TIMEOUT
 
 Run 'clipd help config' for the config file format.
 
@@ -367,11 +394,16 @@ the Mac.
 Options:
   -server <host>        Mac hostname or IP address
   -port <port>          port the daemon listens on
-  -token <token>        authentication token, or "-" to read it from stdin
+  -token <token>        authentication token; prefer "-" to read it from stdin
   -fingerprint <fp>     server key fingerprint; accepts the sha256: prefix or
                         not, colons or not, any case
   -max-payload <size>   maximum payload to send, e.g. 10MB
   -timeout <duration>   network timeout to store, e.g. 5s
+
+Prefer '-token -' and paste the value when prompted. A token passed as
+'-token <value>' is exposed twice over: other local users can read a process's
+command line (on Linux, straight out of /proc), and the shell keeps it in
+history.
 
 The config file is written with 0600 permissions inside a 0700 directory,
 because it contains the token in plaintext.`,
@@ -407,7 +439,16 @@ Keys, all optional except where noted:
   tls_cert_path       daemon: certificate path; empty means beside the config
   tls_key_path        daemon: private key path; empty means beside the config
   max_payload_bytes   both:   largest accepted payload (default 10485760)
+  max_concurrent      daemon: copies performed at once (default 128)
+  max_memory_bytes    daemon: total payload bytes buffered across all
+                              connections (default 67108864, or one maximum
+                              payload if that is larger)
   timeout_ms          both:   connect and handshake timeout (default 5000)
+
+The daemon buffers each payload whole, so its memory ceiling would otherwise be
+max_payload_bytes times max_concurrent. max_memory_bytes bounds that product
+directly: copies beyond it wait for room rather than being refused. It must be
+at least max_payload_bytes, since a copy the daemon accepts has to fit.
 
 Keys belonging to the other role stay empty: a Mac has no server_address, a
 client has no keypair. Unknown keys are rejected rather than ignored, so a
@@ -417,7 +458,7 @@ Environment variables override the file:
 
   CLIPD_CONFIG CLIPD_SERVER CLIPD_PORT CLIPD_BIND CLIPD_TOKEN
   CLIPD_FINGERPRINT CLIPD_TLS_CERT CLIPD_TLS_KEY CLIPD_MAX_PAYLOAD
-  CLIPD_TIMEOUT
+  CLIPD_MAX_CONCURRENT CLIPD_MAX_MEMORY CLIPD_TIMEOUT
 
 CLIPD_MAX_PAYLOAD accepts a suffix (10MB, 512KiB); CLIPD_TIMEOUT takes a
 duration (5s, 500ms).`,

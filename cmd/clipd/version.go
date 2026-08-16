@@ -13,7 +13,7 @@ import (
 // information when someone is running a binary they built by hand.
 func cmdVersion(_ context.Context, e *env, g *globalOptions, args []string) int {
 	flags := newFlagSet(e, g, "version", "Usage: clipd version")
-	if code, ok := parseFlags(flags, e, args); !ok {
+	if code, ok := flags.parse(args); !ok {
 		return code
 	}
 	fmt.Fprintf(e.stdout, "clipd %s\n", version)

@@ -454,3 +454,69 @@ func splitPairs(s string) []string {
 	}
 	return out
 }
+
+// TestRotationLeavesAMatchingPairAndNoDebris covers what makes a keypair
+// different from two files: installing a certificate without the key that
+// signed it leaves a daemon that refuses to start, so both must arrive
+// together and neither may leave a staging file behind.
+func TestRotationLeavesAMatchingPairAndNoDebris(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls", "cert.pem")
+	keyPath := filepath.Join(dir, "tls", "key.pem")
+
+	for i, install := range []func() error{
+		func() error { _, err := EnsureCert(certPath, keyPath, DefaultValidity); return err },
+		func() error { return WriteCert(certPath, keyPath, DefaultValidity) },
+		func() error { return WriteCert(certPath, keyPath, DefaultValidity) },
+	} {
+		if err := install(); err != nil {
+			t.Fatalf("install %d: %v", i, err)
+		}
+
+		// The pair must load together: this is the check the daemon itself
+		// performs at startup.
+		if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+			t.Fatalf("install %d produced a mismatched pair: %v", i, err)
+		}
+
+		entries, err := os.ReadDir(filepath.Dir(certPath))
+		if err != nil {
+			t.Fatalf("read tls dir: %v", err)
+		}
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".tmp-") {
+				t.Errorf("install %d left a staging file behind: %s", i, e.Name())
+			}
+		}
+		if len(entries) != 2 {
+			t.Errorf("install %d left %d files in the tls directory, want 2", i, len(entries))
+		}
+	}
+}
+
+func TestRotatedKeyKeepsRestrictivePermissions(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls", "cert.pem")
+	keyPath := filepath.Join(dir, "tls", "key.pem")
+
+	if _, err := EnsureCert(certPath, keyPath, DefaultValidity); err != nil {
+		t.Fatalf("EnsureCert: %v", err)
+	}
+	if err := WriteCert(certPath, keyPath, DefaultValidity); err != nil {
+		t.Fatalf("WriteCert: %v", err)
+	}
+
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("stat key: %v", err)
+	}
+	// Rotation must not be a way to widen the key's mode: it is written with
+	// Chmod precisely so that umask cannot loosen it.
+	if got := info.Mode().Perm(); got != keyPerm {
+		t.Errorf("rotated key mode = %04o, want %04o", got, keyPerm)
+	}
+}

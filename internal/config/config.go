@@ -48,6 +48,33 @@ const (
 	// MaxAllowedPayloadBytes caps what the config file may ask for, so a
 	// typo cannot turn the daemon into an out-of-memory button.
 	MaxAllowedPayloadBytes int64 = 1 << 30
+
+	// DefaultMaxConcurrent bounds copies performed at once — payloads being
+	// read and handed to the clipboard. Must agree with
+	// server.defaultMaxConcurrent.
+	//
+	// It does not bound open sockets. Those are governed by a separate, much
+	// larger budget inside the server, deliberately not configurable: it is a
+	// denial-of-service backstop rather than a capacity choice.
+	DefaultMaxConcurrent = 128
+
+	// MaxAllowedConcurrent is a sanity bound, not a capacity limit: past a few
+	// thousand the failure is file descriptors rather than anything clipd
+	// decides, and a five-digit value in a config file is a typo.
+	MaxAllowedConcurrent = 4096
+
+	// DefaultMaxMemoryBytes bounds the payload bytes the daemon buffers across
+	// all connections at once. Must agree with server.defaultMemoryBudget.
+	//
+	// A payload is buffered whole, so without this the ceiling would be the
+	// copy limit times the payload limit — 1.25 GiB at the defaults,
+	// from two numbers neither of which mentions memory.
+	DefaultMaxMemoryBytes int64 = 64 << 20
+
+	// MaxAllowedMemoryBytes caps the configurable budget. Higher than the
+	// payload ceiling because the whole point of the budget is to hold several
+	// payloads at once.
+	MaxAllowedMemoryBytes int64 = 4 << 30
 )
 
 // File layout.
@@ -77,6 +104,8 @@ const (
 	EnvTLSKey      = "CLIPD_TLS_KEY"
 	EnvMaxPayload  = "CLIPD_MAX_PAYLOAD"
 	EnvTimeout     = "CLIPD_TIMEOUT"
+	EnvMaxConn     = "CLIPD_MAX_CONCURRENT"
+	EnvMaxMemory   = "CLIPD_MAX_MEMORY"
 )
 
 // TLS material lives beside the config file.
@@ -122,6 +151,15 @@ type Config struct {
 	// MaxPayloadBytes is enforced by the client before sending and by the
 	// server before allocating.
 	MaxPayloadBytes int64 `json:"max_payload_bytes"`
+
+	// MaxConcurrent bounds the copies the daemon performs at once.
+	// Server-side only; zero means DefaultMaxConcurrent.
+	MaxConcurrent int `json:"max_concurrent"`
+
+	// MaxMemoryBytes bounds the payload bytes the daemon buffers across all
+	// connections at once. Server-side only; zero means the value MemoryBudget
+	// derives, which is never smaller than one maximum payload.
+	MaxMemoryBytes int64 `json:"max_memory_bytes"`
 
 	// TimeoutMS is stored as milliseconds because JSON has no duration type
 	// and a bare number is less error-prone than a string to hand-edit.
@@ -222,6 +260,12 @@ func Load(path string) (Config, error) {
 	if file.MaxPayloadBytes != 0 {
 		cfg.MaxPayloadBytes = file.MaxPayloadBytes
 	}
+	if file.MaxConcurrent != 0 {
+		cfg.MaxConcurrent = file.MaxConcurrent
+	}
+	if file.MaxMemoryBytes != 0 {
+		cfg.MaxMemoryBytes = file.MaxMemoryBytes
+	}
 	if file.TimeoutMS != 0 {
 		cfg.TimeoutMS = file.TimeoutMS
 	}
@@ -273,6 +317,20 @@ func (c *Config) ApplyEnv(getenv func(string) string) error {
 		}
 		c.TimeoutMS = d.Milliseconds()
 	}
+	if v := getenv(EnvMaxConn); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("%s: %q is not a number", EnvMaxConn, v)
+		}
+		c.MaxConcurrent = n
+	}
+	if v := getenv(EnvMaxMemory); v != "" {
+		size, err := ParseSizeUpTo(v, MaxAllowedMemoryBytes)
+		if err != nil {
+			return fmt.Errorf("%s: %w", EnvMaxMemory, err)
+		}
+		c.MaxMemoryBytes = size
+	}
 	return nil
 }
 
@@ -320,6 +378,32 @@ func (c Config) Save(path string) error {
 		return fmt.Errorf("install config %s: %w", path, err)
 	}
 	return nil
+}
+
+// Concurrency is the effective limit on simultaneous copies.
+func (c Config) Concurrency() int {
+	if c.MaxConcurrent > 0 {
+		return c.MaxConcurrent
+	}
+	return DefaultMaxConcurrent
+}
+
+// MemoryBudget is the effective allowance for buffered payload bytes.
+//
+// When unset it is the larger of the default and one maximum payload, so that
+// raising max_payload_bytes on its own can never produce a configuration in
+// which a copy the server would accept has nowhere to fit. Setting it
+// explicitly is validated against the same floor rather than silently raised,
+// because a budget quietly larger than the one written down is worse than an
+// error saying so.
+func (c Config) MemoryBudget() int64 {
+	if c.MaxMemoryBytes > 0 {
+		return c.MaxMemoryBytes
+	}
+	if c.MaxPayloadBytes > DefaultMaxMemoryBytes {
+		return c.MaxPayloadBytes
+	}
+	return DefaultMaxMemoryBytes
 }
 
 // Timeout returns TimeoutMS as a duration, falling back to the default if the
@@ -387,6 +471,24 @@ func (c Config) ValidateServer() error {
 	if c.BindAddress == "" {
 		return errors.New("no bind address configured")
 	}
+	if c.MaxConcurrent < 0 || c.MaxConcurrent > MaxAllowedConcurrent {
+		return fmt.Errorf("max concurrent %d is out of range (1-%d, or 0 for the default of %d)",
+			c.MaxConcurrent, MaxAllowedConcurrent, DefaultMaxConcurrent)
+	}
+	if c.MaxMemoryBytes < 0 {
+		return fmt.Errorf("max memory %d must be positive", c.MaxMemoryBytes)
+	}
+	if c.MaxMemoryBytes > MaxAllowedMemoryBytes {
+		return fmt.Errorf("max memory %s exceeds the %s ceiling",
+			FormatSize(c.MaxMemoryBytes), FormatSize(MaxAllowedMemoryBytes))
+	}
+	// An explicit budget below one payload would reject copies the payload
+	// limit says are fine, which reads as an intermittent server fault rather
+	// than as the configuration error it is.
+	if c.MaxMemoryBytes > 0 && c.MaxMemoryBytes < c.MaxPayloadBytes {
+		return fmt.Errorf("max memory %s is smaller than max payload %s: the daemon buffers each payload whole, so no copy at the limit could ever run",
+			FormatSize(c.MaxMemoryBytes), FormatSize(c.MaxPayloadBytes))
+	}
 	return c.validateCommon()
 }
 
@@ -422,10 +524,21 @@ func ParseDuration(s string) (time.Duration, error) {
 	return d, nil
 }
 
-// ParseSize parses a byte count with an optional unit suffix: 1048576, 1MB,
-// 512KiB. Decimal and binary suffixes are both accepted and both treated as
-// binary multiples, since the distinction is noise at this scale.
+// ParseSize parses a byte count with an optional unit suffix, rejecting
+// anything above the payload ceiling.
 func ParseSize(s string) (int64, error) {
+	return ParseSizeUpTo(s, MaxAllowedPayloadBytes)
+}
+
+// ParseSizeUpTo parses a byte count with an optional unit suffix: 1048576,
+// 1MB, 512KiB. Decimal and binary suffixes are both accepted and both treated
+// as binary multiples, since the distinction is noise at this scale.
+//
+// The ceiling is a parameter because the two things clipd sizes have different
+// ones: a payload is bounded by what a person plausibly pastes, while the
+// memory budget exists to hold several payloads and so must be allowed above
+// that.
+func ParseSizeUpTo(s string, ceiling int64) (int64, error) {
 	trimmed := strings.TrimSpace(s)
 	if trimmed == "" {
 		return 0, errors.New("empty size")
@@ -456,8 +569,11 @@ func ParseSize(s string) (int64, error) {
 	if value <= 0 {
 		return 0, fmt.Errorf("invalid size %q: must be positive", s)
 	}
-	if value > MaxAllowedPayloadBytes/multiplier {
-		return 0, fmt.Errorf("size %q exceeds the %s ceiling", s, FormatSize(MaxAllowedPayloadBytes))
+	// Divide rather than multiply and compare: value*multiplier could overflow
+	// int64 for a large enough number, and an overflowed product compares as
+	// comfortably under the ceiling.
+	if value > ceiling/multiplier {
+		return 0, fmt.Errorf("size %q exceeds the %s ceiling", s, FormatSize(ceiling))
 	}
 	return value * multiplier, nil
 }

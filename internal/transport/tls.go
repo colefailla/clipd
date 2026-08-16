@@ -6,8 +6,6 @@
 // does. The model is an SSH host key rather than a web certificate: the server
 // generates one long-lived keypair, the client records its fingerprint once
 // during pairing, and any deviation afterwards aborts the connection.
-//
-// See docs/tls-v2.md for the design rationale.
 package transport
 
 import (
@@ -166,14 +164,7 @@ func EnsureCert(certPath, keyPath string, validity time.Duration) (created bool,
 		return false, nil
 	}
 
-	certPEM, keyPEM, err := GenerateCert(validity)
-	if err != nil {
-		return false, err
-	}
-	if err := writeFile(certPath, certPEM, certPerm); err != nil {
-		return false, err
-	}
-	if err := writeFile(keyPath, keyPEM, keyPerm); err != nil {
+	if err := writePair(certPath, keyPath, validity); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -182,14 +173,51 @@ func EnsureCert(certPath, keyPath string, validity time.Duration) (created bool,
 // WriteCert replaces the keypair at the given paths, discarding any existing
 // one. Every client pinned to the old key must be reconfigured afterwards.
 func WriteCert(certPath, keyPath string, validity time.Duration) error {
+	return writePair(certPath, keyPath, validity)
+}
+
+// writePair installs a certificate and its key as close to together as POSIX
+// allows.
+//
+// A certificate and the key that signed it are only useful as a pair: install
+// one without the other and the daemon fails to start with "private key does
+// not match public key", which is a confusing way to learn that a rotation was
+// interrupted. Both files are therefore staged completely — generated, written,
+// permissioned, closed — before either is renamed into place, so every failure
+// mode except one lands with the old pair intact and the daemon still running.
+//
+// The exception is a failure between the two renames, which cannot be closed
+// without a filesystem transaction. It is a far smaller window than writing one
+// file's contents, and rotation is a deliberate, foreground command whose
+// remedy is to run it again.
+func writePair(certPath, keyPath string, validity time.Duration) error {
 	certPEM, keyPEM, err := GenerateCert(validity)
 	if err != nil {
 		return err
 	}
-	if err := writeFile(certPath, certPEM, certPerm); err != nil {
+
+	certTmp, err := stageFile(certPath, certPEM, certPerm)
+	if err != nil {
 		return err
 	}
-	return writeFile(keyPath, keyPEM, keyPerm)
+	defer os.Remove(certTmp)
+
+	keyTmp, err := stageFile(keyPath, keyPEM, keyPerm)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(keyTmp)
+
+	// Key first: a key without its certificate is recoverable by regenerating,
+	// while a certificate whose key was never installed leaves the old private
+	// key on disk under a name that no longer describes it.
+	if err := os.Rename(keyTmp, keyPath); err != nil {
+		return fmt.Errorf("transport: install %s: %w", keyPath, err)
+	}
+	if err := os.Rename(certTmp, certPath); err != nil {
+		return fmt.Errorf("transport: install %s: %w", certPath, err)
+	}
+	return nil
 }
 
 // LoadCertificate reads and parses a PEM certificate, for reporting its
@@ -338,38 +366,51 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// writeFile installs data atomically with an explicit mode, so an interrupted
-// write cannot leave a half-written key in place and so the mode is not
-// subject to umask.
-func writeFile(path string, data []byte, perm fs.FileMode) error {
+// stageFile writes data to a temporary file alongside path and returns its
+// name, ready to be renamed into place.
+//
+// Staging and installing are separate steps so that a caller installing more
+// than one file can get every fallible operation — allocation, write, chmod,
+// close — out of the way before making any of it visible. The mode is applied
+// with Chmod rather than left to OpenFile, so it is not subject to umask, and a
+// caller that returns without renaming must remove the temporary file.
+func stageFile(path string, data []byte, perm fs.FileMode) (string, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
-		return fmt.Errorf("transport: create %s: %w", dir, err)
+		return "", fmt.Errorf("transport: create %s: %w", dir, err)
 	}
 	if err := os.Chmod(dir, dirPerm); err != nil {
-		return fmt.Errorf("transport: secure %s: %w", dir, err)
+		return "", fmt.Errorf("transport: secure %s: %w", dir, err)
 	}
 
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("transport: create temporary file: %w", err)
+		return "", fmt.Errorf("transport: create temporary file: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
 
-	if err := tmp.Chmod(perm); err != nil {
+	// Any failure past this point leaves a temporary file behind, so each one
+	// removes it: the caller has no name to clean up until this returns.
+	fail := func(format string, err error) (string, error) {
 		tmp.Close()
-		return fmt.Errorf("transport: set permissions: %w", err)
+		os.Remove(tmpName)
+		return "", fmt.Errorf(format, err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		return fail("transport: set permissions: %w", err)
 	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("transport: write: %w", err)
+		return fail("transport: write: %w", err)
+	}
+	// Sync before the rename: without it the directory entry can reach disk
+	// ahead of the contents, and a machine that loses power mid-rotation comes
+	// back with a correctly named, empty private key.
+	if err := tmp.Sync(); err != nil {
+		return fail("transport: sync: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("transport: close: %w", err)
+		os.Remove(tmpName)
+		return "", fmt.Errorf("transport: close: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("transport: install %s: %w", path, err)
-	}
-	return nil
+	return tmpName, nil
 }
