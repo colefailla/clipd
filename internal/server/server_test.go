@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -146,24 +147,36 @@ func (h *harness) dialPlaintext() net.Conn {
 
 func dialTLS(t *testing.T, addr string, pin []byte, deadline time.Duration) net.Conn {
 	t.Helper()
+	conn, err := tryDialTLS(addr, pin, deadline)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return conn
+}
 
+// tryDialTLS is dialTLS returning an error instead of failing the test, for
+// goroutines other than the one running the test function — t.Fatalf is
+// documented as unusable from those.
+func tryDialTLS(addr string, pin []byte, deadline time.Duration) (net.Conn, error) {
 	rawConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		return nil, fmt.Errorf("dial: %w", err)
 	}
 	if err := rawConn.SetDeadline(time.Now().Add(deadline)); err != nil {
-		t.Fatalf("set deadline: %v", err)
+		rawConn.Close()
+		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 	clientConfig, err := transport.ClientConfig(pin)
 	if err != nil {
-		t.Fatalf("client config: %v", err)
+		rawConn.Close()
+		return nil, fmt.Errorf("client config: %w", err)
 	}
 	conn := tls.Client(rawConn, clientConfig)
 	if err := conn.HandshakeContext(context.Background()); err != nil {
 		rawConn.Close()
-		t.Fatalf("TLS handshake: %v", err)
+		return nil, fmt.Errorf("TLS handshake: %w", err)
 	}
-	return conn
+	return conn, nil
 }
 
 func readResponse(conn net.Conn) (protocol.Status, string, error) {
@@ -243,7 +256,7 @@ func TestBadTokenIsRejected(t *testing.T) {
 			if status != protocol.StatusAuthFailed {
 				t.Errorf("status = %v, want auth failed", status)
 			}
-			if h.clip.Writes != 0 {
+			if h.clip.WriteCount() != 0 {
 				t.Error("an unauthenticated request reached the clipboard")
 			}
 		})
@@ -276,7 +289,7 @@ func TestOversizedPayloadIsRejected(t *testing.T) {
 	if status != protocol.StatusPayloadTooLarge {
 		t.Fatalf("status = %v (%s), want payload too large", status, message)
 	}
-	if h.clip.Writes != 0 {
+	if h.clip.WriteCount() != 0 {
 		t.Error("an oversized payload reached the clipboard")
 	}
 	if !strings.Contains(message, "4096") {
@@ -310,7 +323,7 @@ func TestOversizedPayloadIsRejectedBeforeTheBody(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("server took %s to reject; it appears to have waited for the body", elapsed)
 	}
-	if h.clip.Writes != 0 {
+	if h.clip.WriteCount() != 0 {
 		t.Error("the clipboard was touched")
 	}
 }
@@ -354,7 +367,7 @@ func TestMalformedRequests(t *testing.T) {
 			if status != protocol.StatusMalformed {
 				t.Errorf("status = %v, want malformed", status)
 			}
-			if h.clip.Writes != 0 {
+			if h.clip.WriteCount() != 0 {
 				t.Error("a malformed request reached the clipboard")
 			}
 		})
@@ -398,7 +411,7 @@ func TestTruncatedPayloadIsRejected(t *testing.T) {
 	if status != protocol.StatusMalformed {
 		t.Errorf("status = %v, want malformed", status)
 	}
-	if h.clip.Writes != 0 {
+	if h.clip.WriteCount() != 0 {
 		t.Error("a truncated payload reached the clipboard")
 	}
 }
@@ -511,7 +524,7 @@ func TestPlaintextClientGetsAnExplanation(t *testing.T) {
 	if !strings.Contains(strings.ToLower(message), "tls") {
 		t.Errorf("message = %q, want it to explain that TLS is required", message)
 	}
-	if h.clip.Writes != 0 {
+	if h.clip.WriteCount() != 0 {
 		t.Error("an unencrypted request reached the clipboard")
 	}
 }
@@ -550,8 +563,56 @@ func TestWrongPinIsRejected(t *testing.T) {
 	if !errors.As(err, &mismatch) {
 		t.Errorf("error = %v (%T), want a PinMismatchError", err, err)
 	}
-	if h.clip.Writes != 0 {
+	if h.clip.WriteCount() != 0 {
 		t.Error("the clipboard was touched despite a failed handshake")
+	}
+}
+
+// TestRejectionSurvivesAnInFlightBody pins the drain behaviour: when the
+// server rejects on the header alone while the client is still streaming a
+// large body, the status frame must still reach the client. Without the
+// drain, closing with unread bytes aborts the connection with RST, which can
+// destroy the response before the client reads it.
+func TestRejectionSurvivesAnInFlightBody(t *testing.T) {
+	t.Parallel()
+
+	// Larger than any loopback socket buffer, so the client genuinely blocks
+	// mid-write while the server rejects.
+	body := bytes.Repeat([]byte("x"), 4<<20)
+
+	tests := []struct {
+		name  string
+		token string
+		want  protocol.Status
+	}{
+		{"auth failure", "not-the-right-token-at-all", protocol.StatusAuthFailed},
+		{"payload too large", testToken, protocol.StatusPayloadTooLarge},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t, withMaxPayload(1024))
+
+			conn := h.dial()
+			defer conn.Close()
+
+			// WriteRequest sends header and body in one call; the server
+			// rejects on the header and must drain the rest.
+			_ = protocol.WriteRequest(conn, tc.token, body)
+
+			status, _, err := protocol.ReadResponse(conn)
+			if err != nil {
+				t.Fatalf("the rejection was lost: %v", err)
+			}
+			if status != tc.want {
+				t.Errorf("status = %v, want %v", status, tc.want)
+			}
+			if h.clip.WriteCount() != 0 {
+				t.Error("a rejected request reached the clipboard")
+			}
+		})
 	}
 }
 
@@ -584,7 +645,11 @@ func TestConcurrentCopies(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			conn := dialTLS(t, h.addr, h.pin, 20*time.Second)
+			conn, err := tryDialTLS(h.addr, h.pin, 20*time.Second)
+			if err != nil {
+				errs <- err
+				return
+			}
 			defer conn.Close()
 			if err := protocol.WriteRequest(conn, testToken, []byte{byte(i)}); err != nil {
 				errs <- err
@@ -607,8 +672,8 @@ func TestConcurrentCopies(t *testing.T) {
 		t.Errorf("concurrent copy failed: %v", err)
 	}
 
-	if h.clip.Writes != clients {
-		t.Errorf("clipboard writes = %d, want %d", h.clip.Writes, clients)
+	if h.clip.WriteCount() != clients {
+		t.Errorf("clipboard writes = %d, want %d", h.clip.WriteCount(), clients)
 	}
 }
 
@@ -902,8 +967,8 @@ func TestParallelCopiesFromOneHostAreNotRationed(t *testing.T) {
 	for err := range errs {
 		t.Errorf("parallel copy from one host was rejected: %v", err)
 	}
-	if h.clip.Writes != clients {
-		t.Errorf("clipboard writes = %d, want %d", h.clip.Writes, clients)
+	if h.clip.WriteCount() != clients {
+		t.Errorf("clipboard writes = %d, want %d", h.clip.WriteCount(), clients)
 	}
 }
 
@@ -1017,8 +1082,8 @@ func TestCopiesQueueWithinTheMemoryBudget(t *testing.T) {
 	for err := range errs {
 		t.Errorf("copy was rejected instead of queued: %v", err)
 	}
-	if h.clip.Writes != clients {
-		t.Errorf("clipboard writes = %d, want %d", h.clip.Writes, clients)
+	if h.clip.WriteCount() != clients {
+		t.Errorf("clipboard writes = %d, want %d", h.clip.WriteCount(), clients)
 	}
 	if got := h.srv.mem.inUse(); got != 0 {
 		t.Errorf("%d bytes of budget still reserved after every copy finished", got)

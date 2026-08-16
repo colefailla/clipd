@@ -28,7 +28,11 @@ func cmdSetup(_ context.Context, e *env, g *globalOptions, args []string) int {
 		return code
 	}
 
-	cfg, path, err := loadConfig(e, g)
+	// File and flags only: a CLIPD_* override active during setup must not
+	// be baked into the stored config — with CLIPD_TOKEN set it would even
+	// be persisted as the daemon's permanent secret in place of a generated
+	// one.
+	cfg, path, err := loadFileConfig(e, g)
 	if err != nil {
 		return fail(e, exitConfig, err)
 	}

@@ -28,9 +28,11 @@ func cmdConfigure(_ context.Context, e *env, g *globalOptions, args []string) in
 		return code
 	}
 
-	// loadConfig has already folded the global -timeout flag into cfg, so
-	// `clipd configure -timeout 10s` stores the value it parsed.
-	cfg, path, err := loadConfig(e, g)
+	// loadFileConfig folds the global -timeout flag into cfg, so `clipd
+	// configure -timeout 10s` stores the value it parsed — but skips the
+	// CLIPD_* environment overrides, which exist for one-off runs and must
+	// not be silently persisted by a configure that never mentioned them.
+	cfg, path, err := loadFileConfig(e, g)
 	if err != nil {
 		return fail(e, exitConfig, err)
 	}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -29,6 +30,15 @@ type result struct {
 // exec runs the CLI with an isolated environment and captures its output.
 func exec(t *testing.T, stdin string, piped bool, args ...string) result {
 	t.Helper()
+	// An empty environment keeps the developer's real CLIPD_* variables
+	// from leaking into the tests.
+	return execEnv(t, stdin, piped, func(string) string { return "" }, args...)
+}
+
+// execEnv is exec with an explicit fake environment, for tests about the
+// CLIPD_* variables themselves.
+func execEnv(t *testing.T, stdin string, piped bool, getenv func(string) string, args ...string) result {
+	t.Helper()
 
 	var out, errOut bytes.Buffer
 	e := &env{
@@ -36,9 +46,7 @@ func exec(t *testing.T, stdin string, piped bool, args ...string) result {
 		stdout:      &out,
 		stderr:      &errOut,
 		stdinIsPipe: piped,
-		// An empty environment keeps the developer's real CLIPD_* variables
-		// from leaking into the tests.
-		getenv: func(string) string { return "" },
+		getenv:      getenv,
 	}
 	code := run(context.Background(), args, e)
 	return result{code: code, stdout: out.String(), stderr: errOut.String()}
@@ -232,6 +240,19 @@ func TestEndToEndExitCodes(t *testing.T) {
 			stdin: "data",
 			want:  exitConfig,
 		},
+		{
+			// The security-relevant code: a pinned fingerprint that does not
+			// match the daemon's key must exit 5, distinguishable from a
+			// daemon that is merely down.
+			name: "wrong fingerprint",
+			cfg: func() config.Config {
+				c := base()
+				c.ServerFingerprint = "sha256:" + strings.Repeat("cd", 32)
+				return c
+			}(),
+			stdin: "data",
+			want:  exitTLS,
+		},
 	}
 
 	for _, tc := range tests {
@@ -348,6 +369,39 @@ func TestHelp(t *testing.T) {
 		}
 		if !strings.Contains(got.stdout, "Usage:") {
 			t.Errorf("stdout = %q, want usage text", got.stdout)
+		}
+		// Exactly once: the flag package's automatic usage print is
+		// suppressed, so help must not also appear on stderr.
+		if got.stderr != "" {
+			t.Errorf("stderr = %q, want empty (usage printed twice?)", got.stderr)
+		}
+	})
+
+	t.Run("subcommand -h goes to stdout", func(t *testing.T) {
+		t.Parallel()
+		got := exec(t, "", false, "copy", "-h")
+		if got.code != exitOK {
+			t.Errorf("exit code = %d, want 0", got.code)
+		}
+		if !strings.Contains(got.stdout, "clipd copy") {
+			t.Errorf("stdout = %q, want the copy usage", got.stdout)
+		}
+		if got.stderr != "" {
+			t.Errorf("stderr = %q, want empty", got.stderr)
+		}
+	})
+
+	t.Run("unknown flag reports the error once", func(t *testing.T) {
+		t.Parallel()
+		got := exec(t, "", false, "-nonsense")
+		if got.code != exitUsage {
+			t.Errorf("exit code = %d, want %d", got.code, exitUsage)
+		}
+		if !strings.Contains(got.stderr, "-nonsense") {
+			t.Errorf("stderr = %q, want it to name the flag", got.stderr)
+		}
+		if n := strings.Count(got.stderr, "Usage:"); n != 1 {
+			t.Errorf("usage printed %d times on stderr, want once", n)
 		}
 	})
 }
@@ -511,13 +565,16 @@ func TestConfigureWithFlags(t *testing.T) {
 	}
 
 	// The file holds the token in plaintext and must not be readable by
-	// anyone else.
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat config: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != config.FilePerm {
-		t.Errorf("config mode = %04o, want %04o", perm, config.FilePerm)
+	// anyone else. Windows has no Unix permission bits, so the check only
+	// means something elsewhere.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat config: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != config.FilePerm {
+			t.Errorf("config mode = %04o, want %04o", perm, config.FilePerm)
+		}
 	}
 }
 
@@ -595,13 +652,78 @@ func TestConfigureInteractive(t *testing.T) {
 	}
 }
 
+// TestConfigureDoesNotPersistEnvOverrides pins the split between the two
+// override channels: CLIPD_* variables exist for one-off runs and must never
+// be baked into the file by a configure or setup that never mentioned them.
+func TestConfigureDoesNotPersistEnvOverrides(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	envVars := map[string]string{
+		"CLIPD_SERVER": "transient-host.local",
+		"CLIPD_PORT":   "9999",
+	}
+	getenv := func(k string) string { return envVars[k] }
+
+	got := execEnv(t, "", false, getenv, "-config", path, "configure",
+		"-server", "real-mac.local", "-token", testToken,
+		"-fingerprint", "sha256:"+strings.Repeat("ab", 32))
+	if got.code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ServerAddress != "real-mac.local" {
+		t.Errorf("server = %q, want the flag value, not the CLIPD_SERVER override", cfg.ServerAddress)
+	}
+	if cfg.Port != config.DefaultPort {
+		t.Errorf("port = %d, want the default %d, not the CLIPD_PORT override", cfg.Port, config.DefaultPort)
+	}
+}
+
+// TestSetupGeneratesATokenDespiteEnvToken covers the sharper end of the same
+// bug: with CLIPD_TOKEN exported, setup must still generate a real secret
+// rather than persisting the transient environment value as the daemon's.
+func TestSetupGeneratesATokenDespiteEnvToken(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	getenv := func(k string) string {
+		if k == "CLIPD_TOKEN" {
+			return "transient-env-token-value-here"
+		}
+		return ""
+	}
+
+	got := execEnv(t, "", false, getenv, "-config", path, "setup")
+	if got.code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Token == "transient-env-token-value-here" {
+		t.Error("setup persisted the CLIPD_TOKEN override instead of generating a token")
+	}
+	if len(cfg.Token) < 32 {
+		t.Errorf("token is %d characters, want a full-entropy generated value", len(cfg.Token))
+	}
+}
+
 func TestBadTimeoutFlagIsRejected(t *testing.T) {
 	t.Parallel()
 
 	path := writeConfig(t, config.Default())
 	got := exec(t, "data", true, "-config", path, "-timeout", "30", "copy")
-	if got.code != exitConfig {
-		t.Errorf("exit code = %d, want %d", got.code, exitConfig)
+	// A malformed flag value is a usage error like any other bad flag;
+	// exit 4 is reserved for problems with the config file or environment.
+	if got.code != exitUsage {
+		t.Errorf("exit code = %d, want %d", got.code, exitUsage)
 	}
 	if !strings.Contains(got.stderr, "timeout") {
 		t.Errorf("stderr = %q, want it to mention the timeout", got.stderr)
@@ -717,6 +839,9 @@ func TestUsageErrorGoesToStderr(t *testing.T) {
 
 func TestPermissionWarning(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not meaningful on Windows")
+	}
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "secret")

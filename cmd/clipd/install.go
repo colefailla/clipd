@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 
 	"github.com/colefailla/clipd/internal/auth"
@@ -27,7 +29,9 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 		return fail(e, exitFailure, launchagent.ErrUnsupported)
 	}
 
-	cfg, path, err := loadConfig(e, g)
+	// File and flags only, like setup: install persists the config, and a
+	// transient CLIPD_* override must not end up in it.
+	cfg, path, err := loadFileConfig(e, g)
 	if err != nil {
 		return fail(e, exitConfig, err)
 	}
@@ -62,8 +66,15 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 
 	// The agent inherits no shell environment, so a non-default config path
 	// has to be pinned into the plist or the daemon would read the default.
+	// Pinned as an absolute path: launchd starts agents with / as the
+	// working directory, so a relative -config that worked for this command
+	// would leave the daemon reading a file that does not exist and
+	// crash-looping under KeepAlive.
 	opts := launchagent.Options{ExecutablePath: *execPath}
 	if g.configPath != "" || e.getenv("CLIPD_CONFIG") != "" {
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
 		opts.ConfigPath = path
 	}
 
@@ -126,5 +137,18 @@ func cmdUninstall(ctx context.Context, e *env, g *globalOptions, args []string) 
 	if path, err := config.ResolvePath(g.configPath); err == nil && config.Exists(path) {
 		fmt.Fprintf(e.stdout, "The config file still holds the token: %s\n", path)
 	}
+	// The log directory is launchd's output, not clipd state, so it is left
+	// in place too — but silently orphaning it would be untidy.
+	if logPath, err := launchagent.LogPath(); err == nil {
+		if dir := filepath.Dir(logPath); dirExists(dir) {
+			fmt.Fprintf(e.stdout, "Log files remain in %s\n", dir)
+		}
+	}
 	return exitOK
+}
+
+// dirExists reports whether path is an existing directory.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }

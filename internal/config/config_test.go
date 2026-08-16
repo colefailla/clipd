@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 // in plaintext, so anything readable beyond the owner is a leak.
 func TestSavePermissions(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not meaningful on Windows")
+	}
 
 	dir := filepath.Join(t.TempDir(), "clipd")
 	path := filepath.Join(dir, "config.json")
@@ -91,6 +95,9 @@ func TestSavePermissions(t *testing.T) {
 // already exists with loose permissions is not fixed by MkdirAll.
 func TestSaveTightensExistingDirectory(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not meaningful on Windows")
+	}
 
 	dir := filepath.Join(t.TempDir(), "clipd")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

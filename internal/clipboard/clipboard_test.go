@@ -18,8 +18,8 @@ func TestFakeStoresBytesVerbatim(t *testing.T) {
 	if got := f.Data(); !bytes.Equal(got, payload) {
 		t.Errorf("Data = %q, want %q", got, payload)
 	}
-	if f.Writes != 1 {
-		t.Errorf("Writes = %d, want 1", f.Writes)
+	if f.WriteCount() != 1 {
+		t.Errorf("Writes = %d, want 1", f.WriteCount())
 	}
 }
 

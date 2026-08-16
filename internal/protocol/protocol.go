@@ -21,10 +21,11 @@
 //	[..] message      human-readable, for diagnostics only
 //
 // There is no separate authentication handshake. The token travels in the
-// same frame as the payload because an extra round trip would buy nothing:
-// v1 runs over plain TCP, so anyone able to observe a challenge-response
-// exchange can equally observe the payload itself (see README security
-// notes). Keeping it to one frame keeps both sides trivial to reason about.
+// same frame as the payload because the frame only ever crosses the wire
+// inside TLS 1.3 with the server's key pinned: the channel is confidential
+// and the server is authenticated before the first byte of it is written, so
+// an extra challenge-response round trip would buy nothing. Keeping it to
+// one frame keeps both sides trivial to reason about.
 //
 // This package deliberately contains no networking policy: no dials, no
 // deadlines, no retries. It only reads and writes frames from io.Reader and

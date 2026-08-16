@@ -75,6 +75,10 @@ func cmdCopy(ctx context.Context, e *env, g *globalOptions, args []string) int {
 }
 
 // readPayload reads the copy source: a named file, or stdin.
+//
+// Failures to even open the source are usage errors: they describe the
+// invocation, not the network or the config, and the documented exit 1 is
+// reserved for connection and server failures.
 func readPayload(e *env, files []string, max int64) ([]byte, error) {
 	if len(files) == 1 && files[0] != "-" {
 		name := files[0]
@@ -84,16 +88,16 @@ func readPayload(e *env, files []string, max int64) ([]byte, error) {
 			// a known command is treated as a filename. Point at the command
 			// list so the cause is obvious.
 			if errors.Is(err, fs.ErrNotExist) {
-				return nil, fmt.Errorf("%s: no such file (run 'clipd help' for the list of commands)", name)
+				return nil, usageError{fmt.Errorf("%s: no such file (run 'clipd help' for the list of commands)", name)}
 			}
-			return nil, fmt.Errorf("open %s: %w", name, err)
+			return nil, usageError{fmt.Errorf("open %s: %w", name, err)}
 		}
 		defer f.Close()
 		return client.ReadInput(f, max)
 	}
 
 	if len(files) == 0 && !e.stdinIsPipe {
-		return nil, errors.New("no input: pipe data into clipd or pass a file")
+		return nil, usageError{errors.New("no input: pipe data into clipd or pass a file")}
 	}
 	return client.ReadInput(e.stdin, max)
 }

@@ -135,11 +135,14 @@ func Copy(ctx context.Context, opts Options, payload []byte) (Result, error) {
 		timeout = 5 * time.Second
 	}
 
-	// The context bounds the whole operation; the per-connection deadlines
-	// below bound each phase of it. Both exist because a context alone cannot
-	// interrupt a blocked syscall on a net.Conn.
-	deadline := timeout + payloadAllowance(len(payload))
-	ctx, cancel := context.WithTimeout(ctx, deadline)
+	// The context bounds the whole operation; the per-phase deadlines below
+	// bound each step of it. Both exist because a context alone cannot
+	// interrupt a blocked syscall on a net.Conn. The dial and the handshake
+	// involve a handful of bytes each, so they get the flat timeout —
+	// anything longer is a stall, not a slow link. Everything after the
+	// handshake shares the size-scaled allowance.
+	overall := timeout + payloadAllowance(len(payload))
+	ctx, cancel := context.WithTimeout(ctx, overall)
 	defer cancel()
 
 	dialer := net.Dialer{Timeout: timeout}
@@ -149,7 +152,7 @@ func Copy(ctx context.Context, opts Options, payload []byte) (Result, error) {
 	}
 	defer rawConn.Close()
 
-	if err := rawConn.SetDeadline(time.Now().Add(deadline)); err != nil {
+	if err := rawConn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return Result{}, newError(KindConnect, "set deadline: %w", err)
 	}
 
@@ -159,6 +162,15 @@ func Copy(ctx context.Context, opts Options, payload []byte) (Result, error) {
 	conn := tls.Client(rawConn, opts.TLS)
 	if err := conn.HandshakeContext(ctx); err != nil {
 		return Result{}, handshakeError(opts.Address, err)
+	}
+
+	// The handshake is done; one absolute deadline covers everything that
+	// remains — body, flush and acknowledgement. The acknowledgement cannot
+	// get its own flat window: Flush returning only means the last byte
+	// entered the kernel's send buffer, and on a slow link the server may
+	// still be receiving the body for most of the allowance after that.
+	if err := conn.SetDeadline(time.Now().Add(overall)); err != nil {
+		return Result{}, newError(KindConnect, "set deadline: %w", err)
 	}
 
 	// Buffering keeps the header out of its own packet, so a small copy

@@ -247,10 +247,16 @@ func Status(ctx context.Context) (State, error) {
 	return st, nil
 }
 
-// resolveExecutable determines the absolute, symlink-free path to embed in
-// the plist. launchd re-executes this path at every login, so a relative path
-// or one that resolves differently later would produce an agent that silently
-// stops working.
+// resolveExecutable determines the absolute path to embed in the plist.
+// launchd re-executes this path at every login, so a relative path would
+// produce an agent that silently stops working.
+//
+// An explicit override is embedded as given (absolutized only): a
+// package-manager path like /opt/homebrew/bin/clipd is deliberately a
+// symlink, and retargeting it is how upgrades work — resolving it would bake
+// in a versioned path that the next upgrade deletes. Only the self-detected
+// path is resolved through symlinks, since os.Executable may report a
+// transient link rather than the binary itself.
 func resolveExecutable(override string) (string, error) {
 	path := override
 	if path == "" {
@@ -258,15 +264,17 @@ func resolveExecutable(override string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("locate clipd executable: %w", err)
 		}
+		if resolved, err := filepath.EvalSymlinks(self); err == nil {
+			self = resolved
+		}
 		path = self
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve %s: %w", path, err)
 	}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = resolved
-	}
+	// Stat follows symlinks, so an override that is a link is still verified
+	// to point at something executable.
 	info, err := os.Stat(abs)
 	if err != nil {
 		return "", fmt.Errorf("clipd executable %s: %w", abs, err)

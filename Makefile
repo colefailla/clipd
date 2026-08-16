@@ -20,7 +20,10 @@ PREFIX ?= /usr/local
 
 # sudo is used only when the install directory is not writable as-is, so
 # installing into a user-owned prefix (PREFIX=$HOME/.local) needs no password.
-SUDO := $(shell test -w "$(PREFIX)/bin" || echo sudo)
+# Missing directories fall back to testing the nearest existing ancestor, so
+# a user prefix that has not been created yet does not force sudo (which
+# would leave a root-owned directory inside the user's home).
+SUDO := $(shell p="$(PREFIX)/bin"; while [ ! -e "$$p" ]; do p=$$(dirname "$$p"); done; test -w "$$p" || echo sudo)
 
 # Must match launchagent.Label. Changing one without the other leaves an
 # orphaned service loaded under the old name.

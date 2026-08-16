@@ -95,16 +95,11 @@ func TestInstallWritesAndLoads(t *testing.T) {
 	if res.PlistPath != wantPlist {
 		t.Errorf("PlistPath = %q, want %q", res.PlistPath, wantPlist)
 	}
-	// The recorded path is symlink-resolved, which on macOS turns the temp
-	// directory's /var prefix into /private/var. That resolution is the point:
-	// launchd re-executes this path at every login, so it must not depend on a
-	// symlink that could later point elsewhere.
-	wantExec, err := filepath.EvalSymlinks(execPath)
-	if err != nil {
-		t.Fatalf("resolve expected path: %v", err)
-	}
-	if res.ExecutablePath != wantExec {
-		t.Errorf("ExecutablePath = %q, want %q", res.ExecutablePath, wantExec)
+	// An explicit -exec path is recorded as given: a package-manager path is
+	// deliberately a symlink whose retargeting is the upgrade mechanism, so
+	// resolving it would bake in a versioned target the next upgrade deletes.
+	if res.ExecutablePath != execPath {
+		t.Errorf("ExecutablePath = %q, want %q", res.ExecutablePath, execPath)
 	}
 
 	info, err := os.Stat(wantPlist)
@@ -125,8 +120,8 @@ func TestInstallWritesAndLoads(t *testing.T) {
 		t.Errorf("plist is not well-formed XML: %v", err)
 	}
 	body := string(data)
-	if !strings.Contains(body, "<string>"+wantExec+"</string>") {
-		t.Errorf("plist does not point at the resolved binary:\n%s", body)
+	if !strings.Contains(body, "<string>"+execPath+"</string>") {
+		t.Errorf("plist does not point at the binary:\n%s", body)
 	}
 	if !strings.Contains(body, "<string>serve</string>") {
 		t.Error("plist does not pass the serve subcommand")
@@ -474,8 +469,11 @@ func TestResolveExecutable(t *testing.T) {
 		t.Errorf("resolved to %q, want an absolute path", got)
 	}
 
-	// A symlink must resolve to its target: launchd re-executes this path at
-	// every login, and a link that later points elsewhere is a silent break.
+	// An explicit symlink is honoured, not resolved: for a Homebrew-style
+	// layout the public path is a symlink and its target is version-specific,
+	// so recording the target would break on the next upgrade. The link must
+	// still point at something executable, which Stat (following links)
+	// verifies.
 	link := filepath.Join(t.TempDir(), "clipd-link")
 	if err := os.Symlink(good, link); err != nil {
 		t.Fatalf("symlink: %v", err)
@@ -484,8 +482,8 @@ func TestResolveExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveExecutable on a symlink: %v", err)
 	}
-	if resolved == link {
-		t.Error("the symlink was recorded rather than its target")
+	if resolved != link {
+		t.Errorf("resolved to %q, want the symlink %q recorded as given", resolved, link)
 	}
 
 	for _, bad := range []string{

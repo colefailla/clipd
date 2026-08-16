@@ -14,8 +14,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/colefailla/clipd/internal/auth"
@@ -104,6 +106,13 @@ const (
 	// shutdownGrace is how long Shutdown waits for in-flight copies before
 	// giving up on them.
 	shutdownGrace = 5 * time.Second
+
+	// drainCap bounds how much of a rejected request is discarded when the
+	// request's declared length is unknown or unusable. See drainRequest.
+	drainCap = 64 << 10
+
+	// maxAcceptBackoff caps the retry delay after a transient accept failure.
+	maxAcceptBackoff = time.Second
 
 	// warnWindow and warnBudget bound how many peer-driven warnings reach the
 	// log per window.
@@ -347,6 +356,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		// The contract is that Serve closes ln before returning; keeping it
+		// open here would leave the port bound and connections piling up in a
+		// backlog nobody drains.
+		_ = ln.Close()
 		return errors.New("server: already shut down")
 	}
 	s.listener = ln
@@ -368,6 +381,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		"clipboard", s.clip.Name(),
 		"max_payload_bytes", s.maxPayload)
 
+	var backoff time.Duration
 	for {
 		// Acquire capacity before accepting. Blocking here applies back
 		// pressure through the kernel's accept queue instead of piling up
@@ -390,13 +404,28 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			if ctx.Err() != nil || s.isClosed() {
 				return s.drain(ctx)
 			}
-			// A transient accept error (EMFILE, ECONNABORTED) should not kill
-			// a daemon the user expects to stay up until launchd stops it.
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			// A transient accept error should not kill a daemon the user
+			// expects to stay up until launchd stops it. ECONNABORTED is
+			// retried inside the runtime and never surfaces here; what does
+			// surface is fd exhaustion (EMFILE/ENFILE), which the daemon rides
+			// out with the same capped backoff net/http uses.
+			if isTemporaryAcceptErr(err) {
+				if backoff == 0 {
+					backoff = 5 * time.Millisecond
+				} else {
+					backoff = min(backoff*2, maxAcceptBackoff)
+				}
+				s.log.Warn("accept failed; retrying", "error", err, "backoff", backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return s.drain(ctx)
+				}
 				continue
 			}
 			return fmt.Errorf("accept: %w", err)
 		}
+		backoff = 0
 
 		// A connection accepted in the instant before the listener closed
 		// would otherwise register itself after Shutdown began waiting, which
@@ -539,6 +568,7 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 		}
 		s.warnPeer("malformed request", "remote", remote, "error", err)
 		s.respond(conn, protocol.StatusMalformed, err.Error())
+		s.drainRequest(conn, reader, drainCap, min(s.timeout, handshakeTimeout))
 		return
 	}
 
@@ -550,6 +580,12 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 		// guessing, and applies equally to peers that never guess at all.
 		s.warnPeer("authentication failed", "remote", remote)
 		s.respond(conn, protocol.StatusAuthFailed, "authentication failed")
+		// The declared length has not been read on this path; consume it so
+		// the drain can cover a body the client is mid-way through sending.
+		// The window stays the unproven-phase one: this peer holds no token.
+		if n, err := protocol.ReadPayloadLen(reader); err == nil {
+			s.drainRequest(conn, reader, n, min(s.timeout, handshakeTimeout))
+		}
 		return
 	}
 	// The peer has proved it holds the token, so it no longer counts against
@@ -570,6 +606,9 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 		workCancel()
 		s.warnPeer("no copy capacity available", "remote", remote, "limit", cap(s.sem))
 		s.respond(conn, protocol.StatusInternalError, "server is busy: too many copies in progress")
+		if n, err := protocol.ReadPayloadLen(reader); err == nil {
+			s.drainRequest(conn, reader, n, s.timeout)
+		}
 		return
 	}
 
@@ -582,8 +621,15 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 
 	payloadLen, err := protocol.ReadPayloadLen(reader)
 	if err != nil {
+		if isTimeout(err) {
+			// Same policy as the prologue: a peer that blew its deadline gets
+			// no response and therefore no fresh deadline window.
+			s.warnPeer("connection timed out reading the payload length", "remote", remote)
+			return
+		}
 		s.warnPeer("malformed request", "remote", remote, "error", err)
 		s.respond(conn, protocol.StatusMalformed, err.Error())
+		s.drainRequest(conn, reader, drainCap, s.timeout)
 		return
 	}
 
@@ -595,6 +641,7 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 			"declared_bytes", payloadLen, "limit_bytes", s.maxPayload)
 		s.respond(conn, protocol.StatusPayloadTooLarge,
 			fmt.Sprintf("payload of %d bytes exceeds the server limit of %d bytes", payloadLen, s.maxPayload))
+		s.drainRequest(conn, reader, payloadLen, s.timeout)
 		return
 	}
 
@@ -619,6 +666,7 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 		// "unexpected server status" on anything not yet upgraded.
 		s.respond(conn, protocol.StatusInternalError,
 			"server is busy: not enough memory budget for a payload this size")
+		s.drainRequest(conn, reader, payloadLen, s.timeout)
 		return
 	}
 	defer s.mem.release(int64(payloadLen))
@@ -635,6 +683,7 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 			return
 		}
 		s.respond(conn, protocol.StatusMalformed, err.Error())
+		s.drainRequest(conn, reader, drainCap, s.timeout)
 		return
 	}
 
@@ -692,6 +741,7 @@ func (s *Server) startTLS(ctx context.Context, rawConn net.Conn, remote string) 
 			_ = protocol.WriteResponse(rawConn, protocol.StatusMalformed,
 				"this daemon requires TLS; upgrade clipd on the client machine (see clipd version)")
 		}
+		s.drainRequest(rawConn, sniff, drainCap, min(s.timeout, handshakeTimeout))
 		return nil, nil, false
 	}
 
@@ -725,6 +775,30 @@ func (s *Server) respond(conn net.Conn, status protocol.Status, message string) 
 	}
 }
 
+// drainRequest discards up to n bytes of an already-rejected request before
+// the connection is closed.
+//
+// Closing a socket with unread data in its receive queue makes the kernel
+// send RST rather than FIN, and an RST can destroy the status frame written
+// just before the close — the client then reports a connection failure
+// instead of the rejection, with the wrong exit code. Draining first lets the
+// close deliver the response, for the same reason net/http drains request
+// bodies. The drain is bounded by n and by window — callers pass the
+// unproven-phase window for peers that have not authenticated — so a hostile
+// peer cannot hold the slot open by trickling bytes.
+func (s *Server) drainRequest(conn net.Conn, r io.Reader, n uint64, window time.Duration) {
+	if n == 0 {
+		return
+	}
+	if n > math.MaxInt64 {
+		n = math.MaxInt64
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
+		return
+	}
+	_, _ = io.CopyN(io.Discard, r, int64(n))
+}
+
 // payloadTimeout scales the read deadline with the declared payload size.
 func (s *Server) payloadTimeout(n uint64) time.Duration {
 	return s.timeout + time.Duration(n/minThroughput)*time.Second
@@ -732,6 +806,17 @@ func (s *Server) payloadTimeout(n uint64) time.Duration {
 
 // isTimeout reports whether an error came from an expired deadline.
 func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// isTemporaryAcceptErr recognises accept failures worth retrying rather than
+// exiting over: file-descriptor exhaustion, and timeouts from any listener
+// that happens to carry a deadline.
+func isTemporaryAcceptErr(err error) bool {
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+		return true
+	}
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
 }

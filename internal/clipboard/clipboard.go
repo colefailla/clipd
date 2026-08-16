@@ -35,11 +35,12 @@ type Clipboard interface {
 type Fake struct {
 	mu   sync.Mutex
 	data []byte
+	// writes counts successful and failed calls alike. It is read through
+	// WriteCount so tests on other goroutines get a synchronised view.
+	writes int
 	// Err, when set, is returned by Write instead of storing the data. It
 	// lets tests exercise the server's internal-error path.
 	Err error
-	// Writes counts successful and failed calls alike.
-	Writes int
 }
 
 // Write records data. It copies the input so a caller reusing its buffer
@@ -47,7 +48,7 @@ type Fake struct {
 func (f *Fake) Write(ctx context.Context, data []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.Writes++
+	f.writes++
 	if f.Err != nil {
 		return f.Err
 	}
@@ -66,4 +67,13 @@ func (f *Fake) Data() []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]byte(nil), f.data...)
+}
+
+// WriteCount reports how many times Write has been called. Server handlers
+// call Write on their own goroutines, so tests must read the count through
+// the same mutex those writes hold — a bare field read would be a data race.
+func (f *Fake) WriteCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.writes
 }
