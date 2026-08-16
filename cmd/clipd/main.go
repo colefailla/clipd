@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"strings"
 
 	"github.com/colefailla/clipd/internal/client"
 	"github.com/colefailla/clipd/internal/config"
@@ -98,8 +100,12 @@ func run(ctx context.Context, args []string, e *env) int {
 	var g globalOptions
 
 	fs := flag.NewFlagSet("clipd", flag.ContinueOnError)
-	fs.SetOutput(e.stderr)
-	fs.Usage = func() { printUsage(e.stderr) }
+	// The flag package prints its own error and calls Usage on every parse
+	// failure, including -h. Both are suppressed so help lands once on
+	// stdout and errors land once on stderr, instead of usage appearing
+	// twice on a terminal where the two streams interleave.
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 	registerGlobalFlags(fs, &g)
 
 	if err := fs.Parse(args); err != nil {
@@ -107,6 +113,8 @@ func run(ctx context.Context, args []string, e *env) int {
 			printUsage(e.stdout)
 			return exitOK
 		}
+		fmt.Fprintf(e.stderr, "clipd: %v\n\n", err)
+		printUsage(e.stderr)
 		return exitUsage
 	}
 
@@ -149,7 +157,16 @@ func registerGlobalFlags(fs *flag.FlagSet, g *globalOptions) {
 	fs.StringVar(&g.configPath, "config", g.configPath, "path to the clipd config file")
 	fs.BoolVar(&g.verbose, "verbose", g.verbose, "report progress on stderr")
 	fs.BoolVar(&g.verbose, "v", g.verbose, "shorthand for -verbose")
-	fs.StringVar(&g.timeout, "timeout", g.timeout, "network timeout, e.g. 5s")
+	// Validated during Parse so a malformed value is a usage error (exit 64)
+	// like any other bad flag, rather than surfacing later as a
+	// configuration error the exit-code table reserves for the config file.
+	fs.Func("timeout", "network timeout, e.g. 5s", func(v string) error {
+		if _, err := config.ParseDuration(v); err != nil {
+			return err
+		}
+		g.timeout = v
+		return nil
+	})
 }
 
 // cmdFlags is a subcommand's flag set together with its usage text.
@@ -206,6 +223,37 @@ func (c *cmdFlags) printUsage(w io.Writer) {
 // loadConfig resolves and loads configuration for a command, applying
 // environment overrides and the global --timeout flag.
 func loadConfig(e *env, g *globalOptions) (config.Config, string, error) {
+	return loadConfigAt(e, g, true, true)
+}
+
+// loadFileConfig is loadConfig without the environment overlay.
+//
+// Commands that persist the configuration — configure, setup, install — use
+// it so a transient CLIPD_* override is not silently baked into the file:
+// the environment exists for one-off runs, and `CLIPD_SERVER=test clipd
+// configure -port 9000` must not leave the test server in config.json.
+// CLIPD_CONFIG still selects which file, via ResolvePath. Any override that
+// is being ignored is called out on stderr, so a workflow that relied on
+// the old persisting behaviour fails loudly rather than mysteriously.
+func loadFileConfig(e *env, g *globalOptions) (config.Config, string, error) {
+	var ignored []string
+	for _, name := range []string{
+		config.EnvServer, config.EnvPort, config.EnvBind, config.EnvToken,
+		config.EnvFingerprint, config.EnvTLSCert, config.EnvTLSKey,
+		config.EnvMaxPayload, config.EnvTimeout,
+	} {
+		if e.getenv(name) != "" {
+			ignored = append(ignored, name)
+		}
+	}
+	if len(ignored) > 0 {
+		fmt.Fprintf(e.stderr, "clipd: note: %s ignored — environment overrides apply to one-off runs and are never written to the config file; use flags instead\n",
+			strings.Join(ignored, ", "))
+	}
+	return loadConfigAt(e, g, false, true)
+}
+
+func loadConfigAt(e *env, g *globalOptions, applyEnv, warnPerms bool) (config.Config, string, error) {
 	path, err := config.ResolvePath(g.configPath)
 	if err != nil {
 		return config.Config{}, "", err
@@ -214,8 +262,20 @@ func loadConfig(e *env, g *globalOptions) (config.Config, string, error) {
 	if err != nil {
 		return cfg, path, err
 	}
-	if err := cfg.ApplyEnv(e.getenv); err != nil {
-		return cfg, path, err
+	// The file holds the token in plaintext, and Save enforces 0600 — but a
+	// config copied from another machine or written by hand answers to the
+	// umask instead, and nothing else would ever mention it. Status renders
+	// the same warning inside its report and asks for this one to be
+	// suppressed.
+	if warnPerms && runtime.GOOS != "windows" && config.Exists(path) {
+		if warning := permissionWarning(path, "the token"); warning != "" {
+			fmt.Fprintf(e.stderr, "clipd: warning: %s\n", warning)
+		}
+	}
+	if applyEnv {
+		if err := cfg.ApplyEnv(e.getenv); err != nil {
+			return cfg, path, err
+		}
 	}
 	if g.timeout != "" {
 		d, err := config.ParseDuration(g.timeout)
@@ -239,8 +299,21 @@ func failf(e *env, code int, format string, args ...any) int {
 	return fail(e, code, fmt.Errorf(format, args...))
 }
 
+// usageError marks a failure caused by how the command was invoked — a
+// missing input file, nothing to read — rather than by configuration or the
+// network, so it exits 64 like other invocation mistakes. The documented
+// exit 1 is reserved for connection and server failures.
+type usageError struct{ err error }
+
+func (u usageError) Error() string { return u.err.Error() }
+func (u usageError) Unwrap() error { return u.err }
+
 // exitCodeFor maps a copy failure onto its exit code.
 func exitCodeFor(err error) int {
+	var uerr usageError
+	if errors.As(err, &uerr) {
+		return exitUsage
+	}
 	var cerr *client.Error
 	if errors.As(err, &cerr) {
 		switch cerr.Kind {
@@ -348,7 +421,11 @@ preserved exactly as supplied. Input larger than the configured maximum is
 rejected rather than truncated.
 
 Options:
-  -max-payload <size>   override the limit for this copy, e.g. 20MB
+  -max-payload <size>   override the client-side limit for this copy, e.g.
+                        20MB. The daemon enforces its own limit as well: to
+                        copy more than the Mac accepts, also run
+                        'clipd setup -max-payload <size>' there and restart
+                        the daemon.
 
 Exit codes: 0 success, 1 connection or server failure, 2 authentication
 failure, 3 payload too large, 4 configuration error, 5 TLS handshake or
@@ -416,7 +493,12 @@ full.
 
 On a client it also completes a TLS handshake with the daemon and reports
 whether the server's key matches the pinned fingerprint, without sending the
-token or any payload. A mismatch prints both fingerprints.`,
+token or any payload. A mismatch prints both fingerprints.
+
+The probe's outcome is the exit code, so status works as a scriptable
+preflight: 0 when the probe succeeds or there is nothing configured to
+check, 1 when the server is unreachable, 5 when the handshake fails or the
+fingerprint does not match, 4 for a configuration problem.`,
 
 	"config": `clipd config file
 

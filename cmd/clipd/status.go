@@ -25,7 +25,9 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 		return code
 	}
 
-	cfg, path, err := loadConfig(e, g)
+	// Status renders the permission warning inside its own report, so the
+	// stderr copy other commands print is suppressed here.
+	cfg, path, err := loadConfigAt(e, g, true, false)
 	if err != nil {
 		return fail(e, exitConfig, err)
 	}
@@ -75,8 +77,10 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 		return exitOK
 	}
 	fmt.Fprintf(out, "  fingerprint  %s\n", cfg.ServerFingerprint)
-	reportProbe(out, cfg)
-	return exitOK
+	// The probe's outcome is the exit code, so `clipd status && ...` is a
+	// genuine preflight: an unconfigured machine reports 0 (there is nothing
+	// to check), but a failed probe against a configured server does not.
+	return reportProbe(out, cfg)
 }
 
 // reportCertificate describes the local daemon's keypair.
@@ -106,27 +110,30 @@ func reportCertificate(out io.Writer, certPath string) {
 // stops there — no token, no payload.
 //
 // This makes status a genuine preflight: it answers "is my pin correct"
-// without a copy having to fail to find out.
-func reportProbe(out io.Writer, cfg config.Config) {
+// without a copy having to fail to find out. The returned exit code carries
+// the verdict — 1 for an unreachable server, 5 for a handshake or pin
+// failure, matching what the failed copy would have exited with — so scripts
+// can branch on $? rather than parsing the report.
+func reportProbe(out io.Writer, cfg config.Config) int {
 	address := cfg.DialAddress()
 	timeout := cfg.Timeout()
 
 	pin, err := transport.ParseFingerprint(cfg.ServerFingerprint)
 	if err != nil {
 		fmt.Fprintf(out, "  reachable    unknown (%v)\n", err)
-		return
+		return exitConfig
 	}
 	tlsConfig, err := transport.ClientConfig(pin)
 	if err != nil {
 		fmt.Fprintf(out, "  reachable    unknown (%v)\n", err)
-		return
+		return exitConfig
 	}
 
 	start := time.Now()
 	rawConn, err := net.DialTimeout("tcp", address, timeout)
 	if err != nil {
 		fmt.Fprintf(out, "  reachable    no (%v)\n", err)
-		return
+		return exitFailure
 	}
 	defer rawConn.Close()
 	fmt.Fprintf(out, "  reachable    yes (%dms)\n", time.Since(start).Milliseconds())
@@ -142,10 +149,10 @@ func reportProbe(out io.Writer, cfg config.Config) {
 			fmt.Fprintf(out, "  pin          MISMATCH\n")
 			fmt.Fprintf(out, "               expected %s\n", transport.FormatFingerprint(mismatch.Want))
 			fmt.Fprintf(out, "               server   %s\n", transport.FormatFingerprint(mismatch.Got))
-			return
+			return exitTLS
 		}
 		fmt.Fprintf(out, "  pin          cannot verify (%v)\n", err)
-		return
+		return exitTLS
 	}
 	defer conn.Close()
 
@@ -154,9 +161,10 @@ func reportProbe(out io.Writer, cfg config.Config) {
 		expiry := state.PeerCertificates[0].NotAfter
 		fmt.Fprintf(out, "  pin          matches (server certificate valid until %s)\n",
 			expiry.Format("2006-01-02"))
-		return
+		return exitOK
 	}
 	fmt.Fprintf(out, "  pin          matches\n")
+	return exitOK
 }
 
 // reportAgent prints the LaunchAgent's state.

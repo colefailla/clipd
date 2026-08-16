@@ -169,7 +169,7 @@ func TestCopyAuthFailure(t *testing.T) {
 	if cerr.Kind != client.KindAuth {
 		t.Errorf("Kind = %v, want auth", cerr.Kind)
 	}
-	if clip.Writes != 0 {
+	if clip.WriteCount() != 0 {
 		t.Error("the clipboard was written despite a failed authentication")
 	}
 }
@@ -322,8 +322,14 @@ func TestCopyAgainstV1Daemon(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 		// Exactly what clipd v1 does with bytes that are not a clipd frame.
 		_ = protocol.WriteResponse(conn, protocol.StatusMalformed, "protocol: not a clipd request")
+		// Consume the rest of the ClientHello before closing. Closing with
+		// unread data makes the kernel abort the connection with RST, which on
+		// some client platforms destroys the buffered response this test is
+		// about; a real network delivers the reply, so the fake must too.
+		_, _ = io.Copy(io.Discard, io.LimitReader(conn, 64<<10))
 	}()
 
 	_, pin, err := transport.Ephemeral()

@@ -150,7 +150,16 @@ to stderr.
 Input is sent as-is without trimming or re-encoding.
 
 The default limit is 10 MiB. Input over the limit is rejected rather than
-truncated. To raise it for a single copy:
+truncated. Both ends enforce it: the client before sending, and the daemon
+before accepting. To copy something larger, raise the daemon's limit on the
+Mac (and restart it):
+
+```bash
+clipd setup -max-payload 20MB
+launchctl kickstart -k gui/$(id -u)/com.clipd.agent
+```
+
+Then raise it for a single copy on the client:
 
 ```bash
 clipd copy -max-payload 20MB large.log

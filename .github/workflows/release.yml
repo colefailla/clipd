@@ -16,7 +16,38 @@ on:
 permissions: {}
 
 jobs:
+  # A tag that cannot pass its own tests should not become a release — on
+  # either platform. The darwin-only packages (pbcopy, launchagent) are what
+  # the release ships to Macs, and their tests do not even compile on Linux,
+  # so an ubuntu-only gate would prove nothing about them.
+  test:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # Pinned to a commit rather than a tag; see the note in ci.yml.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # The same toolchain the release job builds with, so the gate tests
+          # what actually ships.
+          go-version: stable
+
+      - name: Test
+        run: go test -race ./...
+
+      # Nor should a release ship a known stdlib vulnerability.
+      - name: govulncheck
+        if: matrix.os == 'ubuntu-latest'
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   release:
+    needs: test
     runs-on: ubuntu-latest
 
     permissions:
@@ -45,14 +76,6 @@ jobs:
           # linked against a standard library that has stopped receiving
           # security fixes.
           go-version: stable
-
-      # A tag that cannot pass its own tests should not become a release.
-      - name: Test
-        run: go test -race ./...
-
-      # Nor should one shipping a known stdlib vulnerability.
-      - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: Build
         run: make dist

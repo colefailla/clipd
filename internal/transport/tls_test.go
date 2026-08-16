@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -169,20 +170,23 @@ func TestEnsureCert(t *testing.T) {
 		t.Fatalf("LoadCertificate: %v", err)
 	}
 
-	// The private key must not be readable by anyone else.
-	keyInfo, err := os.Stat(keyPath)
-	if err != nil {
-		t.Fatalf("stat key: %v", err)
-	}
-	if perm := keyInfo.Mode().Perm(); perm != keyPerm {
-		t.Errorf("key mode = %04o, want %04o", perm, keyPerm)
-	}
-	dirInfo, err := os.Stat(filepath.Dir(keyPath))
-	if err != nil {
-		t.Fatalf("stat directory: %v", err)
-	}
-	if perm := dirInfo.Mode().Perm(); perm != dirPerm {
-		t.Errorf("tls directory mode = %04o, want %04o", perm, dirPerm)
+	// The private key must not be readable by anyone else. Windows has no
+	// Unix permission bits, so the check only means something elsewhere.
+	if runtime.GOOS != "windows" {
+		keyInfo, err := os.Stat(keyPath)
+		if err != nil {
+			t.Fatalf("stat key: %v", err)
+		}
+		if perm := keyInfo.Mode().Perm(); perm != keyPerm {
+			t.Errorf("key mode = %04o, want %04o", perm, keyPerm)
+		}
+		dirInfo, err := os.Stat(filepath.Dir(keyPath))
+		if err != nil {
+			t.Fatalf("stat directory: %v", err)
+		}
+		if perm := dirInfo.Mode().Perm(); perm != dirPerm {
+			t.Errorf("tls directory mode = %04o, want %04o", perm, dirPerm)
+		}
 	}
 
 	// Idempotent: a second call must not silently re-key and break clients.
@@ -498,6 +502,9 @@ func TestRotationLeavesAMatchingPairAndNoDebris(t *testing.T) {
 
 func TestRotatedKeyKeepsRestrictivePermissions(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not meaningful on Windows")
+	}
 
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "tls", "cert.pem")
