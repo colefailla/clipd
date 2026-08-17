@@ -113,7 +113,9 @@ Then test it:
 echo hello | clipd
 ```
 
-Run `clipd status` to check the configuration and connection.
+Run `clipd status` to check the configuration and connection. It exits 0 only
+if the probe succeeds, so it works as a preflight in a script — and will fail
+one if the daemon is not up yet.
 
 ## Usage
 

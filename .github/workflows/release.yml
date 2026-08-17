@@ -28,6 +28,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # Spelled out rather than left to the workflow-level {}: checkout only
+    # clones without it because this repository is public, which is a property
+    # of the repository rather than of this job.
+    permissions:
+      contents: read
+
     steps:
       # Pinned to a commit rather than a tag; see the note in ci.yml.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

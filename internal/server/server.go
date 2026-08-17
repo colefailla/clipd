@@ -108,7 +108,8 @@ const (
 	shutdownGrace = 5 * time.Second
 
 	// drainCap bounds how much of a rejected request is discarded when the
-	// request's declared length is unknown or unusable. See drainRequest.
+	// declared length is unknown, unusable, or simply not worth trusting —
+	// which is every unproven peer. See drainRequest and drainUnproven.
 	drainCap = 64 << 10
 
 	// maxAcceptBackoff caps the retry delay after a transient accept failure.
@@ -568,7 +569,7 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 		}
 		s.warnPeer("malformed request", "remote", remote, "error", err)
 		s.respond(conn, protocol.StatusMalformed, err.Error())
-		s.drainRequest(conn, reader, drainCap, min(s.timeout, handshakeTimeout))
+		s.drainUnproven(reader)
 		return
 	}
 
@@ -580,12 +581,11 @@ func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
 		// guessing, and applies equally to peers that never guess at all.
 		s.warnPeer("authentication failed", "remote", remote)
 		s.respond(conn, protocol.StatusAuthFailed, "authentication failed")
-		// The declared length has not been read on this path; consume it so
-		// the drain can cover a body the client is mid-way through sending.
-		// The window stays the unproven-phase one: this peer holds no token.
-		if n, err := protocol.ReadPayloadLen(reader); err == nil {
-			s.drainRequest(conn, reader, n, min(s.timeout, handshakeTimeout))
-		}
+		// Enough of the body a client may be mid-way through sending for the
+		// close to deliver the rejection rather than reset it. The declared
+		// length still sits unread in front of it, which costs the drain eight
+		// of its bytes and saves reading a number it would ignore.
+		s.drainUnproven(reader)
 		return
 	}
 	// The peer has proved it holds the token, so it no longer counts against
@@ -741,7 +741,7 @@ func (s *Server) startTLS(ctx context.Context, rawConn net.Conn, remote string) 
 			_ = protocol.WriteResponse(rawConn, protocol.StatusMalformed,
 				"this daemon requires TLS; upgrade clipd on the client machine (see clipd version)")
 		}
-		s.drainRequest(rawConn, sniff, drainCap, min(s.timeout, handshakeTimeout))
+		s.drainUnproven(sniff)
 		return nil, nil, false
 	}
 
@@ -776,26 +776,55 @@ func (s *Server) respond(conn net.Conn, status protocol.Status, message string) 
 }
 
 // drainRequest discards up to n bytes of an already-rejected request before
-// the connection is closed.
+// the connection is closed, giving the drain its own window.
 //
 // Closing a socket with unread data in its receive queue makes the kernel
 // send RST rather than FIN, and an RST can destroy the status frame written
 // just before the close — the client then reports a connection failure
 // instead of the rejection, with the wrong exit code. Draining first lets the
 // close deliver the response, for the same reason net/http drains request
-// bodies. The drain is bounded by n and by window — callers pass the
-// unproven-phase window for peers that have not authenticated — so a hostile
-// peer cannot hold the slot open by trickling bytes.
+// bodies.
+//
+// It is a best effort, not a guarantee: against a peer still streaming a body
+// far larger than the cap, the drain empties what it can and the close still
+// races the rest. net/http makes the same trade at 256KB.
+//
+// Only authenticated peers reach this. Unproven ones get drainUnproven.
 func (s *Server) drainRequest(conn net.Conn, r io.Reader, n uint64, window time.Duration) {
+	if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
+		return
+	}
+	drainBytes(r, n)
+}
+
+// drainUnproven is drainRequest for a peer that has not proved it holds the
+// token, which costs it both of drainRequest's allowances.
+//
+// The declared length is not consulted at all: it is the peer's own claim,
+// bounded only by the width of the field, and a flat drainCap is all an
+// unproven peer is worth reading. Nor does it set a deadline, so the drain
+// runs against whatever is left of the one window set before the first read —
+// the unproven phase gets a single window in total, however many steps it
+// fails at. Extending it here would hand back exactly the slot-holding lever
+// that window exists to deny.
+//
+// The receiver is unused and left unnamed to say so: this is the drain that
+// consults no server state, no configured window and no declared length. It
+// stays a method only so the call sites read beside drainRequest.
+func (*Server) drainUnproven(r io.Reader) {
+	drainBytes(r, drainCap)
+}
+
+// drainBytes discards n bytes under whatever deadline is already in force.
+func drainBytes(r io.Reader, n uint64) {
 	if n == 0 {
 		return
 	}
 	if n > math.MaxInt64 {
 		n = math.MaxInt64
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
-		return
-	}
+	// io.Discard implements ReaderFrom, so this recycles one small buffer
+	// rather than sizing anything to n.
 	_, _ = io.CopyN(io.Discard, r, int64(n))
 }
 

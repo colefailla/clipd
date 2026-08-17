@@ -268,6 +268,45 @@ func TestApplyEnvIgnoresUnsetVariables(t *testing.T) {
 	}
 }
 
+// TestOverrideEnvMatchesApplyEnv keeps the list and the code that reads it in
+// step, by watching which names ApplyEnv actually asks for.
+//
+// Nothing fails loudly when they diverge: commands that decline the overlay
+// report which overrides they are ignoring by ranging over OverrideEnv, so a
+// variable missing from the list is one the user is told nothing about while
+// it is quietly dropped.
+func TestOverrideEnvMatchesApplyEnv(t *testing.T) {
+	t.Parallel()
+
+	asked := make(map[string]bool)
+	cfg := Default()
+	if err := cfg.ApplyEnv(func(name string) string {
+		asked[name] = true
+		return ""
+	}); err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+
+	listed := make(map[string]bool, len(OverrideEnv))
+	for _, name := range OverrideEnv {
+		if listed[name] {
+			t.Errorf("OverrideEnv lists %s twice", name)
+		}
+		listed[name] = true
+		if !asked[name] {
+			t.Errorf("OverrideEnv lists %s, which ApplyEnv never reads", name)
+		}
+	}
+	for name := range asked {
+		if !listed[name] {
+			t.Errorf("ApplyEnv reads %s, which OverrideEnv does not list", name)
+		}
+	}
+	if listed[EnvConfig] {
+		t.Errorf("%s selects which file to read rather than overriding a value in it, so it must stay out of OverrideEnv", EnvConfig)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	t.Parallel()
 

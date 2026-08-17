@@ -108,6 +108,22 @@ const (
 	EnvMaxMemory   = "CLIPD_MAX_MEMORY"
 )
 
+// OverrideEnv lists every variable ApplyEnv reads.
+//
+// EnvConfig is deliberately absent: it selects which file to read rather than
+// overriding a value inside it, so it still applies to commands that decline
+// the rest of the overlay.
+//
+// Callers that reason about the overlay as a whole — reporting which overrides
+// they are ignoring, say — range over this rather than repeating the names,
+// because a hand-copied list silently stops covering the variables added after
+// it was written.
+var OverrideEnv = []string{
+	EnvServer, EnvPort, EnvBind, EnvToken, EnvFingerprint,
+	EnvTLSCert, EnvTLSKey, EnvMaxPayload, EnvTimeout,
+	EnvMaxConn, EnvMaxMemory,
+}
+
 // TLS material lives beside the config file.
 const (
 	TLSDirName   = "tls"
@@ -277,6 +293,9 @@ func Load(path string) (Config, error) {
 // getenv is injected so tests need not mutate the process environment; pass
 // os.Getenv in production. A malformed value is an error rather than a
 // silent fallback: a typo in CLIPD_PORT should be loud.
+//
+// Every variable read here must also appear in OverrideEnv; a test enforces
+// it, since the two drifting apart is invisible at the call site.
 func (c *Config) ApplyEnv(getenv func(string) string) error {
 	if v := getenv(EnvServer); v != "" {
 		c.ServerAddress = v

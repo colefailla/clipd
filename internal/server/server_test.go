@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -568,11 +570,18 @@ func TestWrongPinIsRejected(t *testing.T) {
 	}
 }
 
-// TestRejectionSurvivesAnInFlightBody pins the drain behaviour: when the
-// server rejects on the header alone while the client is still streaming a
-// large body, the status frame must still reach the client. Without the
-// drain, closing with unread bytes aborts the connection with RST, which can
-// destroy the response before the client reads it.
+// TestRejectionSurvivesAnInFlightBody checks the outcome the drain exists for:
+// when the server rejects on the header alone while the client is still
+// streaming a body, the client reads the status frame rather than a connection
+// error.
+//
+// It does not prove the drain is what saves it, and should not be read as
+// doing so. Whether closing with unread bytes produces RST or FIN is the
+// kernel's call, and over a loopback socket it comes out deliverable either
+// way — this test passes with the drain removed. The case it stands in for is
+// real (a Linux client, where an RST does discard already-queued data), but
+// provoking that portably is beyond a unit test. TestDrainBounds covers the
+// half that is actually clipd's: how much the drain reads.
 func TestRejectionSurvivesAnInFlightBody(t *testing.T) {
 	t.Parallel()
 
@@ -614,6 +623,75 @@ func TestRejectionSurvivesAnInFlightBody(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDrainBounds pins how much a drain reads, which is the half of the
+// behaviour that belongs to clipd rather than to the kernel.
+//
+// The other half — that an unproven peer's drain cannot extend the deadline it
+// is running under — needs no test: drainUnproven takes no net.Conn, so there
+// is nothing for it to call SetReadDeadline on.
+func TestDrainBounds(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an unproven peer is capped however much it sends", func(t *testing.T) {
+		t.Parallel()
+		r := &endlessReader{}
+		(*Server)(nil).drainUnproven(r)
+		if r.read != drainCap {
+			t.Errorf("read %d bytes from an endless reader, want the %d-byte cap", r.read, drainCap)
+		}
+	})
+
+	t.Run("a source shorter than the cap ends the drain early", func(t *testing.T) {
+		t.Parallel()
+		r := &endlessReader{limit: 100}
+		(*Server)(nil).drainUnproven(r)
+		if r.read != 100 {
+			t.Errorf("read %d bytes, want the 100 available", r.read)
+		}
+	})
+
+	t.Run("an authenticated peer's drain honours the declared length", func(t *testing.T) {
+		t.Parallel()
+		r := &endlessReader{}
+		drainBytes(r, 4096)
+		if r.read != 4096 {
+			t.Errorf("read %d bytes, want 4096", r.read)
+		}
+	})
+
+	// The declared length is a uint64 straight off the wire, so it can name
+	// more bytes than io.CopyN's int64 count can express. It must clamp rather
+	// than overflow into a negative count.
+	t.Run("a declared length past the int64 ceiling clamps", func(t *testing.T) {
+		t.Parallel()
+		r := &endlessReader{limit: 10}
+		drainBytes(r, math.MaxUint64)
+		if r.read != 10 {
+			t.Errorf("read %d bytes, want the 10 available", r.read)
+		}
+	})
+}
+
+// endlessReader yields zero bytes forever, or up to limit when one is set,
+// counting what it handed out.
+type endlessReader struct {
+	read  int
+	limit int
+}
+
+func (e *endlessReader) Read(p []byte) (int, error) {
+	if e.limit > 0 {
+		if e.read >= e.limit {
+			return 0, io.EOF
+		}
+		if remaining := e.limit - e.read; remaining < len(p) {
+			p = p[:remaining]
+		}
+	}
+	e.read += len(p)
+	return len(p), nil
 }
 
 func TestClipboardFailureIsReported(t *testing.T) {

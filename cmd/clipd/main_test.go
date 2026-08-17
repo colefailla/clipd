@@ -715,6 +715,37 @@ func TestSetupGeneratesATokenDespiteEnvToken(t *testing.T) {
 	}
 }
 
+// TestSetupReportsIgnoredDaemonOverrides covers the reporting half of the same
+// split. The note is the only thing between a declined override and a silent
+// change in behaviour, so it has to name every variable it declines —
+// including the daemon-only ones, which are the ones setup exists to write.
+func TestSetupReportsIgnoredDaemonOverrides(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	envVars := map[string]string{
+		config.EnvBind:      "127.0.0.1",
+		config.EnvMaxConn:   "99",
+		config.EnvMaxMemory: "1GB",
+	}
+	getenv := func(k string) string { return envVars[k] }
+
+	got := execEnv(t, "", false, getenv, "-config", path, "setup")
+	if got.code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+	for name := range envVars {
+		if !strings.Contains(got.stderr, name) {
+			t.Errorf("the note does not name the ignored %s:\n%s", name, got.stderr)
+		}
+	}
+	// Naming the command matters most for install, which has no flag for any
+	// of these: "use flags instead" would leave that user nowhere to go.
+	if !strings.Contains(got.stderr, "clipd setup") {
+		t.Errorf("the note does not say which command stores these:\n%s", got.stderr)
+	}
+}
+
 func TestBadTimeoutFlagIsRejected(t *testing.T) {
 	t.Parallel()
 

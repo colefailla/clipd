@@ -237,21 +237,27 @@ func loadConfig(e *env, g *globalOptions) (config.Config, string, error) {
 // the old persisting behaviour fails loudly rather than mysteriously.
 func loadFileConfig(e *env, g *globalOptions) (config.Config, string, error) {
 	var ignored []string
-	for _, name := range []string{
-		config.EnvServer, config.EnvPort, config.EnvBind, config.EnvToken,
-		config.EnvFingerprint, config.EnvTLSCert, config.EnvTLSKey,
-		config.EnvMaxPayload, config.EnvTimeout,
-	} {
+	for _, name := range config.OverrideEnv {
 		if e.getenv(name) != "" {
 			ignored = append(ignored, name)
 		}
 	}
 	if len(ignored) > 0 {
-		fmt.Fprintf(e.stderr, "clipd: note: %s ignored — environment overrides apply to one-off runs and are never written to the config file; use flags instead\n",
-			strings.Join(ignored, ", "))
+		fmt.Fprintf(e.stderr,
+			"clipd: note: %s ignored — environment overrides apply to one-off runs and are never written to the config file.\n       %s\n",
+			strings.Join(ignored, ", "), persistInstead)
 	}
 	return loadConfigAt(e, g, false, true)
 }
+
+// persistInstead completes the ignored-override note by naming the commands
+// that do write a value into the file.
+//
+// It names them rather than saying "use flags instead", which is unactionable
+// for install: its only flag is -exec, so a user whose CLIPD_BIND is being
+// declined has to reach for setup, and nothing on the install command line
+// would have told them so.
+const persistInstead = "To store one, pass the matching flag to 'clipd setup' (daemon settings) or 'clipd configure' (client settings)."
 
 func loadConfigAt(e *env, g *globalOptions, applyEnv, warnPerms bool) (config.Config, string, error) {
 	path, err := config.ResolvePath(g.configPath)
