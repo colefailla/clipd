@@ -19,7 +19,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -66,7 +65,7 @@ const (
 	DefaultMaxDropBytes int64 = 256 << 20
 	DefaultMaxDropFiles       = 256
 
-	// MaxAllowedPayloadBytes is the ceiling ParseSize enforces, well above any
+	// MaxAllowedPayloadBytes is the ceiling Validate enforces, well above any
 	// plausible paste and well below anything that would trouble a Mac.
 	MaxAllowedPayloadBytes int64 = 1 << 30
 )
@@ -154,6 +153,10 @@ func Load(path string) (Config, error) {
 		return cfg, fmt.Errorf("read %s: %w", path, err)
 	}
 
+	if err := checkV2(path, data); err != nil {
+		return cfg, err
+	}
+
 	// Unknown keys are rejected rather than ignored, so a typo fails loudly
 	// instead of silently leaving a default in place.
 	dec := json.NewDecoder(strings.NewReader(string(data)))
@@ -182,6 +185,47 @@ func Load(path string) (Config, error) {
 		cfg.MaxConcurrent = file.MaxConcurrent
 	}
 	return cfg, cfg.Validate()
+}
+
+// v2Keys are settings that existed only before clipd moved to a socket. None
+// of them has a v3 equivalent: the token and fingerprint authenticated a TLS
+// connection that no longer exists, and the address is now one field rather
+// than a host and a port.
+var v2Keys = []string{
+	"server_address", "server_fingerprint", "token",
+	"tls_cert_path", "tls_key_path", "bind_address", "port", "timeout_ms",
+}
+
+// checkV2 turns the strict parser's complaint into an answer.
+//
+// Strict parsing is right — a typo should fail rather than silently leave a
+// default in place — but "unknown field "server_fingerprint"" tells someone
+// upgrading nothing about what happened or what to do. This is the one case
+// worth naming, and it is a lookup rather than a migration: there is nothing in
+// a v2 file worth carrying forward, since every v3 setting has a working
+// default.
+func checkV2(path string, data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		// Not decodable at all; let the strict parser report why.
+		return nil
+	}
+	var found []string
+	for _, key := range v2Keys {
+		if _, ok := raw[key]; ok {
+			found = append(found, key)
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s is a clipd v2 config (it still has %s).\n"+
+			"       v3 sends over an SSH-forwarded socket, so the token, fingerprint and TLS\n"+
+			"       settings no longer exist and every remaining setting has a working default.\n"+
+			"       Move it aside and start fresh:\n\n"+
+			"         mv %s %s.v2\n",
+		path, strings.Join(found, ", "), path, path)
 }
 
 // Save writes the config, creating the directory if needed.
@@ -235,55 +279,6 @@ func (c Config) Validate() error {
 		return fmt.Errorf("max_concurrent: %d must not be negative", c.MaxConcurrent)
 	}
 	return nil
-}
-
-// ParseSize parses a byte count with an optional unit suffix, rejecting
-// anything above the payload ceiling.
-func ParseSize(s string) (int64, error) {
-	return ParseSizeUpTo(s, MaxAllowedPayloadBytes)
-}
-
-// ParseSizeUpTo parses a byte count with an optional unit suffix: 1048576,
-// 1MB, 512KiB. Decimal and binary suffixes are both accepted and both treated
-// as binary multiples, since the distinction is noise at this scale.
-func ParseSizeUpTo(s string, ceiling int64) (int64, error) {
-	trimmed := strings.TrimSpace(s)
-	if trimmed == "" {
-		return 0, errors.New("empty size")
-	}
-
-	upper := strings.ToUpper(trimmed)
-	multiplier := int64(1)
-	for _, unit := range []struct {
-		suffix string
-		mult   int64
-	}{
-		{"KIB", 1 << 10}, {"MIB", 1 << 20}, {"GIB", 1 << 30},
-		{"KB", 1 << 10}, {"MB", 1 << 20}, {"GB", 1 << 30},
-		{"K", 1 << 10}, {"M", 1 << 20}, {"G", 1 << 30},
-		{"B", 1},
-	} {
-		if strings.HasSuffix(upper, unit.suffix) {
-			multiplier = unit.mult
-			upper = strings.TrimSpace(strings.TrimSuffix(upper, unit.suffix))
-			break
-		}
-	}
-
-	value, err := strconv.ParseInt(upper, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid size %q: use bytes or a suffix, e.g. 10MB", s)
-	}
-	if value <= 0 {
-		return 0, fmt.Errorf("invalid size %q: must be positive", s)
-	}
-	// Divide rather than multiply and compare: value*multiplier could overflow
-	// int64 for a large enough number, and an overflowed product compares as
-	// comfortably under the ceiling.
-	if value > ceiling/multiplier {
-		return 0, fmt.Errorf("size %q exceeds the %s ceiling", s, FormatSize(ceiling))
-	}
-	return value * multiplier, nil
 }
 
 // FormatSize renders a byte count for human consumption.

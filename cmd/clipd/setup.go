@@ -109,7 +109,8 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	}
 
 	forward := fmt.Sprintf("RemoteForward %s:%s", remoteSocket, localSocket)
-	sshBlock := fmt.Sprintf("%s\nHost %s\n  %s\n%s\n", blockStart, host, forward, blockEnd)
+	pattern := hostPattern(host)
+	sshBlock := fmt.Sprintf("%s\nHost %s\n  %s\n%s\n", blockStart, pattern, forward, blockEnd)
 
 	if *printOnly {
 		fmt.Fprintf(e.stdout, "\n--- would append to %s on %s ---\n%s", rcFile, host, block)
@@ -122,7 +123,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	}
 	fmt.Fprintf(e.stdout, "\nInstalled the clipd function in %s on %s.\n", rcFile, host)
 
-	sshPath, changed, err := installSSHConfig(host, sshBlock)
+	sshPath, changed, err := installSSHConfig(pattern, sshBlock)
 	if err != nil {
 		return fail(e, exitFailure, err)
 	}
@@ -147,6 +148,20 @@ ControlMaster, the old master has to go first, which is what the -O exit above
 is for.
 `, host, host, host)
 	return exitOK
+}
+
+// hostPattern reduces an ssh destination to something a Host block can match.
+//
+// ssh strips the user before matching Host patterns, so a block written as
+// "Host cole@debian" matches nothing at all — and the failure is silent: the
+// forward simply never happens and the socket never appears on the remote.
+// Verified with `ssh -G`, which resolves "cole@debian" against "Host debian"
+// and ignores "Host cole@debian" entirely.
+func hostPattern(destination string) string {
+	if _, host, ok := strings.Cut(destination, "@"); ok {
+		return host
+	}
+	return destination
 }
 
 // probe runs probeScript on the host and parses its key=value output.

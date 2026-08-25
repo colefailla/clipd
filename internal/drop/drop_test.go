@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // entry describes one archive member for the test archive builder.
@@ -335,7 +336,6 @@ func TestSafeNameRejectsUnusableNames(t *testing.T) {
 	for _, name := range []string{
 		"", ".", "..", "/", "//", "../", "a/b/..",
 		strings.Repeat("n", maxNameBytes+1),
-		"nul\x00byte",
 	} {
 		if got, err := safeName(name); err == nil {
 			t.Errorf("safeName(%q) = %q, want an error", name, got)
@@ -468,5 +468,121 @@ func assertDirEmpty(t *testing.T, dir string) {
 			names = append(names, e.Name())
 		}
 		t.Errorf("a failed drop left %v behind", names)
+	}
+}
+
+// TestExtractBoundsSkippedEntries pins the second budget.
+//
+// maxFiles only counts what is written, so an archive made entirely of entries
+// this package skips would otherwise stream forever: the reader keeps making
+// progress, the connection's idle deadline never fires, and the handler holds
+// a concurrency slot for as long as the sender keeps writing.
+func TestExtractBoundsSkippedEntries(t *testing.T) {
+	t.Parallel()
+
+	pr, pw := io.Pipe()
+	go func() {
+		tw := tar.NewWriter(pw)
+		for {
+			if err := tw.WriteHeader(&tar.Header{
+				Name: "link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd",
+			}); err != nil {
+				return
+			}
+			if err := tw.Flush(); err != nil {
+				return
+			}
+		}
+	}()
+	defer pw.Close()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	done := make(chan error, 1)
+	go func() {
+		_, err := Extract(pr, Options{Dir: dir, MaxFiles: 8})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Extract accepted an endless archive")
+		}
+		if !strings.Contains(err.Error(), "entries") {
+			t.Errorf("err = %v, want it to name the entry limit", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Extract did not stop: the entry loop is unbounded")
+	}
+	assertDirEmpty(t, dir)
+}
+
+// TestSafeNameRejectsControlCharacters: names are echoed into the response the
+// sender's terminal prints, so a newline forges an extra line and an ANSI
+// escape drives the terminal.
+func TestSafeNameRejectsControlCharacters(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{
+		"evil\nclipd: copied 999 bytes",
+		"wipe\x1b[2J.txt",
+		"bell\x07.txt",
+		"nul\x00byte.txt",
+		"carriage\r.txt",
+		"tab\t.txt",
+		"del\x7f.txt",
+	} {
+		if got, err := safeName(name); err == nil {
+			t.Errorf("safeName(%q) = %q, want an error", name, got)
+		}
+	}
+}
+
+// TestSafeNameKeepsAwkwardButLegitimateNames: refusing control characters must
+// not also refuse the merely unusual. A leading dash matters because these
+// names reach os.OpenFile, never a shell.
+func TestSafeNameKeepsAwkwardButLegitimateNames(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{
+		"-rf", "--help", "file with spaces.txt", "日本語.txt",
+		"emoji 🎉.txt", "quote'and\"quote.txt", "semi;colon.txt",
+		"$(whoami).txt", "back`tick`.txt",
+	} {
+		got, err := safeName(name)
+		if err != nil {
+			t.Errorf("safeName(%q): %v", name, err)
+			continue
+		}
+		if got != name {
+			t.Errorf("safeName(%q) = %q, want it unchanged", name, got)
+		}
+	}
+}
+
+// TestExtractWritesAwkwardNames carries the same cases through a real
+// extraction, so the guarantee covers the filesystem call and not just the
+// validator.
+func TestExtractWritesAwkwardNames(t *testing.T) {
+	t.Parallel()
+
+	names := []string{"-rf", "file with spaces.txt", "日本語.txt", "$(whoami).txt"}
+	var entries []entry
+	for _, n := range names {
+		entries = append(entries, entry{name: n, body: "ok"})
+	}
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	res, err := Extract(archiveOf(t, entries...), Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if len(res.Names) != len(names) {
+		t.Fatalf("wrote %v, want %d files", res.Names, len(names))
+	}
+	for _, n := range names {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Errorf("stat %q: %v", n, err)
+		}
 	}
 }

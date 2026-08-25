@@ -117,23 +117,6 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 	return req, nil
 }
 
-// WriteRequest emits Magic followed by req's JSON envelope. It exists for
-// tests and for any future first-party client; the shell-function client
-// builds the same two lines with printf.
-func WriteRequest(w io.Writer, req Request) error {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("protocol: encode request: %w", err)
-	}
-	if _, err := io.WriteString(w, Magic); err != nil {
-		return err
-	}
-	if _, err := w.Write(append(body, '\n')); err != nil {
-		return err
-	}
-	return nil
-}
-
 // readLine reads one newline-terminated line, refusing to buffer more than
 // limit bytes. Both "\n" and "\r\n" terminate, because the client may be a
 // shell one-liner and printf on some platforms is not fussy about which.

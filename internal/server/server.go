@@ -49,9 +49,11 @@ const (
 	//
 	// Small, because the peers are the user's own SSH sessions rather than a
 	// network of clients. It is also the second half of the daemon's memory
-	// bound: a clipboard payload is buffered whole, so the ceiling is this
-	// times the payload limit — 80 MiB at the defaults. Raising the payload
-	// limit a long way is a reason to lower this.
+	// bound: a clipboard payload is buffered whole, so the ceiling is roughly
+	// this times the payload limit — about 80 MiB at the defaults, and
+	// transiently more, since the buffer grows by doubling and briefly holds
+	// both halves while it does. Raising the payload limit a long way is a
+	// reason to lower this. A drop is streamed to disk and costs nothing here.
 	defaultMaxConcurrent = 8
 
 	// defaultMaxConnections bounds sockets in any state, the backstop against

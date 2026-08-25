@@ -185,31 +185,6 @@ func TestResolvePathFromEnvironment(t *testing.T) {
 	}
 }
 
-func TestParseSize(t *testing.T) {
-	t.Parallel()
-
-	good := map[string]int64{
-		"1024": 1024, "1KB": 1 << 10, "1KiB": 1 << 10,
-		"10MB": 10 << 20, "1GB": 1 << 30, " 5 MB ": 5 << 20, "2m": 2 << 20,
-	}
-	for give, want := range good {
-		got, err := ParseSize(give)
-		if err != nil {
-			t.Errorf("ParseSize(%q): %v", give, err)
-			continue
-		}
-		if got != want {
-			t.Errorf("ParseSize(%q) = %d, want %d", give, got, want)
-		}
-	}
-
-	for _, give := range []string{"", "-1", "0", "abc", "10PB", "9999999999999999999GB"} {
-		if _, err := ParseSize(give); err == nil {
-			t.Errorf("ParseSize(%q) succeeded, want an error", give)
-		}
-	}
-}
-
 func TestFormatSize(t *testing.T) {
 	t.Parallel()
 
@@ -221,4 +196,55 @@ func TestFormatSize(t *testing.T) {
 			t.Errorf("FormatSize(%d) = %q, want something like %q", give, got, want)
 		}
 	}
+}
+
+// TestV2ConfigGetsAMigrationMessage: strict parsing is right, but "unknown
+// field" tells someone upgrading nothing. This is the one case worth naming.
+func TestV2ConfigGetsAMigrationMessage(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	v2 := `{"server_address":"mac.local","port":8199,"token":"secret",
+	        "server_fingerprint":"sha256:aa","tls_cert_path":"","timeout_ms":5000}`
+	if err := os.WriteFile(path, []byte(v2), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted a v2 config")
+	}
+	for _, want := range []string{"v2 config", "token", "mv "} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+}
+
+// TestUnknownKeyStillReportsGenerically: the v2 check must not swallow an
+// ordinary typo into a misleading upgrade message.
+func TestUnknownKeyStillReportsGenerically(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"drop_directory":"~/Inbox"}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	err := Load2Err(t, path)
+	if strings.Contains(err.Error(), "v2 config") {
+		t.Errorf("a typo was reported as a v2 config: %v", err)
+	}
+	if !strings.Contains(err.Error(), "drop_directory") {
+		t.Errorf("err = %v, want it to name the unknown key", err)
+	}
+}
+
+// Load2Err is Load, asserting that it failed.
+func Load2Err(t *testing.T, path string) error {
+	t.Helper()
+	if _, err := Load(path); err != nil {
+		return err
+	}
+	t.Fatalf("Load(%s) succeeded, want an error", path)
+	return nil
 }

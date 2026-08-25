@@ -254,3 +254,22 @@ func TestInstallSSHConfigWritesRestrictivePermissions(t *testing.T) {
 		t.Errorf("config mode = %04o, want no group or other access", perm)
 	}
 }
+
+// TestHostPatternStripsTheUser pins a silent failure: ssh removes the user
+// before matching Host patterns, so a block written as "Host cole@debian"
+// matches nothing and the forward never happens, with no error anywhere.
+func TestHostPatternStripsTheUser(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"debian":            "debian",
+		"cole@debian":       "debian",
+		"cole@debian.local": "debian.local",
+		"root@10.0.0.5":     "10.0.0.5",
+	}
+	for give, want := range tests {
+		if got := hostPattern(give); got != want {
+			t.Errorf("hostPattern(%q) = %q, want %q", give, got, want)
+		}
+	}
+}

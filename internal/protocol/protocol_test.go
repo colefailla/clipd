@@ -118,18 +118,16 @@ func TestReadRequestAcceptsCarriageReturns(t *testing.T) {
 	}
 }
 
-func TestWriteRequestRoundTrips(t *testing.T) {
+// TestFrameFromTheShellClientParses builds the frame exactly as the generated
+// shell function does — printf, then tar bytes — rather than round-tripping a
+// Go writer against a Go reader. Nothing ships a Go client, so testing against
+// the literal bytes the real client emits is the guarantee that matters.
+func TestFrameFromTheShellClientParses(t *testing.T) {
 	t.Parallel()
 
-	var buf strings.Builder
-	if err := WriteRequest(&buf, Request{Type: TypeDrop}); err != nil {
-		t.Fatalf("WriteRequest: %v", err)
-	}
-	if !strings.HasPrefix(buf.String(), Magic) {
-		t.Fatalf("output %q does not start with the magic prefix", buf.String())
-	}
+	wire := "clipd:magic:v1\n" + `{"type":"drop"}` + "\n" + "\x00tar\x00bytes"
 
-	r := readerOf(buf.String())
+	r := readerOf(wire)
 	structured, err := Sniff(r)
 	if err != nil || !structured {
 		t.Fatalf("Sniff = %v, %v; want true, nil", structured, err)
@@ -140,5 +138,12 @@ func TestWriteRequestRoundTrips(t *testing.T) {
 	}
 	if req.Type != TypeDrop {
 		t.Errorf("Type = %q, want %q", req.Type, TypeDrop)
+	}
+	rest, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if string(rest) != "\x00tar\x00bytes" {
+		t.Errorf("body = %q, want the archive bytes untouched", rest)
 	}
 }

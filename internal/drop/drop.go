@@ -110,6 +110,16 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 	if maxFiles <= 0 {
 		maxFiles = DefaultMaxFiles
 	}
+	// maxFiles bounds what is written, which is not the same as what is read.
+	// Entries this package skips — directories, symlinks, devices — are never
+	// written and so never count against it, and an archive made entirely of
+	// them would stream forever: the reader keeps making progress, so the
+	// connection's idle deadline never fires, and the handler holds a
+	// concurrency slot for as long as the sender cares to keep writing.
+	//
+	// Generous relative to maxFiles, because a legitimate archive of a
+	// directory tree carries a directory header per level on top of its files.
+	maxEntries := maxFiles * 16
 
 	if err := os.MkdirAll(opts.Dir, dirPerm); err != nil {
 		return Result{}, fmt.Errorf("drop: create %s: %w", opts.Dir, err)
@@ -129,7 +139,11 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 	}
 
 	tr := tar.NewReader(r)
-	for {
+	for entries := 0; ; entries++ {
+		if entries >= maxEntries {
+			cleanup()
+			return Result{}, fmt.Errorf("drop: archive holds more than %d entries", maxEntries)
+		}
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -201,14 +215,22 @@ func safeName(raw string) (string, error) {
 		// the whole package rests on, and it costs one comparison to assert.
 		return "", fmt.Errorf("drop: archive entry %q resolved to a path", raw)
 	}
-	if strings.ContainsRune(name, 0) {
-		return "", fmt.Errorf("drop: archive entry %q contains a null byte", raw)
+	// Control characters are refused rather than escaped on output. The name
+	// is both written to disk and echoed back to the sender's terminal in the
+	// acknowledgement, where an embedded newline forges a second response line
+	// and an ANSI escape drives the terminal directly. Refusing them here fixes
+	// both at once, and no filename worth having contains one.
+	if i := strings.IndexFunc(name, isControl); i >= 0 {
+		return "", fmt.Errorf("drop: archive entry %q contains a control character at byte %d", raw, i)
 	}
 	if len(name) > maxNameBytes {
 		return "", fmt.Errorf("drop: archive entry name exceeds %d bytes", maxNameBytes)
 	}
 	return name, nil
 }
+
+// isControl reports whether r is a C0 control character or DEL.
+func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
 
 // writeFile writes one entry, returning the path created and the bytes
 // written. The path is returned even on error so the caller can clean up a

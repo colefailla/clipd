@@ -72,9 +72,10 @@ jobs:
 
   vulncheck:
     # clipd has no third-party dependencies, so this is entirely about the
-    # standard library it is linked against — crypto/tls above all. A daemon
-    # that terminates TLS on the LAN should not be shipped against a stdlib
-    # with a known hole in it, and "we would have noticed" is not a control.
+    # standard library it is linked against — archive/tar above all, which
+    # parses attacker-controlled input on every drop. A daemon that unpacks
+    # archives should not be shipped against a stdlib with a known hole in it,
+    # and "we would have noticed" is not a control.
     #
     # Run via `go run` rather than added to go.mod, so the module itself stays
     # dependency-free.

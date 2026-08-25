@@ -19,7 +19,8 @@ import (
 
 const (
 	// plistPerm is the conventional mode for a LaunchAgent plist. It holds no
-	// secrets — the token lives in the 0600 config file, never here.
+	// secrets: clipd has none to hold, and the plist only names a binary and
+	// a config path.
 	plistPerm fs.FileMode = 0o644
 
 	// logDirPerm keeps the daemon's log private to its user.
