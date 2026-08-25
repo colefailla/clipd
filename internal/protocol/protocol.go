@@ -1,251 +1,163 @@
-// Package protocol implements the clipd wire format.
+// Package protocol defines the small wire format clipd speaks over its
+// listening socket.
 //
-// The protocol is a single request/response round trip over a stream
-// connection. A client sends one request frame containing the shared token
-// and the clipboard payload; the server replies with one status frame and
-// both sides close.
+// There are two kinds of message, and which one arrived is decided by the
+// first bytes on the connection:
 //
-// Request frame (client -> server):
+//	<anything else>   raw clipboard content, written verbatim
+//	Magic + JSON line a structured request, dispatched on its "type"
 //
-//	[4]  magic        "CLPD"
-//	[1]  version      0x01
-//	[1]  token_len    N (1..255)
-//	[N]  token
-//	[8]  payload_len  uint64, big-endian
-//	[..] payload      payload_len bytes, verbatim
+// The raw case is the default on purpose. It is what makes `nc` a complete
+// client: a shell pipeline that knows nothing about clipd can still put text
+// on the clipboard. The structured case exists for everything that needs to
+// say more than "here are some bytes" — today that is only file drops.
 //
-// Response frame (server -> client):
+// The design is lifted from wincent/clipper, which solved the same problem
+// first: a magic prefix keeps a framed extension from breaking the unframed
+// clients that came before it, and versioning the prefix itself leaves room
+// to change the frame later without having to guess what an old peer meant.
 //
-//	[1]  status       see the Status constants
-//	[2]  message_len  uint16, big-endian
-//	[..] message      human-readable, for diagnostics only
-//
-// There is no separate authentication handshake. The token travels in the
-// same frame as the payload because the frame only ever crosses the wire
-// inside TLS 1.3 with the server's key pinned: the channel is confidential
-// and the server is authenticated before the first byte of it is written, so
-// an extra challenge-response round trip would buy nothing. Keeping it to
-// one frame keeps both sides trivial to reason about.
-//
-// This package deliberately contains no networking policy: no dials, no
-// deadlines, no retries. It only reads and writes frames from io.Reader and
-// io.Writer, which keeps it exhaustively testable and lets the server stage
-// its reads so it can reject an oversized payload before allocating for it.
+// This package contains no networking policy: no dials, no deadlines, no
+// reads from a socket. It parses and formats, and the server decides how long
+// anything is allowed to take.
 package protocol
 
 import (
-	"encoding/binary"
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math"
+	"strings"
 )
 
-// Magic is the first four bytes of every request frame. It exists so that a
-// stray connection (a port scanner, a browser, a mistyped host) is rejected
-// immediately instead of being interpreted as a malformed token.
-var Magic = [4]byte{'C', 'L', 'P', 'D'}
+// Magic introduces a structured request.
+//
+// The trailing v1 versions the frame, not the product: a future incompatible
+// frame uses a different prefix, and this one keeps meaning exactly what it
+// means today. A connection whose opening bytes are anything else is raw
+// clipboard content and must stay that way, or every `nc` alias in the wild
+// breaks at once.
+const Magic = "clipd:magic:v1\n"
 
+// MaxFrameBytes bounds the JSON line following the magic prefix.
+//
+// The envelope describes a request; it never carries the payload. Anything
+// approaching this size is a peer trying to make the daemon buffer without
+// bound, not a request, so the read stops rather than growing.
+const MaxFrameBytes = 8 << 10
+
+// Request types.
 const (
-	// Version1 is the only wire version in existence. The field exists so a
-	// future revision can be introduced without a flag day: a server can
-	// recognise an unknown version and say so instead of misparsing.
-	Version1 byte = 0x01
-
-	// CurrentVersion is the version this build emits.
-	CurrentVersion = Version1
-
-	// MaxTokenLen is dictated by the single-byte token_len field.
-	MaxTokenLen = 255
-
-	// MaxMessageLen is dictated by the uint16 message_len field.
-	MaxMessageLen = math.MaxUint16
-
-	// PrologueSize covers magic, version and token_len: everything needed
-	// before the variable-length token can be read.
-	PrologueSize = 4 + 1 + 1
-
-	// PayloadLenSize is the width of the payload_len field.
-	PayloadLenSize = 8
-
-	// ResponseHeaderSize covers status and message_len.
-	ResponseHeaderSize = 1 + 2
+	// TypeDrop is a file transfer: the JSON line is followed by a tar stream
+	// on the same connection.
+	TypeDrop = "drop"
 )
 
-// Status is the result code in a response frame.
-type Status byte
+// ErrNoMagic reports that a stream did not begin with Magic, and so is raw
+// clipboard content rather than a structured request.
+var ErrNoMagic = errors.New("protocol: not a structured request")
 
-const (
-	StatusOK              Status = 0x00
-	StatusAuthFailed      Status = 0x01
-	StatusPayloadTooLarge Status = 0x02
-	StatusMalformed       Status = 0x03
-	StatusInternalError   Status = 0x04
-)
-
-// OK reports whether the status indicates a successful copy.
-func (s Status) OK() bool { return s == StatusOK }
-
-func (s Status) String() string {
-	switch s {
-	case StatusOK:
-		return "ok"
-	case StatusAuthFailed:
-		return "authentication failed"
-	case StatusPayloadTooLarge:
-		return "payload too large"
-	case StatusMalformed:
-		return "malformed request"
-	case StatusInternalError:
-		return "internal server error"
-	default:
-		return fmt.Sprintf("unknown status 0x%02x", byte(s))
-	}
-}
-
-// Framing errors. Callers use errors.Is to distinguish a peer that is not
-// speaking clipd from one that is speaking it badly.
-var (
-	ErrBadMagic           = errors.New("protocol: not a clipd request")
-	ErrUnsupportedVersion = errors.New("protocol: unsupported version")
-	ErrEmptyToken         = errors.New("protocol: empty token")
-	ErrTokenTooLong       = errors.New("protocol: token too long")
-	ErrMessageTooLong     = errors.New("protocol: message too long")
-)
-
-// Request is the authenticated prologue of a request frame: everything up to
-// but not including payload_len.
+// Request is the envelope carried on the line after Magic.
+//
+// Fields beyond Type are per-type and optional; unknown fields are rejected
+// rather than ignored, so a client sending something this daemon does not
+// understand is told rather than silently half-served.
 type Request struct {
-	Version byte
-	Token   []byte
+	Type string `json:"type"`
 }
 
-// WriteRequest writes a complete request frame.
+// Sniff reports whether r begins with Magic, consuming the prefix when it
+// does and leaving the reader untouched when it does not.
 //
-// The caller is expected to hand this a buffered writer wrapping the
-// connection and to flush afterwards; the header is written as one slice so
-// that a buffered writer emits header and payload in as few segments as the
-// network stack allows.
-func WriteRequest(w io.Writer, token string, payload []byte) error {
-	switch {
-	case len(token) == 0:
-		return ErrEmptyToken
-	case len(token) > MaxTokenLen:
-		return fmt.Errorf("%w: %d bytes (max %d)", ErrTokenTooLong, len(token), MaxTokenLen)
+// The caller keeps using the same *bufio.Reader either way: the peeked bytes
+// live in its buffer, and handing the bare connection to the raw path instead
+// would silently drop however much had already been read.
+func Sniff(r *bufio.Reader) (bool, error) {
+	peek, err := r.Peek(len(Magic))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	if len(peek) < len(Magic) || string(peek) != Magic {
+		return false, nil
+	}
+	if _, err := r.Discard(len(Magic)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ReadRequest reads the JSON envelope that follows Magic.
+//
+// Once the magic prefix has been consumed the connection is committed to the
+// structured path: a malformed line is an error, never a fallback to treating
+// the bytes as clipboard content. Guessing there would let a peer smuggle
+// arbitrary text onto the clipboard by sending a frame it knew would fail.
+func ReadRequest(r *bufio.Reader) (Request, error) {
+	line, err := readLine(r, MaxFrameBytes)
+	if err != nil {
+		return Request{}, err
+	}
+	if len(line) == 0 {
+		return Request{}, errors.New("protocol: empty request frame")
 	}
 
-	header := make([]byte, 0, PrologueSize+len(token)+PayloadLenSize)
-	header = append(header, Magic[:]...)
-	header = append(header, CurrentVersion, byte(len(token)))
-	header = append(header, token...)
-	header = binary.BigEndian.AppendUint64(header, uint64(len(payload)))
-
-	// io.Writer's contract requires Write to report an error on a short
-	// write, so a single call per slice is sufficient here; the partial-write
-	// hazard in this protocol lives on the read side.
-	if _, err := w.Write(header); err != nil {
-		return fmt.Errorf("write request header: %w", err)
+	// DisallowUnknownFields so a typo in a field name fails loudly instead of
+	// leaving a default in place — the same choice the config file makes.
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.DisallowUnknownFields()
+	var req Request
+	if err := dec.Decode(&req); err != nil {
+		return Request{}, fmt.Errorf("protocol: parse request: %w", err)
 	}
-	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
-			return fmt.Errorf("write payload: %w", err)
+	if req.Type == "" {
+		return Request{}, errors.New("protocol: request has no type")
+	}
+	return req, nil
+}
+
+// WriteRequest emits Magic followed by req's JSON envelope. It exists for
+// tests and for any future first-party client; the shell-function client
+// builds the same two lines with printf.
+func WriteRequest(w io.Writer, req Request) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("protocol: encode request: %w", err)
+	}
+	if _, err := io.WriteString(w, Magic); err != nil {
+		return err
+	}
+	if _, err := w.Write(append(body, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+// readLine reads one newline-terminated line, refusing to buffer more than
+// limit bytes. Both "\n" and "\r\n" terminate, because the client may be a
+// shell one-liner and printf on some platforms is not fussy about which.
+func readLine(r *bufio.Reader, limit int) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		buf = append(buf, chunk...)
+		if len(buf) > limit {
+			return nil, fmt.Errorf("protocol: request frame exceeds %d bytes", limit)
 		}
+		if err == nil {
+			break
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			// A frame that ends at EOF without a newline is still a complete
+			// line as far as the sender is concerned; accept it rather than
+			// failing on a missing terminator nobody would notice omitting.
+			break
+		}
+		return nil, err
 	}
-	return nil
-}
-
-// ReadPrologue reads magic, version and the token.
-//
-// It stops before payload_len so the caller can authenticate first and drop
-// an unauthorised connection without reading anything it did not ask for.
-func ReadPrologue(r io.Reader) (*Request, error) {
-	buf := make([]byte, PrologueSize)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, fmt.Errorf("read prologue: %w", err)
-	}
-	if [4]byte(buf[0:4]) != Magic {
-		return nil, ErrBadMagic
-	}
-
-	version := buf[4]
-	if version != Version1 {
-		return nil, fmt.Errorf("%w: 0x%02x", ErrUnsupportedVersion, version)
-	}
-
-	tokenLen := int(buf[5])
-	if tokenLen == 0 {
-		return nil, ErrEmptyToken
-	}
-	token := make([]byte, tokenLen)
-	if _, err := io.ReadFull(r, token); err != nil {
-		return nil, fmt.Errorf("read token: %w", err)
-	}
-	return &Request{Version: version, Token: token}, nil
-}
-
-// ReadPayloadLen reads the declared payload length.
-//
-// The value is attacker-controlled: callers must compare it against their
-// configured limit before allocating a buffer for it.
-func ReadPayloadLen(r io.Reader) (uint64, error) {
-	buf := make([]byte, PayloadLenSize)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return 0, fmt.Errorf("read payload length: %w", err)
-	}
-	return binary.BigEndian.Uint64(buf), nil
-}
-
-// ReadPayload reads exactly n bytes.
-//
-// n must already have been validated against the caller's maximum; this
-// function allocates n bytes up front and will happily do so for any n that
-// fits in memory.
-func ReadPayload(r io.Reader, n uint64) ([]byte, error) {
-	if n == 0 {
-		return []byte{}, nil
-	}
-	if n > math.MaxInt {
-		return nil, fmt.Errorf("read payload: length %d exceeds addressable memory", n)
-	}
-	payload := make([]byte, n)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, fmt.Errorf("read payload: %w", err)
-	}
-	return payload, nil
-}
-
-// WriteResponse writes a status frame. An over-long message is truncated
-// rather than rejected: a diagnostic string is never worth failing a copy
-// that already succeeded.
-func WriteResponse(w io.Writer, status Status, message string) error {
-	if len(message) > MaxMessageLen {
-		message = message[:MaxMessageLen]
-	}
-	frame := make([]byte, 0, ResponseHeaderSize+len(message))
-	frame = append(frame, byte(status))
-	frame = binary.BigEndian.AppendUint16(frame, uint16(len(message)))
-	frame = append(frame, message...)
-
-	if _, err := w.Write(frame); err != nil {
-		return fmt.Errorf("write response: %w", err)
-	}
-	return nil
-}
-
-// ReadResponse reads a status frame.
-func ReadResponse(r io.Reader) (Status, string, error) {
-	header := make([]byte, ResponseHeaderSize)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return 0, "", fmt.Errorf("read response: %w", err)
-	}
-	status := Status(header[0])
-	messageLen := binary.BigEndian.Uint16(header[1:3])
-	if messageLen == 0 {
-		return status, "", nil
-	}
-	message := make([]byte, messageLen)
-	if _, err := io.ReadFull(r, message); err != nil {
-		return status, "", fmt.Errorf("read response message: %w", err)
-	}
-	return status, string(message), nil
+	return []byte(strings.TrimRight(string(buf), "\r\n")), nil
 }

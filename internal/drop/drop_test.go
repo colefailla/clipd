@@ -1,0 +1,472 @@
+package drop
+
+import (
+	"archive/tar"
+	"bytes"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// entry describes one archive member for the test archive builder.
+type entry struct {
+	name     string
+	body     string
+	typeflag byte
+	mode     int64
+	linkname string
+}
+
+// archiveOf builds a tar stream in memory. It writes headers exactly as
+// given, including ones a well-behaved tar would never produce, because those
+// are the interesting cases.
+func archiveOf(t *testing.T, entries ...entry) io.Reader {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, e := range entries {
+		flag := e.typeflag
+		if flag == 0 {
+			flag = tar.TypeReg
+		}
+		mode := e.mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		hdr := &tar.Header{
+			Name:     e.name,
+			Mode:     mode,
+			Size:     int64(len(e.body)),
+			Typeflag: flag,
+			Linkname: e.linkname,
+		}
+		if flag != tar.TypeReg {
+			hdr.Size = 0
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write header %q: %v", e.name, err)
+		}
+		if flag == tar.TypeReg {
+			if _, err := tw.Write([]byte(e.body)); err != nil {
+				t.Fatalf("write body %q: %v", e.name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close archive: %v", err)
+	}
+	return &buf
+}
+
+// TestExtractConfinesHostileNames is the test this package exists for.
+//
+// Every name here is a real archive-extraction attack. The property being
+// pinned is not "these particular strings are handled" but the invariant that
+// makes them all harmless at once: nothing is ever written outside Dir,
+// because every entry is reduced to a basename before it becomes a path.
+func TestExtractConfinesHostileNames(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		give string
+		want string
+	}{
+		{"parent traversal", "../../.ssh/authorized_keys", "authorized_keys"},
+		{"deep traversal", "../../../../../../etc/passwd", "passwd"},
+		{"absolute path", "/etc/passwd", "passwd"},
+		{"absolute traversal", "/../../etc/shadow", "shadow"},
+		{"windows separators", `..\..\Windows\System32\drivers\etc\hosts`, "hosts"},
+		{"embedded traversal", "a/b/../../../../c.txt", "c.txt"},
+		{"trailing dot segments", "notes/./x.txt", "x.txt"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := filepath.Join(t.TempDir(), "drop")
+			res, err := Extract(archiveOf(t, entry{name: tc.give, body: "payload"}), Options{Dir: dir})
+			if err != nil {
+				t.Fatalf("Extract: %v", err)
+			}
+			if len(res.Names) != 1 || res.Names[0] != tc.want {
+				t.Fatalf("wrote %v, want exactly [%s]", res.Names, tc.want)
+			}
+
+			// The written file is inside Dir, and Dir holds nothing else.
+			written := filepath.Join(dir, tc.want)
+			if _, err := os.Stat(written); err != nil {
+				t.Fatalf("stat %s: %v", written, err)
+			}
+			ents, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("read dir: %v", err)
+			}
+			if len(ents) != 1 {
+				t.Fatalf("drop directory holds %d entries, want 1", len(ents))
+			}
+		})
+	}
+}
+
+// TestExtractNothingEscapesTheParent is the same property checked from the
+// other side: after extracting an archive full of traversal attempts, the
+// directory above Dir must be untouched.
+func TestExtractNothingEscapesTheParent(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "drop")
+
+	_, err := Extract(archiveOf(t,
+		entry{name: "../escaped.txt", body: "no"},
+		entry{name: "../../escaped2.txt", body: "no"},
+		entry{name: "/tmp/escaped3.txt", body: "no"},
+	), Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	ents, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatalf("read parent: %v", err)
+	}
+	if len(ents) != 1 || ents[0].Name() != "drop" {
+		var names []string
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("parent directory holds %v, want only [drop]", names)
+	}
+}
+
+// TestExtractSkipsNonRegularEntries covers every tar type that is a way to
+// write somewhere else or to create something a sender has no business
+// creating: links of both kinds, directories, devices and FIFOs.
+func TestExtractSkipsNonRegularEntries(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	res, err := Extract(archiveOf(t,
+		entry{name: "evil-link", typeflag: tar.TypeSymlink, linkname: "/etc/passwd"},
+		entry{name: "evil-hard", typeflag: tar.TypeLink, linkname: "/etc/passwd"},
+		entry{name: "subdir", typeflag: tar.TypeDir},
+		entry{name: "evil-dev", typeflag: tar.TypeChar},
+		entry{name: "evil-blk", typeflag: tar.TypeBlock},
+		entry{name: "evil-fifo", typeflag: tar.TypeFifo},
+		entry{name: "real.txt", body: "kept"},
+	), Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if len(res.Names) != 1 || res.Names[0] != "real.txt" {
+		t.Fatalf("wrote %v, want only [real.txt]", res.Names)
+	}
+
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(ents) != 1 {
+		t.Fatalf("drop directory holds %d entries, want 1", len(ents))
+	}
+	// Specifically: no symlink was created, under any name.
+	for _, e := range ents {
+		if e.Type()&os.ModeSymlink != 0 {
+			t.Errorf("%s is a symlink", e.Name())
+		}
+	}
+}
+
+// TestExtractWillNotFollowAPlantedSymlink pins the reason createUnique uses
+// O_EXCL. With a symlink already sitting at the target name, an extraction
+// that opened it normally would write through the link to whatever it points
+// at.
+func TestExtractWillNotFollowAPlantedSymlink(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "drop")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(tmp, "victim.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write victim: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "notes.txt")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	res, err := Extract(archiveOf(t, entry{name: "notes.txt", body: "overwritten"}), Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read victim: %v", err)
+	}
+	if string(got) != "original" {
+		t.Fatalf("the symlink was followed: victim now holds %q", got)
+	}
+	if len(res.Names) != 1 || res.Names[0] == "notes.txt" {
+		t.Fatalf("wrote %v, want a renamed file rather than notes.txt", res.Names)
+	}
+}
+
+func TestExtractNeverOverwrites(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("first"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	res, err := Extract(archiveOf(t, entry{name: "notes.txt", body: "second"}), Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if res.Names[0] != "notes-1.txt" {
+		t.Errorf("wrote %q, want notes-1.txt", res.Names[0])
+	}
+	original, err := os.ReadFile(filepath.Join(dir, "notes.txt"))
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if string(original) != "first" {
+		t.Errorf("the original was modified: %q", original)
+	}
+}
+
+func TestExtractStripsTheExecutableBit(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	if _, err := Extract(archiveOf(t,
+		entry{name: "payload.sh", body: "#!/bin/sh\n", mode: 0o777},
+	), Options{Dir: dir}); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dir, "payload.sh"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != filePerm {
+		t.Errorf("mode = %04o, want %04o", perm, filePerm)
+	}
+}
+
+func TestExtractEnforcesLimits(t *testing.T) {
+	t.Parallel()
+
+	t.Run("total bytes", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "drop")
+		_, err := Extract(archiveOf(t,
+			entry{name: "a.bin", body: strings.Repeat("x", 600)},
+			entry{name: "b.bin", body: strings.Repeat("x", 600)},
+		), Options{Dir: dir, MaxBytes: 1000})
+		if err == nil {
+			t.Fatal("Extract succeeded, want a size-limit error")
+		}
+		assertDirEmpty(t, dir)
+	})
+
+	t.Run("a single oversized file", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "drop")
+		_, err := Extract(archiveOf(t,
+			entry{name: "big.bin", body: strings.Repeat("x", 5000)},
+		), Options{Dir: dir, MaxBytes: 1000})
+		if err == nil {
+			t.Fatal("Extract succeeded, want a size-limit error")
+		}
+		assertDirEmpty(t, dir)
+	})
+
+	t.Run("file count", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "drop")
+		var entries []entry
+		for i := range 10 {
+			entries = append(entries, entry{name: string(rune('a'+i)) + ".txt", body: "x"})
+		}
+		_, err := Extract(archiveOf(t, entries...), Options{Dir: dir, MaxFiles: 3})
+		if err == nil {
+			t.Fatal("Extract succeeded, want a file-count error")
+		}
+		assertDirEmpty(t, dir)
+	})
+}
+
+// TestExtractCleansUpAfterAFailure pins the all-or-nothing property: a
+// rejected drop must not leave files behind that look like a complete one.
+func TestExtractCleansUpAfterAFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	_, err := Extract(archiveOf(t,
+		entry{name: "ok-1.txt", body: "fine"},
+		entry{name: "ok-2.txt", body: "fine"},
+		entry{name: "toobig.bin", body: strings.Repeat("x", 5000)},
+	), Options{Dir: dir, MaxBytes: 1000})
+	if err == nil {
+		t.Fatal("Extract succeeded, want a size-limit error")
+	}
+	assertDirEmpty(t, dir)
+}
+
+// TestSafeNameRejectsUnusableNames exercises safeName directly rather than
+// through Extract, because Go's tar writer refuses to encode some of these —
+// a trailing slash, for instance. A hostile archive is not produced by Go's
+// writer, so the extractor still has to cope with them.
+func TestSafeNameRejectsUnusableNames(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{
+		"", ".", "..", "/", "//", "../", "a/b/..",
+		strings.Repeat("n", maxNameBytes+1),
+		"nul\x00byte",
+	} {
+		if got, err := safeName(name); err == nil {
+			t.Errorf("safeName(%q) = %q, want an error", name, got)
+		}
+	}
+}
+
+// TestSafeNameKeepsUsableNames is the other half: legitimate filenames,
+// including dotfiles and names with spaces, must survive intact.
+func TestSafeNameKeepsUsableNames(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"notes.txt":            "notes.txt",
+		"a/b/c/notes.txt":      "notes.txt",
+		".bashrc":              ".bashrc",
+		"my report (final).md": "my report (final).md",
+		"árvíztűrő.txt":        "árvíztűrő.txt",
+		// Base strips trailing slashes, so this lands as a plain filename
+		// inside Dir rather than being rejected. Safe, and worth pinning so
+		// the behaviour is not mistaken for an oversight later.
+		"some/dir/": "dir",
+	}
+	for give, want := range tests {
+		got, err := safeName(give)
+		if err != nil {
+			t.Errorf("safeName(%q): %v", give, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("safeName(%q) = %q, want %q", give, got, want)
+		}
+	}
+}
+
+// TestExtractRejectsAnOverlongName goes through Extract for the one unusable
+// case the tar writer will happily encode.
+func TestExtractRejectsAnOverlongName(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	_, err := Extract(archiveOf(t,
+		entry{name: strings.Repeat("n", maxNameBytes+1), body: "x"},
+	), Options{Dir: dir})
+	if err == nil {
+		t.Fatal("Extract accepted an overlong name")
+	}
+	assertDirEmpty(t, dir)
+}
+
+func TestExtractRejectsAnEmptyArchive(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	_, err := Extract(archiveOf(t), Options{Dir: dir})
+	if !errors.Is(err, ErrNoFiles) {
+		t.Fatalf("err = %v, want ErrNoFiles", err)
+	}
+}
+
+func TestExtractRejectsGarbage(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	_, err := Extract(strings.NewReader("this is not a tar archive at all"), Options{Dir: dir})
+	if err == nil {
+		t.Fatal("Extract accepted non-archive input")
+	}
+}
+
+func TestExtractPreservesContentAndOrder(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	res, err := Extract(archiveOf(t,
+		entry{name: "one.txt", body: "first"},
+		entry{name: "two.txt", body: "second"},
+	), Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if got := strings.Join(res.Names, ","); got != "one.txt,two.txt" {
+		t.Errorf("names = %s, want one.txt,two.txt", got)
+	}
+	if res.Bytes != int64(len("first")+len("second")) {
+		t.Errorf("bytes = %d, want %d", res.Bytes, len("first")+len("second"))
+	}
+	for name, want := range map[string]string{"one.txt": "first", "two.txt": "second"} {
+		got, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestSplitName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, stem, ext string }{
+		{"notes.txt", "notes", ".txt"},
+		{"archive.tar.gz", "archive.tar", ".gz"},
+		{"README", "README", ""},
+		{".bashrc", ".bashrc", ""},
+	}
+	for _, tc := range tests {
+		stem, ext := splitName(tc.name)
+		if stem != tc.stem || ext != tc.ext {
+			t.Errorf("splitName(%q) = %q, %q; want %q, %q", tc.name, stem, ext, tc.stem, tc.ext)
+		}
+	}
+}
+
+// assertDirEmpty reports any file left in dir, which after a failed extraction
+// should be none.
+func assertDirEmpty(t *testing.T, dir string) {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(ents) != 0 {
+		var names []string
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		t.Errorf("a failed drop left %v behind", names)
+	}
+}

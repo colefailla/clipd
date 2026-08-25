@@ -1,26 +1,20 @@
 // Command clipd is a terminal-independent remote clipboard.
 //
-// One binary plays both roles. On macOS `clipd serve` runs a small daemon
-// that writes what it receives to the system clipboard; on any machine that
-// can reach it, `something | clipd` sends stdin there and exits. Nothing is
-// asked of the terminal emulator, so the workflow behaves identically in
-// Terminal.app, iTerm2, Ghostty, tmux or a VS Code panel.
+// The daemon runs on the Mac and listens on a UNIX domain socket. Forwarding
+// that socket over SSH puts it on a remote machine, where anything able to
+// write bytes — `nc`, an editor, a shell function — can put text on the Mac's
+// clipboard or send it a file. Nothing is installed on the remote side, and
+// nothing is asked of the terminal emulator, so the workflow behaves
+// identically in Terminal.app, iTerm2, Ghostty, tmux or a VS Code panel.
 package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"runtime"
-	"strings"
-
-	"github.com/colefailla/clipd/internal/client"
-	"github.com/colefailla/clipd/internal/config"
-	"github.com/colefailla/clipd/internal/transport"
 )
 
 // Build information, injected with -ldflags. See the Makefile.
@@ -32,27 +26,19 @@ var (
 
 // Exit codes. Distinct codes let a script branch on $? instead of parsing
 // stderr. 64 is sysexits.h's EX_USAGE, kept apart from the operational codes
-// so "I typed it wrong" never looks like "authentication failed".
+// so "I typed it wrong" never looks like "the daemon is not running".
 const (
-	exitOK       = 0
-	exitFailure  = 1
-	exitAuth     = 2
-	exitTooLarge = 3
-	exitConfig   = 4
-	exitTLS      = 5
-	exitUsage    = 64
+	exitOK      = 0
+	exitFailure = 1
+	exitConfig  = 4
+	exitUsage   = 64
 )
 
 // env is the process environment the commands run against, injected so the
 // dispatcher and commands are testable without touching the real one.
 type env struct {
-	stdin  io.Reader
 	stdout io.Writer
 	stderr io.Writer
-
-	// stdinIsPipe is true when stdin is a pipe or a file rather than a
-	// terminal. It is what makes `ls | clipd` work without a subcommand.
-	stdinIsPipe bool
 
 	getenv func(string) string
 }
@@ -61,22 +47,15 @@ type env struct {
 type globalOptions struct {
 	configPath string
 	verbose    bool
-	timeout    string
 }
 
 // commandFunc is the signature every subcommand implements.
 type commandFunc func(ctx context.Context, e *env, g *globalOptions, args []string) int
 
 // commands is the authoritative list of subcommand names.
-//
-// It is consulted before argument parsing decides anything else, because
-// `clipd serve` and `clipd notes.txt` occupy the same argv slot: a name in
-// this table is a command, and anything else is a filename.
 var commands = map[string]commandFunc{
-	"copy":      cmdCopy,
 	"serve":     cmdServe,
 	"setup":     cmdSetup,
-	"configure": cmdConfigure,
 	"status":    cmdStatus,
 	"install":   cmdInstall,
 	"uninstall": cmdUninstall,
@@ -85,12 +64,18 @@ var commands = map[string]commandFunc{
 }
 
 func main() {
+	// Every file, directory and socket this process creates is owner-only,
+	// set once here rather than repaired afterwards with Chmod. A socket in
+	// particular has no second chance: between bind and chmod there is a
+	// window where a permissive umask has already published it.
+	//
+	// Taken from wincent/clipper, which opens main the same way.
+	restrictUmask()
+
 	e := &env{
-		stdin:       os.Stdin,
-		stdout:      os.Stdout,
-		stderr:      os.Stderr,
-		stdinIsPipe: stdinIsPipe(os.Stdin),
-		getenv:      os.Getenv,
+		stdout: os.Stdout,
+		stderr: os.Stderr,
+		getenv: os.Getenv,
 	}
 	os.Exit(run(context.Background(), os.Args[1:], e))
 }
@@ -101,9 +86,9 @@ func run(ctx context.Context, args []string, e *env) int {
 
 	fs := flag.NewFlagSet("clipd", flag.ContinueOnError)
 	// The flag package prints its own error and calls Usage on every parse
-	// failure, including -h. Both are suppressed so help lands once on
-	// stdout and errors land once on stderr, instead of usage appearing
-	// twice on a terminal where the two streams interleave.
+	// failure, including -h. Both are suppressed so help lands once on stdout
+	// and errors land once on stderr, instead of usage appearing twice on a
+	// terminal where the two streams interleave.
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {}
 	registerGlobalFlags(fs, &g)
@@ -120,53 +105,28 @@ func run(ctx context.Context, args []string, e *env) int {
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		// No subcommand. Piped stdin means the user wants a copy; a terminal
-		// means they typed `clipd` to see what it does.
-		if e.stdinIsPipe {
-			return cmdCopy(ctx, e, &g, nil)
-		}
 		printUsage(e.stderr)
 		return exitUsage
 	}
-
-	if isCommand(rest[0]) {
-		return commands[rest[0]](ctx, e, &g, rest[1:])
+	cmd, ok := commands[rest[0]]
+	if !ok {
+		fmt.Fprintf(e.stderr, "clipd: unknown command %q\n\n", rest[0])
+		printUsage(e.stderr)
+		return exitUsage
 	}
-
-	// Not a command, so it is a file to copy.
-	return cmdCopy(ctx, e, &g, rest)
-}
-
-// isCommand reports whether an argument names a subcommand.
-//
-// The match is exact: "serve" is a command, "serve.txt" and "./serve" are
-// files. A file whose name collides with a command is reachable through the
-// explicit form, `clipd copy serve`.
-func isCommand(arg string) bool {
-	_, ok := commands[arg]
-	return ok
+	return cmd(ctx, e, &g, rest[1:])
 }
 
 // registerGlobalFlags attaches the global flags to fs.
 //
 // Each flag's default is g's current value, so registering the same flags on
 // a subcommand's flag set preserves anything already parsed from before the
-// subcommand. That is what makes `clipd --verbose copy` and
-// `clipd copy --verbose` equivalent.
+// subcommand. That is what makes `clipd -v serve` and `clipd serve -v`
+// equivalent.
 func registerGlobalFlags(fs *flag.FlagSet, g *globalOptions) {
 	fs.StringVar(&g.configPath, "config", g.configPath, "path to the clipd config file")
 	fs.BoolVar(&g.verbose, "verbose", g.verbose, "report progress on stderr")
 	fs.BoolVar(&g.verbose, "v", g.verbose, "shorthand for -verbose")
-	// Validated during Parse so a malformed value is a usage error (exit 64)
-	// like any other bad flag, rather than surfacing later as a
-	// configuration error the exit-code table reserves for the config file.
-	fs.Func("timeout", "network timeout, e.g. 5s", func(v string) error {
-		if _, err := config.ParseDuration(v); err != nil {
-			return err
-		}
-		g.timeout = v
-		return nil
-	})
 }
 
 // cmdFlags is a subcommand's flag set together with its usage text.
@@ -174,8 +134,7 @@ func registerGlobalFlags(fs *flag.FlagSet, g *globalOptions) {
 // The flag package prints usage to one fixed destination, but the same text
 // serves two purposes: an answer when the user typed -h, and a complaint when
 // they typed something wrong. Keeping the text here lets parse route it to
-// stdout or stderr accordingly. Embedding the flag set means callers declare
-// flags exactly as they would on a *flag.FlagSet.
+// stdout or stderr accordingly.
 type cmdFlags struct {
 	*flag.FlagSet
 	usage string
@@ -187,8 +146,6 @@ func newFlagSet(e *env, g *globalOptions, name, usage string) *cmdFlags {
 	fs := flag.NewFlagSet("clipd "+name, flag.ContinueOnError)
 	fs.SetOutput(e.stderr)
 	registerGlobalFlags(fs, g)
-	// Suppressed here and printed by parse, which is where it is known whether
-	// the usage text is being asked for or imposed.
 	fs.Usage = func() {}
 	return &cmdFlags{FlagSet: fs, usage: usage, e: e}
 }
@@ -201,13 +158,10 @@ func (c *cmdFlags) parse(args []string) (code int, ok bool) {
 		return exitOK, true
 	case errors.Is(err, flag.ErrHelp):
 		// -h is a request, and its output is what the user asked for, so it
-		// goes to stdout where it can be piped into a pager like any other
-		// command's help.
+		// goes to stdout where it can be piped into a pager.
 		c.printUsage(c.e.stdout)
 		return exitOK, false
 	default:
-		// Parse has already written the error to stderr; the usage text
-		// belongs beside it rather than in the command's output.
 		c.printUsage(c.e.stderr)
 		return exitUsage, false
 	}
@@ -218,79 +172,6 @@ func (c *cmdFlags) printUsage(w io.Writer) {
 	c.FlagSet.SetOutput(w)
 	defer c.FlagSet.SetOutput(c.e.stderr)
 	c.FlagSet.PrintDefaults()
-}
-
-// loadConfig resolves and loads configuration for a command, applying
-// environment overrides and the global --timeout flag.
-func loadConfig(e *env, g *globalOptions) (config.Config, string, error) {
-	return loadConfigAt(e, g, true, true)
-}
-
-// loadFileConfig is loadConfig without the environment overlay.
-//
-// Commands that persist the configuration — configure, setup, install — use
-// it so a transient CLIPD_* override is not silently baked into the file:
-// the environment exists for one-off runs, and `CLIPD_SERVER=test clipd
-// configure -port 9000` must not leave the test server in config.json.
-// CLIPD_CONFIG still selects which file, via ResolvePath. Any override that
-// is being ignored is called out on stderr, so a workflow that relied on
-// the old persisting behaviour fails loudly rather than mysteriously.
-func loadFileConfig(e *env, g *globalOptions) (config.Config, string, error) {
-	var ignored []string
-	for _, name := range config.OverrideEnv {
-		if e.getenv(name) != "" {
-			ignored = append(ignored, name)
-		}
-	}
-	if len(ignored) > 0 {
-		fmt.Fprintf(e.stderr,
-			"clipd: note: %s ignored — environment overrides apply to one-off runs and are never written to the config file.\n       %s\n",
-			strings.Join(ignored, ", "), persistInstead)
-	}
-	return loadConfigAt(e, g, false, true)
-}
-
-// persistInstead completes the ignored-override note by naming the commands
-// that do write a value into the file.
-//
-// It names them rather than saying "use flags instead", which is unactionable
-// for install: its only flag is -exec, so a user whose CLIPD_BIND is being
-// declined has to reach for setup, and nothing on the install command line
-// would have told them so.
-const persistInstead = "To store one, pass the matching flag to 'clipd setup' (daemon settings) or 'clipd configure' (client settings)."
-
-func loadConfigAt(e *env, g *globalOptions, applyEnv, warnPerms bool) (config.Config, string, error) {
-	path, err := config.ResolvePath(g.configPath)
-	if err != nil {
-		return config.Config{}, "", err
-	}
-	cfg, err := config.Load(path)
-	if err != nil {
-		return cfg, path, err
-	}
-	// The file holds the token in plaintext, and Save enforces 0600 — but a
-	// config copied from another machine or written by hand answers to the
-	// umask instead, and nothing else would ever mention it. Status renders
-	// the same warning inside its report and asks for this one to be
-	// suppressed.
-	if warnPerms && runtime.GOOS != "windows" && config.Exists(path) {
-		if warning := permissionWarning(path, "the token"); warning != "" {
-			fmt.Fprintf(e.stderr, "clipd: warning: %s\n", warning)
-		}
-	}
-	if applyEnv {
-		if err := cfg.ApplyEnv(e.getenv); err != nil {
-			return cfg, path, err
-		}
-	}
-	if g.timeout != "" {
-		d, err := config.ParseDuration(g.timeout)
-		if err != nil {
-			return cfg, path, fmt.Errorf("-timeout: %w", err)
-		}
-		cfg.TimeoutMS = d.Milliseconds()
-	}
-	return cfg, path, nil
 }
 
 // fail prints an error to stderr in the conventional `clipd: message` form
@@ -305,71 +186,20 @@ func failf(e *env, code int, format string, args ...any) int {
 	return fail(e, code, fmt.Errorf(format, args...))
 }
 
-// usageError marks a failure caused by how the command was invoked — a
-// missing input file, nothing to read — rather than by configuration or the
-// network, so it exits 64 like other invocation mistakes. The documented
-// exit 1 is reserved for connection and server failures.
-type usageError struct{ err error }
-
-func (u usageError) Error() string { return u.err.Error() }
-func (u usageError) Unwrap() error { return u.err }
-
-// exitCodeFor maps a copy failure onto its exit code.
-func exitCodeFor(err error) int {
-	var uerr usageError
-	if errors.As(err, &uerr) {
-		return exitUsage
-	}
-	var cerr *client.Error
-	if errors.As(err, &cerr) {
-		switch cerr.Kind {
-		case client.KindAuth:
-			return exitAuth
-		case client.KindTooLarge:
-			return exitTooLarge
-		case client.KindTLS:
-			return exitTLS
-		}
-	}
-	return exitFailure
-}
-
-// clientTLS builds the pinned TLS configuration from the configured
-// fingerprint.
-func clientTLS(cfg config.Config) (*tls.Config, error) {
-	pin, err := transport.ParseFingerprint(cfg.ServerFingerprint)
-	if err != nil {
-		return nil, fmt.Errorf("server_fingerprint: %w", err)
-	}
-	return transport.ClientConfig(pin)
-}
-
-// stdinIsPipe reports whether stdin is connected to a pipe or a file rather
-// than a terminal.
-func stdinIsPipe(f *os.File) bool {
-	info, err := f.Stat()
-	if err != nil {
-		// If the mode cannot be determined, assume a terminal: printing usage
-		// is a harmless mistake, silently blocking on a read is not.
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice == 0
-}
-
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `clipd — send stdin to a remote Mac's clipboard
+	fmt.Fprint(w, `clipd — send text and files to your Mac's clipboard over SSH
 
-Usage:
-  <command> | clipd              copy piped input to the configured Mac
-  clipd <file>                   copy a file's contents
-  clipd <command> [options]
+The daemon runs on the Mac. Nothing is installed on the machines you copy
+from: 'clipd setup <host>' forwards the socket and drops a shell function
+there, and from then on:
+
+  ls -l | clipd            copy output to the Mac's clipboard
+  clipd drop report.pdf    send files to the Mac's ~/Drop
 
 Commands:
-  copy        copy stdin or a file to the remote clipboard (the default)
-  serve       run the clipboard daemon in the foreground (macOS)
-  setup       macOS: create the config, generate the token and TLS keypair
-  configure   client: set the server address, port, token and fingerprint
-  status      show configuration, daemon state, reachability and pin check
+  serve       run the daemon in the foreground (macOS)
+  setup       configure a remote host to talk to this daemon
+  status      show the daemon's configuration and state
   install     macOS: install and start the LaunchAgent
   uninstall   macOS: stop and remove the LaunchAgent
   version     print build information
@@ -377,22 +207,13 @@ Commands:
 
 Global options:
   -config <path>     use an alternate config file
-  -timeout <dur>     network timeout, e.g. 5s
   -verbose, -v       report progress on stderr
 
 Environment:
-  CLIPD_CONFIG, CLIPD_SERVER, CLIPD_PORT, CLIPD_BIND, CLIPD_TOKEN,
-  CLIPD_FINGERPRINT, CLIPD_TLS_CERT, CLIPD_TLS_KEY, CLIPD_MAX_PAYLOAD,
-  CLIPD_MAX_CONCURRENT, CLIPD_MAX_MEMORY, CLIPD_TIMEOUT
+  CLIPD_CONFIG       path to the config file
 
-Run 'clipd help config' for the config file format.
-
-Examples:
-  docker ps | clipd
-  clipd compose.yaml
-  clipd -v status
-
-Run 'clipd help <command>' for details.
+Run 'clipd help config' for the config file format, or
+'clipd help security' for what protects the socket.
 `)
 }
 
@@ -402,177 +223,11 @@ func cmdHelp(_ context.Context, e *env, _ *globalOptions, args []string) int {
 		printUsage(e.stdout)
 		return exitOK
 	}
-	topic := args[0]
-	text, ok := helpTopics[topic]
+	text, ok := helpTopics[args[0]]
 	if !ok {
-		fmt.Fprintf(e.stderr, "clipd: no help for %q\n", topic)
+		fmt.Fprintf(e.stderr, "clipd: no help for %q\n", args[0])
 		return exitUsage
 	}
 	fmt.Fprintln(e.stdout, text)
 	return exitOK
-}
-
-var helpTopics = map[string]string{
-	"copy": `clipd copy [file]
-
-Reads stdin, or the named file, and copies it to the configured Mac's
-clipboard. A file named "-" means stdin. This is what runs when no
-subcommand is given and stdin is piped, so these are equivalent:
-
-  echo hello | clipd
-  echo hello | clipd copy
-
-Content is sent byte for byte: newlines, tabs and the trailing newline are
-preserved exactly as supplied. Input larger than the configured maximum is
-rejected rather than truncated.
-
-Options:
-  -max-payload <size>   override the client-side limit for this copy, e.g.
-                        20MB. The daemon enforces its own limit as well: to
-                        copy more than the Mac accepts, also run
-                        'clipd setup -max-payload <size>' there and restart
-                        the daemon.
-
-Exit codes: 0 success, 1 connection or server failure, 2 authentication
-failure, 3 payload too large, 4 configuration error, 5 TLS handshake or
-fingerprint mismatch, 64 usage error.`,
-
-	"serve": `clipd serve
-
-Runs the clipboard daemon in the foreground until SIGINT or SIGTERM. macOS
-only, since writing the clipboard is what the daemon does.
-
-It does not detach: under the LaunchAgent, launchd owns backgrounding,
-restarts and log files.
-
-Options:
-  -bind <address>   listen address (default from config, 0.0.0.0)
-  -port <port>      listen port (default from config, 8199)`,
-
-	"setup": `clipd setup
-
-Creates the config file on the Mac, generating a random authentication token
-and a TLS keypair if they do not exist, then prints the exact command to run
-on the client machine. Running it again prints the existing token and
-fingerprint rather than replacing them.
-
-The token is a secret. The fingerprint is not: it is the server's identity,
-and clients use it to verify they are talking to this Mac.
-
-Options:
-  -bind <address>       listen address to store (default 0.0.0.0)
-  -port <port>          listen port to store
-  -max-payload <size>   maximum accepted payload, e.g. 10MB
-  -rotate               generate a new token, invalidating the old one
-  -rotate-cert          generate a new TLS keypair; every client must then be
-                        reconfigured with the new fingerprint`,
-
-	"configure": `clipd configure
-
-Stores the Mac's address, port, token and server fingerprint on the client
-machine. With no flags on a terminal it prompts for each value; in a script,
-pass flags. Both the token and the fingerprint come from 'clipd setup' on
-the Mac.
-
-Options:
-  -server <host>        Mac hostname or IP address
-  -port <port>          port the daemon listens on
-  -token <token>        authentication token; prefer "-" to read it from stdin
-  -fingerprint <fp>     server key fingerprint; accepts the sha256: prefix or
-                        not, colons or not, any case
-  -max-payload <size>   maximum payload to send, e.g. 10MB
-  -timeout <duration>   network timeout to store, e.g. 5s
-
-Prefer '-token -' and paste the value when prompted. A token passed as
-'-token <value>' is exposed twice over: other local users can read a process's
-command line (on Linux, straight out of /proc), and the shell keeps it in
-history.
-
-The config file is written with 0600 permissions inside a 0700 directory,
-because it contains the token in plaintext.`,
-
-	"status": `clipd status
-
-Shows the resolved configuration, the local daemon's state on macOS, and
-whether the configured server is reachable. The token is never printed in
-full.
-
-On a client it also completes a TLS handshake with the daemon and reports
-whether the server's key matches the pinned fingerprint, without sending the
-token or any payload. A mismatch prints both fingerprints.
-
-The probe's outcome is the exit code, so status works as a scriptable
-preflight: 0 when the probe succeeds or there is nothing configured to
-check, 1 when the server is unreachable, 5 when the handshake fails or the
-fingerprint does not match, 4 for a configuration problem.`,
-
-	"config": `clipd config file
-
-Location:
-
-  macOS   ~/Library/Application Support/clipd/config.json
-  Linux   $XDG_CONFIG_HOME/clipd/config.json, or ~/.config/clipd/config.json
-
-Override with -config <path> or CLIPD_CONFIG. The directory is created 0700
-and the file 0600, because the token is stored in plaintext. The daemon's TLS
-keypair lives in a tls/ directory beside the config file.
-
-Keys, all optional except where noted:
-
-  server_address      client: Mac hostname or IP. Required to copy.
-  port                both:   port the daemon listens on (default 8199)
-  bind_address        daemon: listen address (default 0.0.0.0)
-  token               both:   shared authentication token. Required.
-  server_fingerprint  client: pinned server public key. Required to copy.
-  tls_cert_path       daemon: certificate path; empty means beside the config
-  tls_key_path        daemon: private key path; empty means beside the config
-  max_payload_bytes   both:   largest accepted payload (default 10485760)
-  max_concurrent      daemon: copies performed at once (default 128)
-  max_memory_bytes    daemon: total payload bytes buffered across all
-                              connections (default 67108864, or one maximum
-                              payload if that is larger)
-  timeout_ms          both:   connect and handshake timeout (default 5000)
-
-The daemon buffers each payload whole, so its memory ceiling would otherwise be
-max_payload_bytes times max_concurrent. max_memory_bytes bounds that product
-directly: copies beyond it wait for room rather than being refused. It must be
-at least max_payload_bytes, since a copy the daemon accepts has to fit.
-
-Keys belonging to the other role stay empty: a Mac has no server_address, a
-client has no keypair. Unknown keys are rejected rather than ignored, so a
-typo fails loudly instead of silently leaving a default in place.
-
-Environment variables override the file:
-
-  CLIPD_CONFIG CLIPD_SERVER CLIPD_PORT CLIPD_BIND CLIPD_TOKEN
-  CLIPD_FINGERPRINT CLIPD_TLS_CERT CLIPD_TLS_KEY CLIPD_MAX_PAYLOAD
-  CLIPD_MAX_CONCURRENT CLIPD_MAX_MEMORY CLIPD_TIMEOUT
-
-CLIPD_MAX_PAYLOAD accepts a suffix (10MB, 512KiB); CLIPD_TIMEOUT takes a
-duration (5s, 500ms).`,
-
-	"install": `clipd install
-
-macOS only. Generates the config and token if needed, writes
-~/Library/LaunchAgents/com.clipd.agent.plist, and loads it into the user's
-GUI session so the daemon starts at login and restarts if it crashes. No
-root privileges are required.
-
-Options:
-  -exec <path>   binary path to record in the plist (default: this binary)`,
-
-	"uninstall": `clipd uninstall
-
-macOS only. Unloads the LaunchAgent and removes its plist. The config file
-is left in place; delete it by hand to remove the stored token.`,
-
-	"version": `clipd version
-
-Prints the version, commit and build date recorded at build time, plus the
-Go toolchain and target platform.`,
-
-	"help": `clipd help [topic]
-
-With no topic, prints the command list. With a topic, prints detail for that
-command. 'clipd help config' documents the config file format.`,
 }

@@ -1,116 +1,77 @@
-// Package server implements the clipd daemon: accept a connection,
-// authenticate it, read a clipboard payload, hand it to the host clipboard.
+// Package server implements the clipd daemon: accept a connection from the
+// listening socket, decide what kind of message it is, and carry it out.
 //
 // The daemon runs in the foreground and never self-daemonizes. On macOS,
 // launchd owns backgrounding, log redirection and restart-on-crash, so
 // duplicating any of that here would only add ways to disagree with launchd.
+//
+// # What this package is not responsible for
+//
+// There is no authentication, no encryption and no peer identity, and their
+// absence is the design rather than a gap in it. The daemon listens on a UNIX
+// domain socket in the user's home directory, and that socket reaches other
+// machines only by being forwarded over SSH. By the time bytes arrive here,
+// SSH has already encrypted the channel, verified the host key, and
+// authenticated the user, and the filesystem permissions on the socket have
+// already decided who is allowed to write to it. A token checked at this layer
+// would be a second, weaker copy of a decision that has already been made
+// correctly — and a token stored on the remote machine to satisfy it would be
+// a stealable secret where today there is only an ephemeral capability.
+//
+// What remains here is resource control. Every peer is authorised, but an
+// authorised peer can still be a runaway loop, so connections, concurrency,
+// payload size and time are all bounded.
 package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/colefailla/clipd/internal/auth"
 	"github.com/colefailla/clipd/internal/clipboard"
+	"github.com/colefailla/clipd/internal/drop"
 	"github.com/colefailla/clipd/internal/protocol"
 )
 
 const (
-	// minThroughput is the slowest transfer rate the payload deadline
-	// assumes. The handshake gets a flat timeout, but the body cannot: a
-	// legitimate 10 MiB paste over a congested link must not be killed at the
-	// same deadline that a 40-byte one gets. 256 KiB/s is far below any real
-	// LAN and still bounds a byte-trickling client.
-	minThroughput = 256 << 10
-
-	// defaultMaxConcurrent bounds copies being carried out at once: reading a
-	// payload and handing it to the clipboard.
+	// defaultMaxConcurrent bounds the messages being carried out at once:
+	// buffering a clipboard payload and forking pbcopy, or extracting an
+	// archive to disk.
 	//
-	// It is acquired after authentication, not before accepting, because the
-	// two halves of a connection's life cost wildly different amounts. Holding
-	// a socket open is a goroutine and some buffers; performing a copy reads a
-	// payload into memory and forks a clipboard helper. Rationing them together
-	// meant a peer that had proved nothing could exhaust the budget for peers
-	// that had — which is precisely the denial of service this split closes.
-	//
-	// It also bounds concurrent pbcopy processes, which nothing else does:
-	// memBudget counts bytes, and a thousand one-byte copies weigh nothing
-	// while still being a thousand forks.
-	defaultMaxConcurrent = 128
+	// Small, because the peers are the user's own SSH sessions rather than a
+	// network of clients. It is also the second half of the daemon's memory
+	// bound: a clipboard payload is buffered whole, so the ceiling is this
+	// times the payload limit — 80 MiB at the defaults. Raising the payload
+	// limit a long way is a reason to lower this.
+	defaultMaxConcurrent = 8
 
 	// defaultMaxConnections bounds sockets in any state, the backstop against
-	// unbounded goroutine growth.
-	//
-	// Far larger than defaultMaxConcurrent because it guards something far
-	// cheaper. Making an unauthenticated flood expensive means having enough
-	// room that filling it is hard: at roughly 30 KiB per connection in the
-	// worst case this is tens of megabytes, which is a fair price for turning a
-	// trivial attack into a sustained one.
-	defaultMaxConnections = 1024
+	// unbounded goroutine growth if something on the far side opens
+	// connections faster than it finishes them.
+	defaultMaxConnections = 64
 
-	// handshakeTimeout bounds the phase before a valid token arrives.
+	// idleTimeout bounds how long a connection may go without producing a
+	// byte.
 	//
-	// Separate from the configurable timeout, which a user may raise for a slow
-	// link, because the two bound different things: a payload transfer can
-	// legitimately be slow, while a handshake and a first frame are a few round
-	// trips and never are. Leaving them shared meant raising the timeout to
-	// accommodate a slow network also lengthened how long an unproven peer
-	// could sit on a slot. It is only ever used to shorten, never to extend, so
-	// a timeout below it still wins.
-	handshakeTimeout = 2 * time.Second
+	// It is an idle deadline rather than a total one because the two failure
+	// modes look nothing alike: a large paste over a slow link is legitimately
+	// slow but always progressing, while a peer that opens a socket and says
+	// nothing is holding a slot for free. Extending the deadline on every read
+	// distinguishes them without having to guess a transfer rate.
+	idleTimeout = 30 * time.Second
 
-	// unauthSoftLimit is how many connections may sit in the pre-authentication
-	// phase before per-host rationing begins.
-	//
-	// Below it nothing is rationed. A burst of parallel copies from one machine
-	// is ordinary use — `xargs -P24` ending in clipd is a reasonable thing to
-	// write — and a limiter that throttled it would trade a denial of service by
-	// an attacker for one by the owner.
-	//
-	// Scaled with defaultMaxConnections rather than fixed, so that rationing
-	// still begins at a quarter of capacity.
-	unauthSoftLimit = defaultMaxConnections / 4
-
-	// maxUnauthPerIP bounds how many pre-authentication connections one source
-	// address may hold once unauthSoftLimit is reached.
-	//
-	// Without a bound of this shape the connection budget is exhaustible by
-	// anyone who can reach the port: a peer that completes the TCP handshake and
-	// then sends nothing occupies a slot until its deadline expires, having
-	// proved nothing about itself. This is sshd's MaxStartups in miniature —
-	// rationing engages only under pressure, and then favours hosts that are not
-	// already holding a share. One host can therefore stall at most
-	// unauthSoftLimit slots of defaultMaxConcurrent, leaving the rest servable.
-	//
-	// A slot is released the moment a valid token arrives, so an authenticated
-	// client never accumulates against this at all.
-	maxUnauthPerIP = 8
-
-	// defaultMemoryBudget bounds buffered payload bytes when nothing else is
-	// configured. Must agree with config.DefaultMaxMemoryBytes.
-	//
-	// It is the fallback for callers constructing a Server directly; the daemon
-	// passes an explicit value resolved from the config file.
-	defaultMemoryBudget int64 = 64 << 20
-
-	// shutdownGrace is how long Shutdown waits for in-flight copies before
-	// giving up on them.
+	// shutdownGrace is how long the daemon waits for in-flight work before
+	// giving up on it.
 	shutdownGrace = 5 * time.Second
-
-	// drainCap bounds how much of a rejected request is discarded when the
-	// declared length is unknown, unusable, or simply not worth trusting —
-	// which is every unproven peer. See drainRequest and drainUnproven.
-	drainCap = 64 << 10
 
 	// maxAcceptBackoff caps the retry delay after a transient accept failure.
 	maxAcceptBackoff = time.Second
@@ -119,71 +80,52 @@ const (
 	// log per window.
 	//
 	// launchd appends the daemon's log file forever with no rotation, and every
-	// rejected connection would otherwise write a line: a peer sending malformed
-	// frames in a loop turns "the clipboard is unavailable" into "the disk is
-	// full". Suppressed lines are counted and reported, so throttling hides the
-	// volume of an attack, never the fact of one.
+	// rejected message would otherwise write a line: a loop sending malformed
+	// frames turns "the clipboard is unavailable" into "the disk is full".
+	// Suppressed lines are counted and reported, so throttling hides the volume
+	// of a problem, never the fact of one.
 	warnWindow = time.Minute
 	warnBudget = 20
 )
 
 // Options configures a Server.
 type Options struct {
-	// Token is the expected shared secret. Required.
-	Token string
-
-	// TLS is the server's TLS configuration. Required: there is no plaintext
-	// mode. A flag to disable encryption would be set once during some late
-	// night of debugging and never unset, and supporting both would double
-	// the connection-handling paths for a two-machine tool.
-	TLS *tls.Config
-
-	// Clipboard receives accepted payloads. Required.
+	// Clipboard receives raw messages. Required.
 	Clipboard clipboard.Clipboard
 
-	// MaxPayload is the largest accepted payload in bytes.
+	// DropDir is where drop requests write their files. Required for drops;
+	// when empty, drop requests are refused and everything else still works.
+	DropDir string
+
+	// MaxPayload caps a single clipboard message. Required.
 	MaxPayload int64
 
-	// MaxMemory bounds the total payload bytes buffered across all connections
-	// at once. Zero means a default derived from MaxPayload.
-	//
-	// It must be at least MaxPayload, or a copy the server has just declared
-	// acceptable could never be given room to run.
-	MaxMemory int64
+	// MaxDropBytes and MaxDropFiles cap one drop. Zero means the drop
+	// package's defaults.
+	MaxDropBytes int64
+	MaxDropFiles int
 
-	// Timeout bounds the handshake and the acknowledgement write.
-	Timeout time.Duration
-
-	// MaxConcurrent bounds copies performed at once. It is taken after
-	// authentication, so it does not bound sockets — see defaultMaxConnections.
+	// MaxConcurrent bounds simultaneous work. Zero means defaultMaxConcurrent.
 	MaxConcurrent int
 
-	// Logger receives operational logs. Clipboard contents are never logged.
+	// Logger receives operational logs. Clipboard and file contents are never
+	// logged.
 	Logger *slog.Logger
 }
 
 // Server accepts clipd connections. The zero value is not usable; use New.
 type Server struct {
-	token      string
-	tlsConfig  *tls.Config
-	clip       clipboard.Clipboard
-	maxPayload int64
-	timeout    time.Duration
-	log        *slog.Logger
+	clip         clipboard.Clipboard
+	dropDir      string
+	maxPayload   int64
+	maxDropBytes int64
+	maxDropFiles int
+	log          *slog.Logger
 
-	// mem bounds the payload bytes buffered across all handlers at once.
-	mem *memBudget
-
-	// connSem bounds sockets in any state; sem bounds copies actually being
-	// performed, and is taken only once a peer has authenticated.
+	// connSem bounds sockets in any state; sem bounds messages actually being
+	// carried out.
 	connSem chan struct{}
 	sem     chan struct{}
-
-	// unauth counts, per source address, the connections that have not yet
-	// presented a valid token; unauthTotal is their sum.
-	unauthMu    sync.Mutex
-	unauth      map[string]int
-	unauthTotal int
 
 	warnLimit warnLimiter
 
@@ -198,8 +140,8 @@ type Server struct {
 //
 // A token bucket would be smoother, but a fixed window is a dozen lines and
 // clipd has no third-party dependencies to borrow one from. The distinction
-// does not matter for a limiter whose only job is to keep a hostile peer from
-// growing a file without bound.
+// does not matter for a limiter whose only job is to keep a misbehaving peer
+// from growing a file without bound.
 type warnLimiter struct {
 	mu          sync.Mutex
 	windowStart time.Time
@@ -230,34 +172,15 @@ func (l *warnLimiter) allow(now time.Time) (ok bool, dropped int) {
 
 // New validates options and constructs a Server.
 func New(opts Options) (*Server, error) {
-	if err := auth.Validate(opts.Token); err != nil {
-		return nil, err
-	}
-	if opts.TLS == nil {
-		return nil, errors.New("server: no TLS configuration")
-	}
 	if opts.Clipboard == nil {
 		return nil, errors.New("server: no clipboard backend")
 	}
 	if opts.MaxPayload < 1 {
 		return nil, fmt.Errorf("server: max payload %d must be positive", opts.MaxPayload)
 	}
-	if opts.Timeout <= 0 {
-		return nil, fmt.Errorf("server: timeout %s must be positive", opts.Timeout)
-	}
 	maxConcurrent := opts.MaxConcurrent
 	if maxConcurrent < 1 {
 		maxConcurrent = defaultMaxConcurrent
-	}
-	maxMemory := opts.MaxMemory
-	if maxMemory < 1 {
-		// Never below one payload: a budget that cannot hold a single
-		// permitted copy would reject work the size check just allowed.
-		maxMemory = max(defaultMemoryBudget, opts.MaxPayload)
-	}
-	if maxMemory < opts.MaxPayload {
-		return nil, fmt.Errorf("server: memory budget %d is smaller than the %d byte payload limit",
-			maxMemory, opts.MaxPayload)
 	}
 	logger := opts.Logger
 	if logger == nil {
@@ -265,26 +188,24 @@ func New(opts Options) (*Server, error) {
 	}
 
 	return &Server{
-		token:      opts.Token,
-		tlsConfig:  opts.TLS,
-		clip:       opts.Clipboard,
-		maxPayload: opts.MaxPayload,
-		timeout:    opts.Timeout,
-		log:        logger,
-		sem:        make(chan struct{}, maxConcurrent),
+		clip:         opts.Clipboard,
+		dropDir:      opts.DropDir,
+		maxPayload:   opts.MaxPayload,
+		maxDropBytes: opts.MaxDropBytes,
+		maxDropFiles: opts.MaxDropFiles,
+		log:          logger,
+		sem:          make(chan struct{}, maxConcurrent),
 		// Never below maxConcurrent, or work slots would be unreachable: every
-		// copy holds a connection slot for its whole life.
+		// message holds a connection slot for its whole life.
 		connSem: make(chan struct{}, max(defaultMaxConnections, maxConcurrent)),
-		unauth:  make(map[string]int),
-		mem:     newMemBudget(maxMemory),
 	}, nil
 }
 
 // warnPeer logs a warning caused by a remote peer, subject to the rate budget.
 //
 // Every warning in a connection handler goes through here rather than to the
-// logger directly: they are all reachable by anyone who can open a socket, and
-// so are all capable of growing an unrotated file without bound.
+// logger directly: they are all reachable by anything that can write to the
+// socket, and so are all capable of growing an unrotated file without bound.
 func (s *Server) warnPeer(msg string, args ...any) {
 	ok, dropped := s.warnLimit.allow(time.Now())
 	if dropped > 0 {
@@ -296,59 +217,6 @@ func (s *Server) warnPeer(msg string, args ...any) {
 	}
 }
 
-// admit reserves a pre-authentication slot for host, reporting false when the
-// server is under pressure and that host is already holding its share.
-func (s *Server) admit(host string) bool {
-	s.unauthMu.Lock()
-	defer s.unauthMu.Unlock()
-
-	// Rationing engages only once enough connections are waiting to prove
-	// themselves for exhaustion to be a live possibility.
-	if s.unauthTotal >= unauthSoftLimit && s.unauth[host] >= maxUnauthPerIP {
-		return false
-	}
-	s.unauth[host]++
-	s.unauthTotal++
-	return true
-}
-
-// release returns a pre-authentication slot. The map entry is deleted at zero
-// so that a long-lived daemon does not accumulate one entry per address it has
-// ever been contacted by.
-func (s *Server) release(host string) {
-	s.unauthMu.Lock()
-	defer s.unauthMu.Unlock()
-	if n := s.unauth[host]; n <= 1 {
-		delete(s.unauth, host)
-	} else {
-		s.unauth[host] = n - 1
-	}
-	if s.unauthTotal > 0 {
-		s.unauthTotal--
-	}
-}
-
-// remoteHost is the address portion of a peer's endpoint, so that the
-// per-source limit counts hosts rather than ephemeral ports.
-func remoteHost(addr net.Addr) string {
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		return addr.String()
-	}
-	return host
-}
-
-// Listen opens a listener on addr. It is separate from Serve so callers can
-// report the resolved address (which matters when the port is 0) and so tests
-// can supply their own listener.
-func Listen(addr string) (net.Listener, error) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("listen on %s: %w", addr, err)
-	}
-	return ln, nil
-}
-
 // Serve accepts connections until ctx is cancelled or the listener fails.
 //
 // It closes ln before returning. A cancelled context is a clean shutdown and
@@ -358,8 +226,8 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.closed {
 		s.mu.Unlock()
 		// The contract is that Serve closes ln before returning; keeping it
-		// open here would leave the port bound and connections piling up in a
-		// backlog nobody drains.
+		// open here would leave the socket bound and connections piling up in
+		// a backlog nobody drains.
 		_ = ln.Close()
 		return errors.New("server: already shut down")
 	}
@@ -377,22 +245,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}()
 	defer close(stopped)
 
-	s.log.Info("clipd daemon ready",
-		"address", ln.Addr().String(),
-		"clipboard", s.clip.Name(),
-		"max_payload_bytes", s.maxPayload)
-
 	var backoff time.Duration
 	for {
 		// Acquire capacity before accepting. Blocking here applies back
 		// pressure through the kernel's accept queue instead of piling up
 		// goroutines for connections we are not ready to service.
-		//
-		// This is the cheap budget, not the copy budget. Gating accepts on the
-		// copy budget is what let unauthenticated peers stall real clients:
-		// once they filled it the daemon stopped accepting altogether, and a
-		// legitimate connection sat unseen in the kernel backlog until its own
-		// deadline expired.
 		select {
 		case s.connSem <- struct{}{}:
 		case <-ctx.Done():
@@ -430,9 +287,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 		// A connection accepted in the instant before the listener closed
 		// would otherwise register itself after Shutdown began waiting, which
-		// is both a WaitGroup misuse and a copy that could be cut off
-		// mid-write. Registering under the same lock that sets the closed
-		// flag makes the two mutually exclusive.
+		// is both a WaitGroup misuse and work that could be cut off mid-write.
+		// Registering under the same lock that sets the closed flag makes the
+		// two mutually exclusive.
 		if !s.track() {
 			conn.Close()
 			<-s.connSem
@@ -467,7 +324,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) drain(ctx context.Context) error {
 	s.closeListener()
 	// ctx is already cancelled at this point, so give handlers their own
-	// bounded window to finish the copy they are in the middle of.
+	// bounded window to finish the message they are in the middle of.
 	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownGrace)
 	defer cancel()
 	if err := s.waitForHandlers(drainCtx); err != nil {
@@ -514,326 +371,177 @@ func (s *Server) isClosed() bool {
 }
 
 // handle services one connection. Every failure path closes the connection;
-// none of them panic, and none of them log payload contents.
-func (s *Server) handle(ctx context.Context, rawConn net.Conn) {
-	defer rawConn.Close()
-	remote := rawConn.RemoteAddr().String()
+// none of them panic, and none of them log clipboard or file contents.
+func (s *Server) handle(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
 
-	// Admission happens before anything else, including the deadline: the
-	// cheapest response to a host that is already holding its share of
-	// unauthenticated slots is to close on it immediately.
-	host := remoteHost(rawConn.RemoteAddr())
-	if !s.admit(host) {
-		s.warnPeer("too many unauthenticated connections from one host; rejecting",
-			"remote", remote, "limit", maxUnauthPerIP)
+	// An idle deadline from the first byte, refreshed by the reader below on
+	// every successful read. A peer that connects and says nothing cannot hold
+	// a slot open; a peer that is genuinely sending can take as long as the
+	// data takes.
+	if err := conn.SetDeadline(time.Now().Add(idleTimeout)); err != nil {
+		s.warnPeer("set deadline failed", "error", err)
 		return
 	}
-	// Released on the first of: successful authentication, or the handler
-	// returning. OnceFunc makes calling it on both paths harmless.
-	releaseSlot := sync.OnceFunc(func() { s.release(host) })
-	defer releaseSlot()
+	reader := bufio.NewReader(&idleReader{conn: conn, r: conn})
 
-	// The deadline is set before the first read so a client that connects and
-	// says nothing cannot hold the slot open indefinitely. It covers the TLS
-	// handshake as well, since tls.Conn delegates deadlines downward.
-	//
-	// min, so that a timeout configured below the handshake bound still wins:
-	// this exists to shorten the unproven phase, never to grant it more time
-	// than the operator asked for.
-	if err := rawConn.SetDeadline(time.Now().Add(min(s.timeout, handshakeTimeout))); err != nil {
-		s.warnPeer("set deadline failed", "remote", remote, "error", err)
-		return
-	}
-
-	conn, reader, ok := s.startTLS(ctx, rawConn, remote)
-	if !ok {
-		return
-	}
-
-	req, err := protocol.ReadPrologue(reader)
+	structured, err := protocol.Sniff(reader)
 	if err != nil {
-		// A bare TCP connect that closes without sending anything is how
-		// `clipd status` probes reachability, and how most port scanners
-		// behave. It is not worth a warning.
-		if errors.Is(err, io.EOF) {
-			s.log.Debug("connection closed before request", "remote", remote)
-			return
-		}
-		// A peer that has already blown its deadline gets nothing: writing a
-		// response would reset the deadline and hand it another window, which
-		// is exactly the hold-a-slot-open behaviour the deadline exists to
-		// prevent.
 		if isTimeout(err) {
-			s.warnPeer("connection timed out before a request arrived", "remote", remote)
+			// A peer that blew its deadline gets no response: writing one
+			// would refresh the deadline and hand it another window, which is
+			// the slot-holding behaviour the deadline exists to prevent.
+			s.warnPeer("connection timed out before a request arrived")
 			return
 		}
-		s.warnPeer("malformed request", "remote", remote, "error", err)
-		s.respond(conn, protocol.StatusMalformed, err.Error())
-		s.drainUnproven(reader)
+		s.warnPeer("read failed", "error", err)
 		return
 	}
 
-	if !auth.Compare(s.token, req.Token) {
-		// Deliberately vague to the client, specific in the local log. There
-		// is no attempt counting or lockout: a 256-bit token makes online
-		// guessing pointless, and a lockout would just be a denial-of-service
-		// lever. The admission limit above is about slot exhaustion, not
-		// guessing, and applies equally to peers that never guess at all.
-		s.warnPeer("authentication failed", "remote", remote)
-		s.respond(conn, protocol.StatusAuthFailed, "authentication failed")
-		// Enough of the body a client may be mid-way through sending for the
-		// close to deliver the rejection rather than reset it. The declared
-		// length still sits unread in front of it, which costs the drain eight
-		// of its bytes and saves reading a number it would ignore.
-		s.drainUnproven(reader)
-		return
-	}
-	// The peer has proved it holds the token, so it no longer counts against
-	// the per-host unauthenticated limit. Releasing here rather than at return
-	// is what keeps a user running many copies at once from throttling
-	// themselves: only unproven connections are rationed.
-	releaseSlot()
-
-	// Now that the peer is authenticated it may compete for the copy budget.
-	// Everything above this point was deliberately cheap; everything below
-	// reads a payload into memory and forks a clipboard helper.
-	workCtx, workCancel := context.WithTimeout(ctx, s.timeout)
+	// Capacity is acquired here, once it is known there is real work. Both
+	// paths below either buffer a payload in memory or write files to disk.
 	select {
 	case s.sem <- struct{}{}:
-		workCancel()
 		defer func() { <-s.sem }()
-	case <-workCtx.Done():
-		workCancel()
-		s.warnPeer("no copy capacity available", "remote", remote, "limit", cap(s.sem))
-		s.respond(conn, protocol.StatusInternalError, "server is busy: too many copies in progress")
-		if n, err := protocol.ReadPayloadLen(reader); err == nil {
-			s.drainRequest(conn, reader, n, s.timeout)
-		}
+	case <-ctx.Done():
+		s.respond(conn, "busy: shutting down")
 		return
 	}
 
-	// The unproven phase is over, so the peer gets the full configured window
-	// for the exchange it came to perform.
-	if err := conn.SetDeadline(time.Now().Add(s.timeout)); err != nil {
-		s.warnPeer("set deadline failed", "remote", remote, "error", err)
+	if structured {
+		s.handleStructured(ctx, conn, reader)
 		return
 	}
+	s.handleClipboard(ctx, conn, reader)
+}
 
-	payloadLen, err := protocol.ReadPayloadLen(reader)
-	if err != nil {
+// handleClipboard implements the default path: everything on the connection is
+// clipboard content, read verbatim to EOF.
+//
+// This is the case that makes `nc` a complete client, so it must stay the
+// behaviour for any stream that does not explicitly ask for something else.
+func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, r io.Reader) {
+	// One byte past the limit, so an oversized payload is detected rather than
+	// silently truncated onto the clipboard. There is no declared length to
+	// check first — the stream ends when the peer half-closes — so the cap has
+	// to be enforced on what actually arrives.
+	var buf bytes.Buffer
+	n, err := io.CopyN(&buf, r, s.maxPayload+1)
+	if err != nil && !errors.Is(err, io.EOF) {
 		if isTimeout(err) {
-			// Same policy as the prologue: a peer that blew its deadline gets
-			// no response and therefore no fresh deadline window.
-			s.warnPeer("connection timed out reading the payload length", "remote", remote)
+			s.warnPeer("connection timed out mid-payload")
 			return
 		}
-		s.warnPeer("malformed request", "remote", remote, "error", err)
-		s.respond(conn, protocol.StatusMalformed, err.Error())
-		s.drainRequest(conn, reader, drainCap, s.timeout)
+		s.warnPeer("payload read failed", "error", err)
 		return
 	}
-
-	// The length is client-supplied, so it is checked before a single byte of
-	// the body is read or a buffer sized for it — otherwise the limit would
-	// be a suggestion rather than a memory bound.
-	if payloadLen > uint64(s.maxPayload) {
-		s.warnPeer("payload rejected", "remote", remote,
-			"declared_bytes", payloadLen, "limit_bytes", s.maxPayload)
-		s.respond(conn, protocol.StatusPayloadTooLarge,
-			fmt.Sprintf("payload of %d bytes exceeds the server limit of %d bytes", payloadLen, s.maxPayload))
-		s.drainRequest(conn, reader, payloadLen, s.timeout)
-		return
-	}
-
-	// Reserve the memory before reading a byte of the body. Checking the
-	// declared length against the payload limit bounds one copy; this bounds
-	// all of them at once, which is the number that decides whether the daemon
-	// survives a burst.
-	//
-	// The wait is bounded by the base timeout rather than the payload deadline:
-	// a peer waiting on a busy server should be told so while its client is
-	// still listening, not held until the transfer window it never got to use
-	// runs out.
-	memCtx, memCancel := context.WithTimeout(ctx, s.timeout)
-	err = s.mem.acquire(memCtx, int64(payloadLen))
-	memCancel()
-	if err != nil {
-		s.warnPeer("payload rejected for lack of memory budget", "remote", remote,
-			"declared_bytes", payloadLen, "in_use_bytes", s.mem.inUse(), "error", err)
-		// StatusInternalError rather than a new status code: this is the
-		// server declining to do the work, which is what that status already
-		// means to every client in existence. A new code would read as
-		// "unexpected server status" on anything not yet upgraded.
-		s.respond(conn, protocol.StatusInternalError,
-			"server is busy: not enough memory budget for a payload this size")
-		s.drainRequest(conn, reader, payloadLen, s.timeout)
-		return
-	}
-	defer s.mem.release(int64(payloadLen))
-
-	if err := conn.SetReadDeadline(time.Now().Add(s.payloadTimeout(payloadLen))); err != nil {
-		s.warnPeer("set read deadline failed", "remote", remote, "error", err)
-		return
-	}
-
-	payload, err := protocol.ReadPayload(reader, payloadLen)
-	if err != nil {
-		s.warnPeer("payload read failed", "remote", remote, "error", err)
-		if isTimeout(err) {
-			return
-		}
-		s.respond(conn, protocol.StatusMalformed, err.Error())
-		s.drainRequest(conn, reader, drainCap, s.timeout)
+	if n > s.maxPayload {
+		s.warnPeer("payload rejected", "limit_bytes", s.maxPayload)
+		s.respond(conn, fmt.Sprintf("payload exceeds the %d byte limit", s.maxPayload))
 		return
 	}
 
 	// Bound the clipboard write so a wedged helper cannot pin this handler.
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.timeout)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), idleTimeout)
 	defer cancel()
-	if err := s.clip.Write(writeCtx, payload); err != nil {
-		s.log.Error("clipboard write failed", "remote", remote, "error", err)
-		s.respond(conn, protocol.StatusInternalError, "clipboard write failed")
+	if err := s.clip.Write(writeCtx, buf.Bytes()); err != nil {
+		s.log.Error("clipboard write failed", "error", err)
+		s.respond(conn, "clipboard write failed")
 		return
 	}
 
 	// Debug, not Info. launchd appends this file forever with no rotation, so
 	// a line per copy is unbounded growth that buries the rare failure in
-	// routine success. The client already reports a successful copy at the
-	// point of use with -v, which is where the answer is actually wanted;
-	// `clipd serve -v` turns these back on when diagnosing the daemon.
-	s.log.Debug("clipboard updated", "remote", remote, "bytes", len(payload))
-	s.respond(conn, protocol.StatusOK, fmt.Sprintf("copied %d bytes", len(payload)))
+	// routine success. The acknowledgement below already tells the user, at
+	// the point of use, which is where the answer is actually wanted.
+	s.log.Debug("clipboard updated", "bytes", buf.Len())
+	s.respond(conn, fmt.Sprintf("copied %d bytes", buf.Len()))
 }
 
-// startTLS completes the handshake, returning the encrypted connection and a
-// reader over it. It reports false when the connection has been dealt with and
-// the caller should stop.
-//
-// Before handing anything to crypto/tls it sniffs the first four bytes. A v1
-// client speaks the frame protocol directly, and letting that hit the TLS
-// handshake produces "first record does not look like a TLS handshake" on this
-// side and a bare connection close on the other — leaving the user to guess.
-// Recognising the magic costs one Peek and turns the most likely upgrade
-// failure into a sentence that says what to do.
-func (s *Server) startTLS(ctx context.Context, rawConn net.Conn, remote string) (net.Conn, *bufio.Reader, bool) {
-	sniff := bufio.NewReader(rawConn)
-
-	head, err := sniff.Peek(len(protocol.Magic))
+// handleStructured reads the JSON envelope after the magic prefix and
+// dispatches on its type.
+func (s *Server) handleStructured(ctx context.Context, conn net.Conn, r *bufio.Reader) {
+	req, err := protocol.ReadRequest(r)
 	if err != nil {
-		switch {
-		case errors.Is(err, io.EOF):
-			// A bare connect that closes without sending: port scanners, and
-			// anything probing whether the port is open.
-			s.log.Debug("connection closed before handshake", "remote", remote)
-		case isTimeout(err):
-			s.warnPeer("connection timed out before the handshake", "remote", remote)
-		default:
-			s.warnPeer("read failed before handshake", "remote", remote, "error", err)
+		if isTimeout(err) {
+			s.warnPeer("connection timed out mid-frame")
+			return
 		}
-		return nil, nil, false
-	}
-
-	if [4]byte(head) == protocol.Magic {
-		s.warnPeer("rejected an unencrypted request", "remote", remote)
-		// Answered in the clear, because that is the only language this peer
-		// speaks. It carries no secret — just an instruction.
-		if err := rawConn.SetWriteDeadline(time.Now().Add(s.timeout)); err == nil {
-			_ = protocol.WriteResponse(rawConn, protocol.StatusMalformed,
-				"this daemon requires TLS; upgrade clipd on the client machine (see clipd version)")
-		}
-		s.drainUnproven(sniff)
-		return nil, nil, false
-	}
-
-	// The peeked bytes have been consumed from rawConn, so the handshake gets
-	// a wrapper that replays them before continuing.
-	conn := tls.Server(&peekedConn{Conn: rawConn, r: sniff}, s.tlsConfig)
-	if err := conn.HandshakeContext(ctx); err != nil {
-		s.warnPeer("TLS handshake failed", "remote", remote, "error", err)
-		return nil, nil, false
-	}
-	return conn, bufio.NewReader(conn), true
-}
-
-// peekedConn is a net.Conn whose reads come from a reader that has already
-// buffered some of the stream.
-type peekedConn struct {
-	net.Conn
-	r io.Reader
-}
-
-func (c *peekedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
-
-// respond writes a status frame, refreshing the deadline first so a slow
-// reader on the client side cannot make the acknowledgement hang.
-func (s *Server) respond(conn net.Conn, status protocol.Status, message string) {
-	if err := conn.SetWriteDeadline(time.Now().Add(s.timeout)); err != nil {
+		s.warnPeer("malformed request", "error", err)
+		s.respond(conn, err.Error())
 		return
 	}
-	if err := protocol.WriteResponse(conn, status, message); err != nil {
-		s.log.Debug("response write failed", "remote", conn.RemoteAddr().String(), "error", err)
+
+	switch req.Type {
+	case protocol.TypeDrop:
+		s.handleDrop(conn, r)
+	default:
+		s.warnPeer("unknown request type", "type", req.Type)
+		s.respond(conn, fmt.Sprintf("unknown request type %q", req.Type))
 	}
 }
 
-// drainRequest discards up to n bytes of an already-rejected request before
-// the connection is closed, giving the drain its own window.
-//
-// Closing a socket with unread data in its receive queue makes the kernel
-// send RST rather than FIN, and an RST can destroy the status frame written
-// just before the close — the client then reports a connection failure
-// instead of the rejection, with the wrong exit code. Draining first lets the
-// close deliver the response, for the same reason net/http drains request
-// bodies.
-//
-// It is a best effort, not a guarantee: against a peer still streaming a body
-// far larger than the cap, the drain empties what it can and the close still
-// races the rest. net/http makes the same trade at 256KB.
-//
-// Only authenticated peers reach this. Unproven ones get drainUnproven.
-func (s *Server) drainRequest(conn net.Conn, r io.Reader, n uint64, window time.Duration) {
-	if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
+// handleDrop extracts the tar stream following the envelope into the drop
+// directory.
+func (s *Server) handleDrop(conn net.Conn, r io.Reader) {
+	if s.dropDir == "" {
+		s.respond(conn, "drop is not configured on this daemon")
 		return
 	}
-	drainBytes(r, n)
-}
-
-// drainUnproven is drainRequest for a peer that has not proved it holds the
-// token, which costs it both of drainRequest's allowances.
-//
-// The declared length is not consulted at all: it is the peer's own claim,
-// bounded only by the width of the field, and a flat drainCap is all an
-// unproven peer is worth reading. Nor does it set a deadline, so the drain
-// runs against whatever is left of the one window set before the first read —
-// the unproven phase gets a single window in total, however many steps it
-// fails at. Extending it here would hand back exactly the slot-holding lever
-// that window exists to deny.
-//
-// The receiver is unused and left unnamed to say so: this is the drain that
-// consults no server state, no configured window and no declared length. It
-// stays a method only so the call sites read beside drainRequest.
-func (*Server) drainUnproven(r io.Reader) {
-	drainBytes(r, drainCap)
-}
-
-// drainBytes discards n bytes under whatever deadline is already in force.
-func drainBytes(r io.Reader, n uint64) {
-	if n == 0 {
+	res, err := drop.Extract(r, drop.Options{
+		Dir:      s.dropDir,
+		MaxBytes: s.maxDropBytes,
+		MaxFiles: s.maxDropFiles,
+	})
+	if err != nil {
+		// Warn rather than Error: every one of these is caused by what a peer
+		// sent, so they are rate-limited like the rest of the peer-driven
+		// lines. The names are safe to log — they have already been reduced
+		// to basenames — but the contents never are, and never appear here.
+		s.warnPeer("drop rejected", "error", err)
+		s.respond(conn, err.Error())
 		return
 	}
-	if n > math.MaxInt64 {
-		n = math.MaxInt64
+	s.log.Info("files dropped", "count", len(res.Names), "bytes", res.Bytes, "dir", s.dropDir)
+	s.respond(conn, fmt.Sprintf("dropped %s (%d bytes) into %s",
+		strings.Join(res.Names, ", "), res.Bytes, s.dropDir))
+}
+
+// respond writes a single human-readable line back to the peer.
+//
+// The client is `nc`, which prints whatever it receives and exits once the
+// far end closes. That makes this line the entire user interface for the
+// result: without it a copy is silent whether it worked or not, and the
+// connection appears to hang until the client is told to half-close. Keeping
+// it plain text rather than JSON is what lets an unmodified `nc` display it.
+func (s *Server) respond(conn net.Conn, message string) {
+	if err := conn.SetWriteDeadline(time.Now().Add(idleTimeout)); err != nil {
+		return
 	}
-	// io.Discard implements ReaderFrom, so this recycles one small buffer
-	// rather than sizing anything to n.
-	_, _ = io.CopyN(io.Discard, r, int64(n))
+	if _, err := fmt.Fprintf(conn, "clipd: %s\n", message); err != nil {
+		s.log.Debug("response write failed", "error", err)
+	}
 }
 
-// payloadTimeout scales the read deadline with the declared payload size.
-func (s *Server) payloadTimeout(n uint64) time.Duration {
-	return s.timeout + time.Duration(n/minThroughput)*time.Second
+// idleReader refreshes the connection deadline on every successful read, so
+// that the deadline bounds silence rather than total transfer time.
+type idleReader struct {
+	conn net.Conn
+	r    io.Reader
 }
 
-// isTimeout reports whether an error came from an expired deadline.
+func (i *idleReader) Read(p []byte) (int, error) {
+	n, err := i.r.Read(p)
+	if n > 0 {
+		// Best effort: a failure to extend the deadline is not worth failing a
+		// read that already succeeded. The old deadline still applies, so the
+		// connection stays bounded either way.
+		_ = i.conn.SetReadDeadline(time.Now().Add(idleTimeout))
+	}
+	return n, err
+}
+
+// isTimeout reports whether err is a deadline expiry.
 func isTimeout(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()

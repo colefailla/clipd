@@ -2,52 +2,71 @@
 
 [![CI](https://github.com/colefailla/clipd/actions/workflows/ci.yml/badge.svg)](https://github.com/colefailla/clipd/actions/workflows/ci.yml)
 
-Send command output from a remote machine to your Mac's clipboard.
+Send command output and files from a remote machine to your Mac, over the SSH
+connection you already have.
 
 ```bash
 ssh debian
-docker ps | clipd
+docker ps | clipd            # now in the Mac's clipboard
+clipd drop report.pdf        # now in the Mac's ~/Drop
 ```
 
-The output is now in the Mac's clipboard.
-
-[OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html) does the same
-job through a terminal escape sequence, and is simpler when it works. clipd is
-for cases where it does not. Terminal.app doesn't support it, and in some
-multiplexer and nested-SSH setups the sequence doesn't reliably reach the local
-terminal.
+**Nothing is installed on the remote machine.** `clipd` there is a shell
+function that pipes into `nc`, which every Unix box already has. The daemon
+runs only on the Mac.
 
 ## How it works
 
 ```text
-Linux                                  macOS
+Linux                                      macOS
 
   docker ps
      │ stdout
      ▼
-  clipd  ────── TLS 1.3 ──────▶  clipd serve
-  (exits)                             │
-                                      ▼
-                                   pbcopy ──▶ clipboard
+  clipd ──▶ ~/.clipd.sock ══ ssh -R ══▶ ~/.clipd.sock ──▶ clipd serve
+  (a shell function)                                            │
+                                                                ▼
+                                                        pbcopy ──▶ clipboard
+                                                        tar    ──▶ ~/Drop
 ```
 
-clipd uses the same binary on both machines:
+SSH's `RemoteForward` makes the Mac's socket appear on the remote host. Anything
+that can write bytes to it — `nc`, `socat`, an editor, a shell function — can
+reach the daemon.
 
-- On macOS, `clipd` runs as a LaunchAgent and writes received data to the
-  system clipboard.
-- On the remote machine, `clipd` reads stdin or a file and sends it to the Mac.
+[OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html) does the
+clipboard half through a terminal escape sequence and is simpler when it works.
+clipd is for the cases where it doesn't: Terminal.app has no support, several
+terminals silently truncate large payloads, and no escape sequence sends files.
 
-Nothing runs in the background on Linux. Each invocation connects, sends its
-input, and exits.
+## Prior art
 
-Connections use TLS 1.3, a pinned server key, and a shared authentication
-token.
+[wincent/clipper](https://github.com/wincent/clipper) does the clipboard half,
+has done for years, and is excellent. If you only need text on your clipboard,
+use it — it is smaller, more mature, and packaged everywhere.
+
+clipd differs in three ways:
+
+- **`clipd drop`** sends files. Clipper is text only.
+- **`clipd setup <host>`** probes the remote host and writes the shell function
+  and SSH config for you. Clipper leaves you to hand-wire the alias, which is
+  where most of the sharp edges are.
+- **The daemon replies.** A copy prints `clipd: copied 47 bytes` instead of
+  succeeding silently or hanging with no output.
+
+The structured-frame design, the stale-socket recovery, the umask handling and
+the path-or-host address are all taken from clipper. It solved these problems
+first.
 
 ## Install
 
-### macOS
+On the **Mac only**:
 
-Apple Silicon:
+```bash
+brew install clipd
+```
+
+Or download a binary:
 
 ```bash
 curl -fsSL https://github.com/colefailla/clipd/releases/latest/download/clipd_darwin_arm64 -o clipd
@@ -55,248 +74,154 @@ sudo install -m 0755 clipd /usr/local/bin/clipd
 rm clipd
 ```
 
-For Intel Macs, use `clipd_darwin_amd64`.
-
-### Linux
-
-x86-64:
-
-```bash
-curl -fsSL https://github.com/colefailla/clipd/releases/latest/download/clipd_linux_amd64 -o clipd
-sudo install -m 0755 clipd /usr/local/bin/clipd
-rm clipd
-```
-
-For ARM64, use `clipd_linux_arm64`.
-
-With Go installed, either platform can also use:
-
-```bash
-go install github.com/colefailla/clipd/cmd/clipd@latest
-```
-
-Releases include `SHA256SUMS` and signed build provenance. To confirm a binary
-came from this repository's release workflow:
-
-```bash
-gh attestation verify clipd_darwin_arm64 --repo colefailla/clipd
-```
-
-## Setup
-
-On the Mac:
+Then start it at login:
 
 ```bash
 clipd install
 ```
 
-This creates the configuration and TLS keypair, installs the LaunchAgent, and
-prints the token and server fingerprint needed by clients.
-
-On the remote machine:
+## Setup a remote host
 
 ```bash
-clipd configure \
-  -server <mac-address> \
-  -fingerprint '<fingerprint>' \
-  -token -
+clipd setup debian
 ```
 
-`-token -` reads the token from stdin, so paste it when prompted. Passing it as
-`-token '<token>'` would put the secret on a command line, where other local
-users can read it — on Linux, straight out of `/proc` — and where the shell
-records it in history.
+That connects to `debian`, works out what it has, installs a `clipd` shell
+function in the right rc file, and adds the socket forward to your
+`~/.ssh/config`. Use `-print` to see what it would do without doing it.
 
-Then test it:
+Reconnect for the forward to take effect:
 
 ```bash
-echo hello | clipd
+ssh -O exit debian 2>/dev/null; ssh debian
 ```
 
-Run `clipd status` to check the configuration and connection. It exits 0 only
-if the probe succeeds, so it works as a preflight in a script — and will fail
-one if the daemon is not up yet.
+The probe exists because `nc` is not one program. The OpenBSD build speaks UNIX
+sockets with `-U` and half-closes with `-N`; the "traditional" build shipped by
+default on some Debian systems does neither, and guessing wrong gives you either
+`invalid option` or a copy that hangs with no output. Asking the host removes
+the guess — and if it genuinely can't, the error names the package that fixes it.
+
+Both edits are bracketed by `# >>> clipd >>>` markers, so re-running replaces
+the block rather than adding another, and uninstalling means deleting between
+the markers. Your SSH config is backed up before the first edit.
 
 ## Usage
 
-Copy command output:
+On the remote host:
 
 ```bash
-ls -la | clipd
-docker ps | clipd
-git diff | clipd
+ls -l | clipd                # copy stdout
+clipd < notes.txt            # copy a file's contents
+clipd drop report.pdf        # send a file to ~/Drop
+clipd drop src/*.go          # send several
 ```
 
-Copy a file:
+Content is sent byte for byte — newlines, tabs and the trailing newline are
+preserved. Input over `max_payload_bytes` (10 MiB by default) is rejected rather
+than truncated.
 
-```bash
-clipd notes.txt
-```
+Dropped files are **flattened**: everything lands directly in `~/Drop` under its
+own basename, with no subdirectories recreated. Files are never overwritten; a
+second `report.pdf` arrives as `report-1.pdf`.
 
-Explicitly use the `copy` command:
+## Security
 
-```bash
-clipd copy notes.txt
-echo hello | clipd copy
-```
+**Nothing listens on the network.** The daemon binds a UNIX socket in your home
+directory. There is no port to scan, and nothing on your local network can reach
+it — on public wifi or anywhere else.
 
-Show the number of bytes copied:
+The socket reaches another machine only when you forward it over SSH. By then
+SSH has encrypted the channel, verified the host key against `known_hosts`, and
+authenticated you; the socket's `0600` permissions decide who on that machine
+may write to it.
 
-```bash
-docker ps | clipd -v
-```
+That is why clipd has no token and no TLS of its own. Both would duplicate a
+decision SSH has already made — and a token stored on the remote host would be
+a stealable secret that works from anywhere until rotated, where the socket is
+an ephemeral capability that dies with the session and cannot be copied off the
+box.
 
-A successful copy produces no output unless `-v` is used. Errors are written
-to stderr.
+**What this does mean:** anything running as you on the remote host can write to
+your clipboard and send you files. Other accounts there cannot, because of the
+socket's permissions, but your own processes can — including a build script or a
+package install. That is inherent to letting a remote machine write to your
+clipboard at all. It also matters less than it sounds: anything positioned to
+abuse it already has your files, your history and your keystrokes on that
+machine.
 
-Input is sent as-is without trimming or re-encoding.
+Two things limit what it can do:
 
-The default limit is 10 MiB. Input over the limit is rejected rather than
-truncated. Both ends enforce it: the client before sending, and the daemon
-before accepting. To copy something larger, raise the daemon's limit on the
-Mac (and restart it):
+- **Bracketed paste**, on by default in modern shells, means pasted text ending
+  in a newline is not executed until you press Enter.
+- **Dropped files** are flattened to basenames so an archive cannot write
+  outside the drop directory, are never overwritten, never made executable, and
+  carry macOS's quarantine attribute so Gatekeeper treats them like downloads.
+  Symlinks, hard links and device nodes in an archive are skipped.
 
-```bash
-clipd setup -max-payload 20MB
-launchctl kickstart -k gui/$(id -u)/com.clipd.agent
-```
-
-Then raise it for a single copy on the client:
-
-```bash
-clipd copy -max-payload 20MB large.log
-```
-
-## Commands
-
-```text
-clipd                   Copy stdin
-clipd copy [file]       Copy stdin or a file
-clipd configure         Configure a client
-clipd install           Install the macOS LaunchAgent
-clipd uninstall         Remove the macOS LaunchAgent
-clipd serve             Run the server in the foreground
-clipd setup             Create or inspect server configuration
-clipd status            Show configuration and connection status
-clipd version           Show version information
-clipd help [command]    Show help
-```
+Setting `address` to a `host:port` turns all of this off. Nothing authenticates
+behind it, so a TCP listener is only ever appropriate on loopback.
 
 ## Configuration
 
-Configuration is stored at:
+`~/Library/Application Support/clipd/config.json`. Every value has a working
+default, so a daemon with no config file is a working daemon.
 
-```text
-macOS:  ~/Library/Application Support/clipd/config.json
-Linux:  ~/.config/clipd/config.json
+```json
+{
+  "address": "~/.clipd.sock",
+  "drop_dir": "~/Drop",
+  "max_payload_bytes": 10485760,
+  "max_drop_bytes": 268435456,
+  "max_drop_files": 256,
+  "max_concurrent": 8
+}
 ```
 
-`$XDG_CONFIG_HOME` is respected on Linux.
+Unknown keys are rejected rather than ignored, so a typo fails loudly.
+`CLIPD_CONFIG` is the only environment variable clipd reads.
 
-The default port is `8199`. The server listens on `0.0.0.0` by default so
-remote machines can reach it.
+Run `clipd help config` or `clipd help security` for detail.
 
-A LAN IP, `.local` hostname, or Tailscale address can be used as the server
-address.
-
-Run:
+## Troubleshooting
 
 ```bash
-clipd help config
-clipd help <command>
+clipd status
 ```
 
-for the config file format and per-command options.
+It dials the socket rather than just checking the file exists, because a daemon
+killed with `SIGKILL` leaves the socket behind and a stale one looks identical
+in a directory listing. Exit code 0 means the daemon answered.
+
+**`clipd: ~/.clipd.sock is missing`** on the remote — the forward isn't up.
+Reconnect. If you use `ControlMaster`, kill the old master first with
+`ssh -O exit <host>`; otherwise you reuse a connection that predates the
+forward.
+
+**`remote port forwarding failed`** — a stale socket on the remote from an
+unclean disconnect. `ssh <host> rm .clipd.sock`, or set
+`StreamLocalBindUnlink yes` in the remote's `/etc/ssh/sshd_config` to stop it
+recurring.
 
 ## Exit codes
 
 ```text
 0   success
-1   connection or server failure
-2   authentication failure
-3   payload too large
+1   the daemon is not running, or an operation failed
 4   configuration error
-5   TLS handshake or fingerprint mismatch
 64  usage error
 ```
 
-## Security
-
-clipd exposes a network service that can write to your Mac's clipboard. Only
-expose it on networks you trust, or restrict access with a firewall.
-
-Connections are encrypted with TLS 1.3. Clients authenticate using a randomly
-generated token and verify the server using a pinned public-key fingerprint.
-
-Anyone with the authentication token can write to your clipboard. Treat the
-token as a secret.
-
-clipd sends bytes verbatim, so someone with the token can put anything on your clipboard, including text
-ending in a newline that a paste into a shell would run without you pressing return.
-
-The token is stored locally in the clipd configuration file, which is created
-with user-only permissions. Clipboard contents and authentication tokens are
-not logged. `clipd status` warns if either the config file or the daemon's
-private key has become readable by other users.
-
-If the server fingerprint changes unexpectedly, do not accept the new
-fingerprint without determining why it changed.
-
-To replace a compromised token, on the Mac:
+## Uninstall
 
 ```bash
-clipd setup -rotate
+clipd uninstall
 ```
 
-To replace the server keypair:
-
-```bash
-clipd setup -rotate-cert
-```
-
-Both print the new values. Clients must be reconfigured with
-`clipd configure` afterward, and will fail to copy until they are.
-
-To report a vulnerability, see [SECURITY.md](SECURITY.md).
-
-## Troubleshooting
-
-**`connect: connection refused`** The daemon isn't running, or the address or
-port is wrong. Run `clipd status` on the Mac; if launchd shows it as not
-loaded, run `clipd install`. Check that the client's `-server` and `-port`
-match what the Mac is listening on.
-
-**The client hangs, then times out.** Usually the macOS firewall dropping the
-connection. Allow incoming connections for clipd in System Settings → Network
-→ Firewall → Options.
-
-**`server rejected the token`** The two machines have different tokens. Run
-`clipd setup` on the Mac to print the current one, then `clipd configure
--token '<token>'` on the client.
-
-**`server key fingerprint ... does not match the pinned ...`** The daemon is
-presenting a different key. If you rotated it with `clipd setup -rotate-cert`,
-re-run `clipd configure -fingerprint`. If you didn't, investigate before
-changing anything. `clipd status` shows both fingerprints.
-
-**`did not respond with TLS: it may be running clipd v1, which is unencrypted`**
-The daemon is older than the client. Upgrade clipd on the Mac.
-
-**`this daemon requires TLS; upgrade clipd on the client machine`** The client
-is older than the daemon. Upgrade clipd on the client.
-
-## Building
-
-Requires Go 1.24 or later.
-
-```bash
-make build
-make check
-make dist
-```
-
-clipd has no third-party Go dependencies.
+Removes the LaunchAgent. The config, logs and the shell functions on remote
+hosts are left in place — delete the block between the clipd markers in their
+rc files.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT
