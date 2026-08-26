@@ -85,8 +85,19 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 			cfg.Address)
 	}
 
-	fmt.Fprintf(e.stdout, "Probing %s...\n", host)
-	facts, err := probe(ctx, host)
+	control, cleanup, err := controlPath()
+	if err != nil {
+		return fail(e, exitFailure, err)
+	}
+	defer cleanup()
+	// The master outlives this process by ControlPersist seconds; closing it
+	// here keeps a stray authenticated connection from lingering.
+	defer func() {
+		_ = exec.Command("ssh", "-o", "ControlPath="+control, "-O", "exit", host).Run()
+	}()
+
+	fmt.Fprintf(e.stdout, "Probing %s (you may be asked for your password)...\n", host)
+	facts, err := probe(ctx, host, control)
 	if err != nil {
 		return fail(e, exitFailure, err)
 	}
@@ -118,7 +129,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		return exitOK
 	}
 
-	if err := installRemote(ctx, host, rcFile, block); err != nil {
+	if err := installRemote(ctx, host, control, rcFile, block); err != nil {
 		return fail(e, exitFailure, err)
 	}
 	fmt.Fprintf(e.stdout, "\nInstalled the clipd function in %s on %s.\n", rcFile, host)
@@ -164,11 +175,44 @@ func hostPattern(destination string) string {
 	return destination
 }
 
+// sshOptions are the options every connection setup makes shares.
+//
+// BatchMode is deliberately absent. It was here to stop a host that wants a
+// password from blocking on a prompt nothing reads, but ssh reads passwords
+// from /dev/tty rather than stdin, so the prompt reaches the user perfectly
+// well even though this captures stdout and stderr — and with BatchMode set,
+// a host without key authentication could never be set up at all.
+//
+// The rest exist so setup is not three password prompts and a pile of
+// warnings. One multiplexed connection carries every command, and forwarding
+// is cleared because setup only runs commands: without that, an unrelated
+// stale socket left by a previous session prints a "remote port forwarding
+// failed" warning over setup's own output.
+func sshOptions(controlPath string) []string {
+	return []string{
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=" + controlPath,
+		"-o", "ControlPersist=30",
+		"-o", "ClearAllForwardings=yes",
+	}
+}
+
+// controlPath returns a short, private path for setup's multiplexing socket.
+//
+// Short because a UNIX socket path is capped near 104 bytes, and a control
+// path built from a long temp directory silently exceeds it.
+func controlPath() (string, func(), error) {
+	dir, err := os.MkdirTemp("", "clipd")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("create control directory: %w", err)
+	}
+	return filepath.Join(dir, "c"), func() { os.RemoveAll(dir) }, nil
+}
+
 // probe runs probeScript on the host and parses its key=value output.
-func probe(ctx context.Context, host string) (remoteFacts, error) {
-	// BatchMode so a host needing a password fails with a message instead of
-	// silently blocking on a prompt nothing is reading.
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", host, "sh -s")
+func probe(ctx context.Context, host, control string) (remoteFacts, error) {
+	args := append(sshOptions(control), host, "sh -s")
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.Stdin = strings.NewReader(probeScript)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -313,9 +357,10 @@ cat "$tmp" > "$rc"
 `
 
 // installRemote writes the shell function into the host's rc file.
-func installRemote(ctx context.Context, host, rcFile, block string) error {
+func installRemote(ctx context.Context, host, control, rcFile, block string) error {
 	script := fmt.Sprintf(installScript, rcFile, strings.TrimRight(block, "\n"))
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", host, "sh -s")
+	args := append(sshOptions(control), host, "sh -s")
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.Stdin = strings.NewReader(script)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
