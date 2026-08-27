@@ -12,17 +12,31 @@ import (
 	"github.com/colefailla/clipd/internal/server"
 )
 
-// Markers bracket the blocks clipd manages, in both the remote shell rc file
-// and the local SSH config.
+// Markers bracket the blocks clipd manages.
 //
 // They exist so setup is idempotent and reversible: re-running replaces the
 // block rather than appending a second copy, and a user who wants clipd gone
 // can delete from one marker to the other without having to work out which
 // lines were theirs.
+//
+// The remote rc file uses these plain markers, because a host has exactly one
+// clipd function however many names you reach it by. The local SSH config
+// cannot: setup is run once per host and every host needs its own block, so
+// there the markers carry the host name. See sshMarkers.
 const (
 	blockStart = "# >>> clipd >>>"
 	blockEnd   = "# <<< clipd <<<"
 )
+
+// sshMarkers returns the markers bracketing one host's block in the SSH config.
+//
+// Naming the host is what lets `clipd setup debian` and `clipd setup pi`
+// coexist. With one shared marker the second run stripped the first run's
+// block on its way to writing its own, so only the most recent host kept a
+// forward — and the earlier ones failed later with nothing to explain why.
+func sshMarkers(host string) (start, end string) {
+	return "# >>> clipd: " + host + " >>>", "# <<< clipd: " + host + " <<<"
+}
 
 // probeScript asks a remote host what it has, rather than assuming.
 //
@@ -121,7 +135,8 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 
 	forward := fmt.Sprintf("RemoteForward %s:%s", remoteSocket, localSocket)
 	pattern := hostPattern(host)
-	sshBlock := fmt.Sprintf("%s\nHost %s\n  %s\n%s\n", blockStart, pattern, forward, blockEnd)
+	sshStart, sshEnd := sshMarkers(pattern)
+	sshBlock := fmt.Sprintf("%s\nHost %s\n  %s\n%s\n", sshStart, pattern, forward, sshEnd)
 
 	if *printOnly {
 		fmt.Fprintf(e.stdout, "\n--- would append to %s on %s ---\n%s", rcFile, host, block)
@@ -398,7 +413,13 @@ func installSSHConfig(host, block string) (path string, changed bool, err error)
 		return path, false, fmt.Errorf("read %s: %w", path, err)
 	}
 
-	stripped := stripBlock(string(existing))
+	start, end := sshMarkers(host)
+	stripped := stripBlock(string(existing), start, end)
+	// Also drop a block from before the markers carried a host name. There can
+	// only be one, it names some host this run may not be for, and leaving it
+	// would forward the same socket twice — which fails at connect time with
+	// "remote port forwarding failed" and no clue as to the cause.
+	stripped = stripBlock(stripped, blockStart, blockEnd)
 	updated := stripped
 	if updated != "" && !strings.HasSuffix(updated, "\n") {
 		updated += "\n"
@@ -425,16 +446,16 @@ func installSSHConfig(host, block string) (path string, changed bool, err error)
 }
 
 // stripBlock removes a previously managed block, markers included.
-func stripBlock(s string) string {
+func stripBlock(s, start, end string) string {
 	var out []string
 	skip := false
 	for _, line := range strings.Split(s, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == blockStart {
+		if trimmed == start {
 			skip = true
 			continue
 		}
-		if trimmed == blockEnd {
+		if trimmed == end {
 			skip = false
 			continue
 		}

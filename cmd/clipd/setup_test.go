@@ -140,11 +140,12 @@ func TestShellFunctionRefusesDropWithoutTar(t *testing.T) {
 func TestStripBlockRemovesAManagedSection(t *testing.T) {
 	t.Parallel()
 
+	start, end := sshMarkers("debian")
 	give := "Host other\n  User someone\n\n" +
-		blockStart + "\nHost debian\n  RemoteForward a:b\n" + blockEnd + "\n\nHost third\n  User x\n"
-	got := stripBlock(give)
+		start + "\nHost debian\n  RemoteForward a:b\n" + end + "\n\nHost third\n  User x\n"
+	got := stripBlock(give, start, end)
 
-	if strings.Contains(got, "RemoteForward") || strings.Contains(got, blockStart) {
+	if strings.Contains(got, "RemoteForward") || strings.Contains(got, start) {
 		t.Errorf("the managed block survived:\n%s", got)
 	}
 	for _, want := range []string{"Host other", "Host third"} {
@@ -157,8 +158,9 @@ func TestStripBlockRemovesAManagedSection(t *testing.T) {
 func TestStripBlockLeavesUnmanagedFilesAlone(t *testing.T) {
 	t.Parallel()
 
+	start, end := sshMarkers("debian")
 	give := "Host debian\n  User cole\n  RemoteForward mine:yours"
-	if got := stripBlock(give); got != give {
+	if got := stripBlock(give, start, end); got != give {
 		t.Errorf("stripBlock changed an unmanaged file:\n%s", got)
 	}
 }
@@ -169,7 +171,8 @@ func TestInstallSSHConfigIsIdempotent(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	block := blockStart + "\nHost debian\n  RemoteForward a:b\n" + blockEnd + "\n"
+	start, end := sshMarkers("debian")
+	block := start + "\nHost debian\n  RemoteForward a:b\n" + end + "\n"
 
 	path, changed, err := installSSHConfig("debian", block)
 	if err != nil {
@@ -191,7 +194,7 @@ func TestInstallSSHConfigIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if n := strings.Count(string(data), blockStart); n != 1 {
+	if n := strings.Count(string(data), start); n != 1 {
 		t.Errorf("the config holds %d managed blocks, want 1:\n%s", n, data)
 	}
 }
@@ -212,7 +215,8 @@ func TestInstallSSHConfigPreservesAndBacksUp(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	block := blockStart + "\nHost debian\n  RemoteForward a:b\n" + blockEnd + "\n"
+	start, end := sshMarkers("debian")
+	block := start + "\nHost debian\n  RemoteForward a:b\n" + end + "\n"
 	if _, _, err := installSSHConfig("debian", block); err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -241,7 +245,8 @@ func TestInstallSSHConfigWritesRestrictivePermissions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	path, _, err := installSSHConfig("debian", blockStart+"\nHost debian\n"+blockEnd+"\n")
+	start, end := sshMarkers("debian")
+	path, _, err := installSSHConfig("debian", start+"\nHost debian\n"+end+"\n")
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -271,5 +276,67 @@ func TestHostPatternStripsTheUser(t *testing.T) {
 		if got := hostPattern(give); got != want {
 			t.Errorf("hostPattern(%q) = %q, want %q", give, got, want)
 		}
+	}
+}
+
+// TestSeveralHostsCoexist is the property one shared marker broke: setup is run
+// once per host, and each run must leave the others' forwards alone. With a
+// single marker the second run stripped the first on its way to writing its
+// own, so only the most recent host kept a forward.
+func TestSeveralHostsCoexist(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hosts := []string{"debian", "debian.local", "10.0.0.5"}
+	for _, h := range hosts {
+		start, end := sshMarkers(h)
+		block := start + "\nHost " + h + "\n  RemoteForward /home/c/.clipd.sock:/Users/c/.clipd.sock\n" + end + "\n"
+		if _, _, err := installSSHConfig(h, block); err != nil {
+			t.Fatalf("setup %s: %v", h, err)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".ssh", "config"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	for _, h := range hosts {
+		if !strings.Contains(string(data), "Host "+h+"\n") {
+			t.Errorf("%s lost its block after later setups:\n%s", h, data)
+		}
+	}
+}
+
+// TestLegacyUnhostedBlockIsReplaced covers the upgrade: a config written before
+// the markers carried a host name has one unhosted block, which would otherwise
+// survive and forward the same socket twice.
+func TestLegacyUnhostedBlockIsReplaced(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	legacy := blockStart + "\nHost debian\n  RemoteForward old:old\n" + blockEnd + "\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(legacy), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	start, end := sshMarkers("debian")
+	block := start + "\nHost debian\n  RemoteForward new:new\n" + end + "\n"
+	if _, _, err := installSSHConfig("debian", block); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(sshDir, "config"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(data), "old:old") {
+		t.Errorf("the legacy block survived, forwarding the socket twice:\n%s", data)
+	}
+	if !strings.Contains(string(data), "new:new") {
+		t.Errorf("the new block is missing:\n%s", data)
 	}
 }
