@@ -328,15 +328,23 @@ func shellFunction(client, socket string, hasTar bool) string {
 	fmt.Fprintf(&b, "  if [ \"$1\" = \"drop\" ]; then\n")
 	fmt.Fprintf(&b, "    shift\n")
 	if hasTar {
-		fmt.Fprintf(&b, "    if [ $# -eq 0 ]; then printf 'clipd drop: no files given\\n' >&2; return 64; fi\n")
-		// The magic line and the envelope, then the archive, all on one
-		// connection. printf rather than echo because echo's handling of
-		// backslashes varies between shells.
-		// COPYFILE_DISABLE stops macOS tar from emitting an AppleDouble "._"
-		// companion for every file, which would otherwise double the count and
-		// litter the drop directory with metadata nobody asked for. It is an
-		// unknown variable on Linux, and ignored there.
-		fmt.Fprintf(&b, "    { printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n'; COPYFILE_DISABLE=1 tar cf - \"$@\"; } | %s\n", client)
+		// Two ways to drop, told apart by whether stdin is a terminal.
+		//
+		// With files on the command line, tar carries their names. In a
+		// pipeline there is no file and no name, so one is taken from the
+		// first argument, or invented from the clock when even that is
+		// missing — a nameless file in the drop directory is worse than an
+		// ugly one.
+		fmt.Fprintf(&b, "    if [ -t 0 ]; then\n")
+		fmt.Fprintf(&b, "      if [ $# -eq 0 ]; then printf 'clipd drop: no files given\\n' >&2; return 64; fi\n")
+		fmt.Fprintf(&b, "      { printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n'; COPYFILE_DISABLE=1 tar cf - \"$@\"; } | %s\n", client)
+		fmt.Fprintf(&b, "    else\n")
+		fmt.Fprintf(&b, "      name=${1:-drop-$(date +%%Y%%m%%d-%%H%%M%%S).bin}\n")
+		// The name lands inside a JSON string, so the two characters JSON
+		// escapes have to be escaped here. Everything else the daemon rejects.
+		fmt.Fprintf(&b, "      esc=$(printf '%%s' \"$name\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n")
+		fmt.Fprintf(&b, "      { printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\"}\\n' \"$esc\"; cat; } | %s\n", client)
+		fmt.Fprintf(&b, "    fi\n")
 	} else {
 		fmt.Fprintf(&b, "    printf 'clipd drop: this host has no tar\\n' >&2; return 1\n")
 	}

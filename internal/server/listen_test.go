@@ -142,3 +142,40 @@ func TestExpandPathResolvesTilde(t *testing.T) {
 		t.Errorf("ExpandPath returned a relative path: %q", got)
 	}
 }
+
+// TestListenRefusesNonLoopbackTCP: the daemon has no authentication, so a
+// reachable TCP address would hand the clipboard to whatever can route to it.
+// That configuration is refused rather than warned about.
+func TestListenRefusesNonLoopbackTCP(t *testing.T) {
+	t.Parallel()
+
+	for _, addr := range []string{
+		"0.0.0.0:0", ":0", "192.168.1.5:0", "[::]:0", "example.com:0",
+	} {
+		ln, err := Listen(addr)
+		if err == nil {
+			ln.Close()
+			t.Errorf("Listen(%q) bound a reachable address", addr)
+			continue
+		}
+		if !strings.Contains(err.Error(), "no authentication") {
+			t.Errorf("Listen(%q) failed with %v, want it to explain why", addr, err)
+		}
+	}
+}
+
+// TestListenAllowsLoopbackTCP keeps the case the restriction exists to
+// preserve: hosts where SSH cannot forward a UNIX socket still need an
+// endpoint, and a loopback port is one.
+func TestListenAllowsLoopbackTCP(t *testing.T) {
+	t.Parallel()
+
+	for _, addr := range []string{"127.0.0.1:0", "localhost:0", "[::1]:0"} {
+		ln, err := Listen(addr)
+		if err != nil {
+			t.Errorf("Listen(%q): %v", addr, err)
+			continue
+		}
+		ln.Close()
+	}
+}

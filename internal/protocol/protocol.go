@@ -66,6 +66,14 @@ var ErrNoMagic = errors.New("protocol: not a structured request")
 // understand is told rather than silently half-served.
 type Request struct {
 	Type string `json:"type"`
+
+	// Name is set on a drop whose body is a single file's raw bytes rather
+	// than a tar stream, which is how a pipeline sends output that never
+	// existed on disk. It is the sender's suggestion, not an instruction: the
+	// daemon reduces it to a bare filename before it becomes a path.
+	//
+	// Empty means the body is a tar stream and the names come from the archive.
+	Name string `json:"name,omitempty"`
 }
 
 // Sniff reports whether r begins with Magic, consuming the prefix when it

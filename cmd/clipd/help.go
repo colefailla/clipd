@@ -40,15 +40,25 @@ one marker to the other. Your SSH config is backed up to config.clipd-backup
 before the first edit.`,
 
 	"drop": `clipd drop <file>...
+       <command> | clipd drop [name]
 
 Run on the remote host, not the Mac. Sends files to the Mac's drop directory
 (default ~/Drop).
 
   clipd drop report.pdf
   clipd drop src/*.go
+  pg_dump mydb | clipd drop dump.sql
+  journalctl -u nginx | clipd drop
 
-The files are packed with tar, so names, multiple files and whole directories
-survive the trip. What arrives is deliberately flattened: every file lands
+With files named, they are packed with tar, so names, multiple files and whole
+directories survive the trip.
+
+In a pipeline there is no file and so no name, and one is taken from the
+argument instead. Without even that, a name is built from the clock —
+drop-20260826-143022.bin — because a nameless file in the drop directory is
+worse than an ugly one.
+
+What arrives is deliberately flattened: every file lands
 directly in the drop directory under its own basename, with no subdirectories
 recreated.
 
@@ -75,8 +85,10 @@ Keys:
 
   address             socket path to listen on (default ~/.clipd.sock).
                       A leading /, ~ or . means a UNIX socket. Anything else
-                      is host:port, which nothing authenticates — see
-                      'clipd help security'.
+                      is host:port, and must be loopback: 127.0.0.1, [::1] or
+                      localhost. A reachable address is refused at startup,
+                      because nothing here authenticates. The port form exists
+                      only for hosts whose SSH cannot forward a socket.
   drop_dir            where dropped files land (default ~/Drop)
   max_payload_bytes   largest clipboard message (default 10485760)
   max_drop_bytes      largest drop, in total (default 268435456)
@@ -128,9 +140,15 @@ Two things reduce what it can do to you:
   Dropped files are flattened to basenames, never overwrite, are never made
   executable, and carry macOS's quarantine attribute.
 
-Setting 'address' to a host:port turns all of this off. There is no
-authentication behind it, so a TCP listener is only ever appropriate on the
-loopback interface.`,
+The 'address' setting also accepts a loopback host:port, for hosts whose SSH
+cannot forward a UNIX socket — OpenSSH gained that ability only in 6.7, and its
+Windows build still lacks it. That is a tunnel endpoint like the socket, not a
+network service: a reachable address is refused at startup rather than warned
+about, because nothing here authenticates and no warning makes that safe.
+
+What a port gives up against a socket is that any user on the machine can reach
+loopback, where a 0600 socket admits only its owner. Prefer the socket wherever
+SSH can forward one.`,
 
 	"install": `clipd install
 

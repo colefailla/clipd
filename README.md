@@ -7,8 +7,9 @@ connection you already have.
 
 ```bash
 ssh debian
-docker ps | clipd            # now in the Mac's clipboard
-clipd drop report.pdf        # now in the Mac's ~/Drop
+tail -50 error.log | clipd        # now in the Mac's clipboard
+clipd drop report.pdf             # now in the Mac's ~/Drop
+pg_dump mydb | clipd drop db.sql  # output that never touched disk
 ```
 
 **Nothing is installed on the remote machine.** `clipd` there is a shell
@@ -20,7 +21,7 @@ runs only on the Mac.
 ```text
 Linux                                      macOS
 
-  docker ps
+  tail -50 error.log
      │ stdout
      ▼
   clipd ──▶ ~/.clipd.sock ══ ssh -R ══▶ ~/.clipd.sock ──▶ clipd serve
@@ -111,11 +112,20 @@ the markers. Your SSH config is backed up before the first edit.
 On the remote host:
 
 ```bash
-ls -l | clipd                # copy stdout
-clipd < notes.txt            # copy a file's contents
-clipd drop report.pdf        # send a file to ~/Drop
-clipd drop src/*.go          # send several
+ls -l | clipd                       # copy stdout
+clipd < notes.txt                   # copy a file's contents
+cat ~/.ssh/id_ed25519.pub | clipd   # grab a public key
+
+clipd drop report.pdf               # send a file to ~/Drop
+clipd drop src/*.go                 # send several
+pg_dump mydb | clipd drop db.sql    # send output as a file
+journalctl -u nginx | clipd drop    # name invented from the clock
 ```
+
+The last two forms matter when the thing you want has no file on disk. With
+arguments, `tar` carries the names; in a pipeline there is nothing to name, so
+you supply one — or let the daemon build `drop-20260826-143022.bin` rather than
+lose the bytes.
 
 Content is sent byte for byte — newlines, tabs and the trailing newline are
 preserved. Input over `max_payload_bytes` (10 MiB by default) is rejected rather
@@ -159,8 +169,15 @@ Two things limit what it can do:
   carry macOS's quarantine attribute so Gatekeeper treats them like downloads.
   Symlinks, hard links and device nodes in an archive are skipped.
 
-Setting `address` to a `host:port` turns all of this off. Nothing authenticates
-behind it, so a TCP listener is only ever appropriate on loopback.
+`address` also accepts a **loopback** `host:port`, for hosts whose SSH cannot
+forward a UNIX socket — OpenSSH gained that ability only in 6.7, and its Windows
+build still lacks it. That is a tunnel endpoint like the socket, not a network
+service: a reachable address is **refused at startup**, not warned about,
+because nothing here authenticates and no warning makes that safe.
+
+A port gives up one thing against a socket: any user on the machine can reach
+loopback, where a `0600` socket admits only its owner. Prefer the socket
+wherever SSH can forward one.
 
 ## Configuration
 

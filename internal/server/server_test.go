@@ -151,6 +151,13 @@ func dropRequest(archive []byte) []byte {
 	return append([]byte(protocol.Magic+`{"type":"drop"}`+"\n"), archive...)
 }
 
+// namedDropRequest frames raw bytes as a drop under one name, the way the
+// shell function does when stdin is a pipe and there is no file to tar.
+func namedDropRequest(name string, body []byte) []byte {
+	head := protocol.Magic + `{"type":"drop","name":"` + name + `"}` + "\n"
+	return append([]byte(head), body...)
+}
+
 func TestRawStreamReachesTheClipboard(t *testing.T) {
 	t.Parallel()
 
@@ -455,5 +462,51 @@ func TestNewRejectsBadOptions(t *testing.T) {
 		if _, err := New(opts); err == nil {
 			t.Errorf("New(%s) succeeded, want an error", name)
 		}
+	}
+}
+
+// TestNamedDropWritesOneFile is the pipeline case end to end: no archive, just
+// bytes and a name, which is what `pg_dump db | clipd drop dump.sql` sends.
+func TestNamedDropWritesOneFile(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	reply := h.send(namedDropRequest("dump.sql", []byte("rows and rows")))
+
+	if !strings.Contains(reply, "dump.sql") {
+		t.Fatalf("reply = %q, want it to name the file", reply)
+	}
+	got, err := os.ReadFile(filepath.Join(h.dropDir, "dump.sql"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "rows and rows" {
+		t.Errorf("content = %q, want the streamed bytes", got)
+	}
+	if h.clip.WriteCount() != 0 {
+		t.Error("a named drop reached the clipboard")
+	}
+}
+
+// TestNamedDropCannotEscape: the name arrives over the wire from the same
+// place an archive would, and is trusted exactly as little.
+func TestNamedDropCannotEscape(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.send(namedDropRequest("../../escaped.txt", []byte("no")))
+
+	parent := filepath.Dir(h.dropDir)
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatalf("read parent: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() == "escaped.txt" {
+			t.Fatal("a named drop wrote outside the drop directory")
+		}
+	}
+	if _, err := os.Stat(filepath.Join(h.dropDir, "escaped.txt")); err != nil {
+		t.Errorf("the file did not land in the drop directory: %v", err)
 	}
 }

@@ -13,23 +13,27 @@ import (
 //
 // The address decides the transport, and with it the security model:
 //
-//	/path/to/clipd.sock   a UNIX domain socket, reachable only through the
-//	                      filesystem — and, via `ssh -R`, from a machine the
-//	                      user has already authenticated to
-//	host:port             a TCP socket, reachable by anything that can route
-//	                      to it
+//	/path/to/clipd.sock   a UNIX domain socket
+//	127.0.0.1:8199        a TCP socket, loopback only
 //
-// The socket is the supported configuration and the default. TCP exists
-// because a listener is occasionally wanted for a local test or a container,
-// and it is deliberately not the path anything is documented to use: nothing
-// in this daemon authenticates, so a TCP listener on anything but the loopback
-// interface hands the clipboard to the network.
+// Both are tunnel endpoints, not network services. The socket is the supported
+// configuration; the loopback port exists for hosts where SSH cannot forward a
+// socket at all — OpenSSH gained that ability only in 6.7, and its Windows
+// build still lacks it — so a port is the only endpoint available there.
+//
+// A non-loopback address is refused rather than warned about. Nothing in this
+// daemon authenticates, so binding one would hand the clipboard to everything
+// that can route to it, and a configuration that dangerous should be
+// impossible rather than discouraged.
 //
 // Splitting on whether the address looks like a path is taken from
 // wincent/clipper, which does the same thing for the same reason: it collapses
 // two settings into one, and makes the transport obvious from the value.
 func Listen(address string) (net.Listener, error) {
 	if !IsSocketPath(address) {
+		if err := requireLoopback(address); err != nil {
+			return nil, err
+		}
 		ln, err := net.Listen("tcp", address)
 		if err != nil {
 			return nil, fmt.Errorf("listen on %s: %w", address, err)
@@ -105,6 +109,34 @@ func prepareSocketPath(path string) error {
 		return fmt.Errorf("remove stale socket %s: %w", path, err)
 	}
 	return nil
+}
+
+// requireLoopback rejects any TCP address the network could reach.
+//
+// The check is on the literal string rather than on what a name resolves to:
+// resolution needs DNS the daemon may not have at startup, and it can change
+// underneath a host that was loopback when it was configured. "localhost" is
+// accepted by name because it is loopback everywhere by definition; anything
+// else must say so as an address.
+func requireLoopback(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("address %q: %w", address, err)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	// An empty host is the most dangerous spelling of all: ":8199" binds every
+	// interface, and reads like it binds none.
+	shown := host
+	if shown == "" {
+		shown = "(empty, meaning every interface)"
+	}
+	return fmt.Errorf("address %q listens on %s, and clipd has no authentication: "+
+		"use a socket path, or 127.0.0.1 if this host cannot forward one", address, shown)
 }
 
 // IsSocketPath reports whether an address names a filesystem path rather than

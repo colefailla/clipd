@@ -193,6 +193,40 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 	return res, nil
 }
 
+// Save writes a single stream into opts.Dir under name.
+//
+// This is the pipeline case — `pg_dump db | clipd drop dump.sql` — where there
+// is no archive because the bytes never existed as a file. It shares every
+// guarantee Extract has, and for the same reasons: the name is reduced to a
+// bare filename, nothing is overwritten, nothing is made executable, the size
+// is capped, and a failure leaves nothing behind.
+func Save(r io.Reader, name string, opts Options) (Result, error) {
+	if opts.Dir == "" {
+		return Result{}, errors.New("drop: no destination directory")
+	}
+	maxBytes := opts.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxBytes
+	}
+
+	safe, err := safeName(name)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := os.MkdirAll(opts.Dir, dirPerm); err != nil {
+		return Result{}, fmt.Errorf("drop: create %s: %w", opts.Dir, err)
+	}
+
+	path, n, err := writeFile(r, opts.Dir, safe, maxBytes)
+	if err != nil {
+		if path != "" {
+			_ = os.Remove(path)
+		}
+		return Result{}, err
+	}
+	return Result{Names: []string{filepath.Base(path)}, Bytes: n}, nil
+}
+
 // safeName reduces an archive entry's name to a bare filename that cannot
 // escape the destination directory.
 //

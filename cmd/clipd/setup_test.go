@@ -340,3 +340,31 @@ func TestLegacyUnhostedBlockIsReplaced(t *testing.T) {
 		t.Errorf("the new block is missing:\n%s", data)
 	}
 }
+
+// TestShellFunctionHandlesBothDropForms pins the two shapes the daemon
+// distinguishes: files on the command line become a tar, and a pipeline
+// becomes one named stream.
+func TestShellFunctionHandlesBothDropForms(t *testing.T) {
+	t.Parallel()
+
+	block := shellFunction(`nc -N -U "$sock"`, "/home/cole/.clipd.sock", true)
+
+	if !strings.Contains(block, "if [ -t 0 ]; then") {
+		t.Errorf("the function does not branch on whether stdin is a pipe:\n%s", block)
+	}
+	if !strings.Contains(block, `COPYFILE_DISABLE=1 tar cf - "$@"`) {
+		t.Errorf("the file form does not tar its arguments:\n%s", block)
+	}
+	if !strings.Contains(block, `"name":"%s"`) {
+		t.Errorf("the pipe form does not send a name:\n%s", block)
+	}
+	// A nameless file in the drop directory is worse than an ugly one.
+	if !strings.Contains(block, "drop-$(date") {
+		t.Errorf("the pipe form invents no name when none is given:\n%s", block)
+	}
+	// The name lands inside a JSON string, so those two characters must be
+	// escaped or a filename with a quote produces a parse error on the daemon.
+	if !strings.Contains(block, "sed 's/") {
+		t.Errorf("the pipe form does not escape the name for JSON:\n%s", block)
+	}
+}

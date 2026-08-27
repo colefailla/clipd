@@ -476,7 +476,7 @@ func (s *Server) handleStructured(ctx context.Context, conn net.Conn, r *bufio.R
 
 	switch req.Type {
 	case protocol.TypeDrop:
-		s.handleDrop(conn, r)
+		s.handleDrop(conn, r, req.Name)
 	default:
 		s.warnPeer("unknown request type", "type", req.Type)
 		s.respond(conn, fmt.Sprintf("unknown request type %q", req.Type))
@@ -485,16 +485,29 @@ func (s *Server) handleStructured(ctx context.Context, conn net.Conn, r *bufio.R
 
 // handleDrop extracts the tar stream following the envelope into the drop
 // directory.
-func (s *Server) handleDrop(conn net.Conn, r io.Reader) {
+func (s *Server) handleDrop(conn net.Conn, r io.Reader, name string) {
 	if s.dropDir == "" {
 		s.respond(conn, "drop is not configured on this daemon")
 		return
 	}
-	res, err := drop.Extract(r, drop.Options{
+	opts := drop.Options{
 		Dir:      s.dropDir,
 		MaxBytes: s.maxDropBytes,
 		MaxFiles: s.maxDropFiles,
-	})
+	}
+	// A name means the body is one file's bytes, sent by a pipeline that had
+	// no file to hand to tar. Without one the body is an archive and the names
+	// come from inside it. Exactly one of these may run: both read the same
+	// stream to its end.
+	var (
+		res drop.Result
+		err error
+	)
+	if name != "" {
+		res, err = drop.Save(r, name, opts)
+	} else {
+		res, err = drop.Extract(r, opts)
+	}
 	if err != nil {
 		// Warn rather than Error: every one of these is caused by what a peer
 		// sent, so they are rate-limited like the rest of the peer-driven

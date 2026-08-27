@@ -586,3 +586,84 @@ func TestExtractWritesAwkwardNames(t *testing.T) {
 		}
 	}
 }
+
+// TestSaveWritesOneNamedStream covers the pipeline case, where the bytes never
+// existed as a file and so carry no name of their own.
+func TestSaveWritesOneNamedStream(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	res, err := Save(strings.NewReader("dumped rows"), "dump.sql", Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if len(res.Names) != 1 || res.Names[0] != "dump.sql" {
+		t.Fatalf("wrote %v, want [dump.sql]", res.Names)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "dump.sql"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "dumped rows" {
+		t.Errorf("content = %q, want the streamed bytes", got)
+	}
+}
+
+// TestSaveAppliesTheSameGuaranteesAsExtract: a name arriving over the wire is
+// no more trustworthy than one inside an archive, so it goes through exactly
+// the same reduction.
+func TestSaveAppliesTheSameGuaranteesAsExtract(t *testing.T) {
+	t.Parallel()
+
+	t.Run("traversal is flattened", func(t *testing.T) {
+		t.Parallel()
+		parent := t.TempDir()
+		dir := filepath.Join(parent, "drop")
+		res, err := Save(strings.NewReader("x"), "../../escaped.txt", Options{Dir: dir})
+		if err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+		if res.Names[0] != "escaped.txt" {
+			t.Errorf("wrote %q, want escaped.txt", res.Names[0])
+		}
+		if _, err := os.Stat(filepath.Join(parent, "escaped.txt")); err == nil {
+			t.Error("Save wrote outside the drop directory")
+		}
+	})
+
+	t.Run("control characters are refused", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "drop")
+		if _, err := Save(strings.NewReader("x"), "evil\nname.txt", Options{Dir: dir}); err == nil {
+			t.Error("Save accepted a control character in the name")
+		}
+	})
+
+	t.Run("size is capped and rolled back", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "drop")
+		_, err := Save(strings.NewReader(strings.Repeat("x", 5000)), "big.bin", Options{Dir: dir, MaxBytes: 100})
+		if err == nil {
+			t.Fatal("Save accepted a stream past the limit")
+		}
+		assertDirEmpty(t, dir)
+	})
+
+	t.Run("existing files are not overwritten", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "drop")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("first"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		res, err := Save(strings.NewReader("second"), "notes.txt", Options{Dir: dir})
+		if err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+		if res.Names[0] != "notes-1.txt" {
+			t.Errorf("wrote %q, want notes-1.txt", res.Names[0])
+		}
+	})
+}
