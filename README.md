@@ -152,19 +152,19 @@ SSH has encrypted the channel, verified the host key against `known_hosts`, and
 authenticated you; the socket's `0600` permissions decide who on that machine
 may write to it.
 
-That is why clipd has no token and no TLS of its own. Both would duplicate a
-decision SSH has already made — and a token stored on the remote host would be
-a stealable secret that works from anywhere until rotated, where the socket is
-an ephemeral capability that dies with the session and cannot be copied off the
-box.
+clipd has no token and no TLS of its own because SSH has already done both
+jobs. A token would also be worse: it would live as a file on the remote host,
+and anyone who copied it could use it from anywhere until you rotated it. The
+socket cannot be copied, and it disappears when the session ends.
 
-**What this does mean:** anything running as you on the remote host can write to
-your clipboard and send you files. Other accounts there cannot, because of the
-socket's permissions, but your own processes can — including a build script or a
-package install. That is inherent to letting a remote machine write to your
-clipboard at all. It also matters less than it sounds: anything positioned to
-abuse it already has your files, your history and your keystrokes on that
-machine.
+**What this means:** anything running as you on the remote host can write to
+your clipboard and send you files, including a build script or a package
+install. Other accounts on that host cannot, because of the socket's
+permissions.
+
+There is no way around this. Letting a remote machine write to your clipboard
+means trusting what runs there as you. In practice anything able to abuse it
+already has your files and your shell history on that machine.
 
 Two things limit what it can do:
 
@@ -175,15 +175,12 @@ Two things limit what it can do:
   carry macOS's quarantine attribute so Gatekeeper treats them like downloads.
   Symlinks, hard links and device nodes in an archive are skipped.
 
-`address` also accepts a **loopback** `host:port`, for hosts whose SSH cannot
-forward a UNIX socket — OpenSSH gained that ability only in 6.7, and its Windows
-build still lacks it. That is a tunnel endpoint like the socket, not a network
-service: a reachable address is **refused at startup**, not warned about,
-because nothing here authenticates and no warning makes that safe.
+`address` also takes a `host:port` instead of a socket, for remotes whose SSH
+cannot forward one — OpenSSH before 6.7, and Windows. It must be loopback;
+anything reachable is refused at startup.
 
-A port gives up one thing against a socket: any user on the machine can reach
-loopback, where a `0600` socket admits only its owner. Prefer the socket
-wherever SSH can forward one.
+Prefer the socket wherever SSH can forward one. A loopback port is reachable by
+any user on the machine, where a `0600` socket is not.
 
 ## Configuration
 
@@ -242,9 +239,41 @@ recurring.
 clipd uninstall
 ```
 
-Removes the LaunchAgent. The config, logs and the shell functions on remote
-hosts are left in place — delete the block between the clipd markers in their
-rc files.
+That unloads and removes the LaunchAgent. Everything else is left in place.
+
+### Everything clipd touches
+
+**On the Mac:**
+
+| Path | What it is |
+|---|---|
+| `/usr/local/bin/clipd` | the binary |
+| `~/Library/LaunchAgents/com.clipd.agent.plist` | the launch agent, removed by `clipd uninstall` |
+| `~/.config/clipd/config.json` | configuration |
+| `~/.clipd.sock` | the socket, created by the daemon and removed when it stops |
+| `~/Drop/` | files received by `clipd drop` |
+| `~/Library/Logs/clipd/` | the daemon's output, written by launchd |
+| `~/.ssh/config` | one block per host, between `# >>> clipd: <host> >>>` markers |
+| `~/.ssh/config.clipd-backup` | a copy of the SSH config from before the first edit |
+
+To remove the rest:
+
+```bash
+sudo rm /usr/local/bin/clipd
+rm -rf ~/.config/clipd ~/Library/Logs/clipd ~/.clipd.sock
+```
+
+Delete the marked blocks from `~/.ssh/config` by hand. `~/Drop` holds files you
+received, so it is left for you to look through.
+
+**On each remote host** — nothing is installed, so there are two things:
+
+| Path | What it is |
+|---|---|
+| `~/.bashrc`, `~/.zshrc` or `~/.profile` | the `clipd` function, between `# >>> clipd >>>` markers |
+| `~/.clipd.sock` | created by sshd while you are connected, removed when you disconnect |
+
+Delete the marked block and the socket is gone on its own.
 
 ## License
 
