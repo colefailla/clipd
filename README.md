@@ -61,13 +61,9 @@ first.
 
 ## Install
 
-On the **Mac only**:
+On the **Mac only** — there is nothing to install on the machines you copy from.
 
-```bash
-brew install clipd
-```
-
-Or download a binary:
+From a release binary (Apple Silicon; use `clipd_darwin_amd64` on Intel):
 
 ```bash
 curl -fsSL https://github.com/colefailla/clipd/releases/latest/download/clipd_darwin_arm64 -o clipd
@@ -75,11 +71,19 @@ sudo install -m 0755 clipd /usr/local/bin/clipd
 rm clipd
 ```
 
+Or from source, which needs only a Go toolchain — clipd has no dependencies:
+
+```bash
+git clone https://github.com/colefailla/clipd && cd clipd && make install
+```
+
 Then start it at login:
 
 ```bash
 clipd install
 ```
+
+There is no Homebrew formula yet.
 
 ## Setup a remote host
 
