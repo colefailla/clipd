@@ -103,9 +103,11 @@ default on some Debian systems does neither, and guessing wrong gives you either
 `invalid option` or a copy that hangs with no output. Asking the host removes
 the guess — and if it genuinely can't, the error names the package that fixes it.
 
-Both edits are bracketed by `# >>> clipd >>>` markers, so re-running replaces
-the block rather than adding another, and uninstalling means deleting between
-the markers. Your SSH config is backed up before the first edit.
+Both edits are bracketed by clipd markers, so re-running replaces the block
+rather than adding another, and uninstalling means deleting between them. The
+SSH config markers name the host — `# >>> clipd: debian >>>` — so setting up
+several hosts leaves each one's forward intact. Your SSH config is backed up
+before the first edit.
 
 ## Usage
 
@@ -181,8 +183,9 @@ wherever SSH can forward one.
 
 ## Configuration
 
-`~/Library/Application Support/clipd/config.json`. Every value has a working
-default, so a daemon with no config file is a working daemon.
+`~/.config/clipd/config.json` — the same path on macOS and Linux, and
+`$XDG_CONFIG_HOME` wins when it is set. Every value has a working default, so a
+daemon with no config file is a working daemon.
 
 ```json
 {

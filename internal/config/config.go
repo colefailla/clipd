@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -73,9 +74,10 @@ const (
 // Config is the on-disk configuration.
 type Config struct {
 	// Address is a socket path or a host:port. A leading /, ~ or . makes it a
-	// UNIX domain socket, which is the supported configuration; anything else
-	// is a TCP listener, which nothing authenticates and which should never be
-	// bound to a routable interface.
+	// UNIX domain socket, which is the supported configuration. Anything else
+	// is a TCP listener and must be loopback — a reachable address is refused
+	// at startup, since nothing here authenticates. The port form exists only
+	// for hosts whose SSH cannot forward a socket.
 	Address string `json:"address"`
 
 	// DropDir receives files sent with `clipd drop`.
@@ -109,14 +111,47 @@ func Default() Config {
 
 // DefaultPath returns the config file path for the current user.
 //
-// os.UserConfigDir already encodes the per-OS convention: Application Support
-// on macOS, XDG_CONFIG_HOME (or ~/.config) on Linux.
+// ~/.config on every platform, rather than os.UserConfigDir's per-OS answer.
+// That function returns ~/Library/Application Support on macOS, which is
+// Apple's convention for application bundles; clipd is a command-line daemon,
+// and the tools it sits beside — git, gh, btop, clipper — all live in
+// ~/.config there. Using one path on both platforms also means one line of
+// documentation instead of two, and no shell command that has to escape a
+// space in the middle of a directory name.
+//
+// XDG_CONFIG_HOME still wins when it is set, which is the whole point of the
+// variable.
 func DefaultPath() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", fmt.Errorf("locate user config directory: %w", err)
+	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		return filepath.Join(dir, AppName, FileName), nil
 	}
-	return filepath.Join(dir, AppName, FileName), nil
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("locate home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", AppName, FileName), nil
+}
+
+// LegacyPath is where releases before v3 kept the config on macOS, or "" if
+// there is nothing there.
+//
+// Nothing reads it. Resolution does not fall back to it and startup does not
+// fail over it, because a config written by v2 holds only settings v3 removed,
+// and defaults are the right answer for an upgrader. It exists so status can
+// mention the orphan, which is where someone would look for it.
+func LegacyPath() string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(home, "Library", "Application Support", AppName, FileName)
+	if !Exists(path) {
+		return ""
+	}
+	return path
 }
 
 // ResolvePath picks the config path from, in order: an explicit flag value,

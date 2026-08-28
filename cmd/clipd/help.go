@@ -73,10 +73,14 @@ Files are never overwritten. A second report.pdf arrives as report-1.pdf.`,
 
 	"config": `clipd config file
 
-Location:
+Location, on every platform:
 
-  macOS   ~/Library/Application Support/clipd/config.json
-  Linux   $XDG_CONFIG_HOME/clipd/config.json, or ~/.config/clipd/config.json
+  $XDG_CONFIG_HOME/clipd/config.json, or ~/.config/clipd/config.json
+
+Releases before v3 kept it under ~/Library/Application Support on macOS.
+Nothing reads that now; a config left there holds only settings v3 removed, so
+an upgrade quietly falls back to defaults rather than failing. 'clipd status'
+points at the orphan if one is present.
 
 Override with -config <path> or CLIPD_CONFIG. Every value has a working
 default, so a daemon with no config file at all is a working daemon.

@@ -38,6 +38,12 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 	} else {
 		fmt.Fprintf(out, "  file         %s (not created; using defaults)\n", path)
 	}
+	// Before v3 this lived under Application Support. Nothing reads it now, and
+	// an upgrader looking for their settings should be told that rather than
+	// left editing a file with no effect.
+	if old := config.LegacyPath(); old != "" {
+		fmt.Fprintf(out, "  note         an unused pre-v3 config remains at %s\n", old)
+	}
 	fmt.Fprintf(out, "  max payload  %s\n", config.FormatSize(cfg.MaxPayloadBytes))
 	fmt.Fprintf(out, "  max drop     %s across %d files\n",
 		config.FormatSize(cfg.MaxDropBytes), cfg.MaxDropFiles)

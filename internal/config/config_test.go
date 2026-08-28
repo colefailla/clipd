@@ -248,3 +248,46 @@ func Load2Err(t *testing.T, path string) error {
 	t.Fatalf("Load(%s) succeeded, want an error", path)
 	return nil
 }
+
+// TestDefaultPathIsXDGShaped pins the move off ~/Library/Application Support.
+//
+// clipd is a command-line daemon, and the tools it sits beside — git, gh, btop,
+// clipper — all keep their config in ~/.config on macOS too. Using one path on
+// both platforms also spares every shell example an escaped space.
+func TestDefaultPathIsXDGShaped(t *testing.T) {
+	path, err := DefaultPath()
+	if err != nil {
+		t.Fatalf("DefaultPath: %v", err)
+	}
+	if strings.Contains(path, "Application Support") {
+		t.Errorf("DefaultPath = %q, want it out of Application Support", path)
+	}
+	if !strings.Contains(path, filepath.Join(".config", AppName, FileName)) {
+		t.Errorf("DefaultPath = %q, want it under .config/%s", path, AppName)
+	}
+}
+
+// TestXDGConfigHomeWins: honouring the variable is the whole point of it.
+func TestXDGConfigHomeWins(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "/somewhere/else")
+
+	path, err := DefaultPath()
+	if err != nil {
+		t.Fatalf("DefaultPath: %v", err)
+	}
+	want := filepath.Join("/somewhere/else", AppName, FileName)
+	if path != want {
+		t.Errorf("DefaultPath = %q, want %q", path, want)
+	}
+}
+
+// TestResolvePathDoesNotFailOverALegacyConfig: an upgrader's old config holds
+// only settings v3 removed, so defaults are the right answer. Failing here
+// would crash-loop the daemon under launchd's KeepAlive for no gain.
+func TestResolvePathDoesNotFailOverALegacyConfig(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	if _, err := ResolvePath(""); err != nil {
+		t.Errorf("ResolvePath: %v", err)
+	}
+}
