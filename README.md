@@ -101,11 +101,38 @@ Reconnect for the forward to take effect:
 ssh -O exit debian 2>/dev/null; ssh debian
 ```
 
-The probe exists because `nc` is not one program. The OpenBSD build speaks UNIX
-sockets with `-U` and half-closes with `-N`; the "traditional" build shipped by
-default on some Debian systems does neither, and guessing wrong gives you either
-`invalid option` or a copy that hangs with no output. Asking the host removes
-the guess — and if it genuinely can't, the error names the package that fixes it.
+### Why it probes
+
+`nc` is not one program. Several unrelated implementations share the name, they
+disagree about which flags exist, and — worse — they disagree about what the
+same flag *means*. Guessing wrong gives you `invalid option`, or a copy that
+hangs with no output, or a flag error on every single use.
+
+So setup asks the host what it has, and writes a client to match:
+
+| Remote | What setup finds | What it writes |
+|---|---|---|
+| Linux, `netcat-openbsd` | `-U` and `-N` | `nc -N -U "$sock"` |
+| macOS | `-U`, and a `-N` that means something else | `nc -U "$sock"` |
+| any, with `socat` | no usable `nc` | `socat - UNIX-CLIENT:"$sock"` |
+| `netcat-traditional` only | no `-U` | refuses, names the package to install |
+
+The two flags that matter:
+
+- **`-U`** talks to a UNIX socket instead of a network address. `netcat-traditional`
+  does not have it, which is why that host needs `socat` or a different netcat.
+- **`-N`** closes the sending half after stdin ends. Without it the daemon never
+  sees the end of your message, so it never replies, and the copy hangs until it
+  times out.
+
+macOS is the case worth spelling out. Its netcat **has** a `-N`, but there it
+takes a probe count for a write timeout — passing it the OpenBSD way fails with
+`invalid tcp adaptive write timeout value`. It also closes on stdin EOF without
+being asked, so it needs no flag. A probe that checked only whether `-N` existed
+would produce a broken client for every Mac; setup checks `uname -s` too.
+
+Nothing is ever installed for you. When the host genuinely cannot do it, setup
+refuses and names the package rather than writing a client that fails later.
 
 Both edits are bracketed by clipd markers, so re-running replaces the block
 rather than adding another, and uninstalling means deleting between them. The

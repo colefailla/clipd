@@ -16,10 +16,13 @@ func TestClientCommandPicksWhatTheHostHas(t *testing.T) {
 		facts remoteFacts
 		want  string
 	}{
-		{"modern netcat", remoteFacts{hasNC: true, ncUnix: true, ncShutdown: true}, "nc -N -U"},
-		{"netcat without -N", remoteFacts{hasNC: true, ncUnix: true}, "nc -U"},
-		{"socat fallback", remoteFacts{hasSocat: true}, "socat"},
-		{"netcat and socat", remoteFacts{hasNC: true, hasSocat: true}, "socat"},
+		{"linux, modern netcat", remoteFacts{os: "Linux", hasNC: true, ncUnix: true, ncShutdown: true}, "nc -N -U"},
+		{"socat fallback", remoteFacts{os: "Linux", hasSocat: true}, "socat"},
+		{"traditional netcat with socat", remoteFacts{os: "Linux", hasNC: true, hasSocat: true}, "socat"},
+		// macOS netcat has -N, but there it takes a probe count for a write
+		// timeout rather than half-closing. Passing it OpenBSD-style fails
+		// outright, and this netcat needs no flag to close on stdin EOF.
+		{"macos remote", remoteFacts{os: "Darwin", hasNC: true, ncUnix: true, ncShutdown: true}, "nc -U"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -42,8 +45,9 @@ func TestClientCommandNamesTheFix(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]remoteFacts{
-		"netcat without -U": {hasNC: true},
-		"nothing at all":    {},
+		"netcat without -U":             {os: "Linux", hasNC: true},
+		"nothing at all":                {os: "Linux"},
+		"netcat that cannot half-close": {os: "Linux", hasNC: true, ncUnix: true},
 	}
 	for name, facts := range tests {
 		_, err := clientCommand(facts)
@@ -51,8 +55,8 @@ func TestClientCommandNamesTheFix(t *testing.T) {
 			t.Errorf("%s: clientCommand succeeded, want an error", name)
 			continue
 		}
-		if !strings.Contains(err.Error(), "netcat-openbsd") {
-			t.Errorf("%s: err = %v, want it to name the package that fixes it", name, err)
+		if !strings.Contains(err.Error(), "netcat-openbsd") && !strings.Contains(err.Error(), "socat") {
+			t.Errorf("%s: err = %v, want it to name something that fixes it", name, err)
 		}
 	}
 }
@@ -366,5 +370,38 @@ func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 	// escaped or a filename with a quote produces a parse error on the daemon.
 	if !strings.Contains(block, "sed 's/") {
 		t.Errorf("the pipe form does not escape the name for JSON:\n%s", block)
+	}
+}
+
+// TestMacOSRemoteDoesNotGetTheOpenBSDFlag is the case the OS probe exists for.
+//
+// Both netcats advertise -N, so a check for the flag's presence cannot tell
+// them apart. On macOS it takes a probe count for a write timeout, and passing
+// it the way OpenBSD's is passed fails with "invalid tcp adaptive write
+// timeout value" on every copy — after setup has already reported success.
+func TestMacOSRemoteDoesNotGetTheOpenBSDFlag(t *testing.T) {
+	t.Parallel()
+
+	got, err := clientCommand(remoteFacts{
+		os: "Darwin", hasNC: true, ncUnix: true, ncShutdown: true,
+	})
+	if err != nil {
+		t.Fatalf("clientCommand: %v", err)
+	}
+	if strings.Contains(got, "-N") {
+		t.Errorf("clientCommand = %q, want no -N on a macOS remote", got)
+	}
+	if !strings.Contains(got, "-U") {
+		t.Errorf("clientCommand = %q, want it to still use the socket", got)
+	}
+}
+
+// TestProbeAsksForTheOperatingSystem: the client choice depends on it, so it
+// has to be collected rather than assumed.
+func TestProbeAsksForTheOperatingSystem(t *testing.T) {
+	t.Parallel()
+
+	if !strings.Contains(probeScript, "uname -s") {
+		t.Errorf("the probe does not ask the host what it is:\n%s", probeScript)
 	}
 }

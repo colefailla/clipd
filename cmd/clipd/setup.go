@@ -49,6 +49,7 @@ func sshMarkers(host string) (start, end string) {
 // the entire class of problem.
 const probeScript = `
 printf 'home=%s\n' "$HOME"
+printf 'os=%s\n' "$(uname -s)"
 printf 'shell=%s\n' "${SHELL:-/bin/sh}"
 if command -v tar >/dev/null 2>&1; then printf 'tar=yes\n'; fi
 if command -v nc >/dev/null 2>&1; then
@@ -62,6 +63,7 @@ if command -v socat >/dev/null 2>&1; then printf 'socat=yes\n'; fi
 // remoteFacts is what the probe learned.
 type remoteFacts struct {
 	home       string
+	os         string
 	shell      string
 	hasTar     bool
 	hasNC      bool
@@ -249,6 +251,8 @@ func probe(ctx context.Context, host, control string) (remoteFacts, error) {
 		switch key {
 		case "home":
 			facts.home = strings.TrimRight(value, "/")
+		case "os":
+			facts.os = value
 		case "shell":
 			facts.shell = value
 		case "tar":
@@ -278,15 +282,25 @@ func probe(ctx context.Context, host, control string) (remoteFacts, error) {
 // leaving the user to decode "invalid option -- 'U'".
 func clientCommand(f remoteFacts) (string, error) {
 	switch {
+	case f.os == "Darwin" && f.hasNC && f.ncUnix:
+		// macOS ships its own netcat, where -N is not the half-close flag at
+		// all — it takes a probe count for a write timeout, and passing it the
+		// way OpenBSD's is passed fails with "invalid tcp adaptive write
+		// timeout value". This netcat closes the socket on stdin EOF anyway,
+		// so the flag is not needed. Checked ahead of the -N cases because the
+		// flag is present here and means something else.
+		return `nc -U "$sock"`, nil
 	case f.hasNC && f.ncUnix && f.ncShutdown:
 		return `nc -N -U "$sock"`, nil
-	case f.hasNC && f.ncUnix:
-		// Without -N, nc keeps the connection open after stdin ends and waits
-		// for the daemon to hang up first. The daemon's acknowledgement is
-		// what releases it, so this works — it just cannot half-close early.
-		return `nc -U "$sock"`, nil
 	case f.hasSocat:
 		return `socat - UNIX-CLIENT:"$sock"`, nil
+	case f.hasNC && f.ncUnix:
+		// -U but no -N, on something that is not macOS: netcat-openbsd from
+		// before the flag existed. Without a half-close the daemon never sees
+		// the end of the message, so it never replies and the client waits out
+		// its deadline. socat is preferred above; reaching here means there is
+		// none.
+		return "", fmt.Errorf("the host's netcat cannot half-close a connection (no -N flag), so a copy would hang: install a newer netcat-openbsd, or socat")
 	case f.hasNC:
 		return "", fmt.Errorf("the host's netcat has no -U flag, so it cannot use a UNIX socket: install netcat-openbsd (Debian/Ubuntu) or socat")
 	default:
