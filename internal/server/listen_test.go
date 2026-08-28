@@ -1,11 +1,14 @@
 package server
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/colefailla/clipd/internal/clipboard"
 )
 
 // TestListenRemovesAStaleSocket pins the recovery that makes the daemon
@@ -43,9 +46,12 @@ func TestListenRemovesAStaleSocket(t *testing.T) {
 	defer got.Close()
 }
 
-// TestListenRefusesALiveSocket is the other half: a socket that answers
-// belongs to a running daemon, and taking it would leave two daemons fighting
-// over one path.
+// TestListenRefusesALiveSocket is the other half: a socket a daemon answers on
+// belongs to that daemon, and taking it would leave two fighting over one path.
+//
+// The daemon has to actually be serving, because "live" now means it identified
+// itself. A bound socket with nothing behind it is a different case, covered
+// below.
 func TestListenRefusesALiveSocket(t *testing.T) {
 	t.Parallel()
 
@@ -56,7 +62,13 @@ func TestListenRefusesALiveSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Listen: %v", err)
 	}
-	defer first.Close()
+	srv, err := New(Options{Clipboard: &clipboard.Fake{}, MaxPayload: 1024})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Serve(ctx, first)
 
 	_, err = Listen(path)
 	if err == nil {
@@ -64,6 +76,37 @@ func TestListenRefusesALiveSocket(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "already listening") {
 		t.Errorf("err = %v, want it to say a daemon is already listening", err)
+	}
+}
+
+// TestListenRefusesAForeignSocket covers the case a bare dial could not see.
+//
+// Something is bound to the path and accepting connections, but it does not
+// answer as clipd. Deleting it would be taking over another program's socket,
+// and a forwarded connection delivered to it would hand that program the
+// clipboard content — so the daemon refuses to start instead.
+func TestListenRefusesAForeignSocket(t *testing.T) {
+	t.Parallel()
+
+	dir := shortTempDir(t)
+	path := filepath.Join(dir, "s.sock")
+
+	other, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("seed listener: %v", err)
+	}
+	defer other.Close()
+
+	_, err = Listen(path)
+	if err == nil {
+		t.Fatal("Listen took over a socket belonging to something else")
+	}
+	if !strings.Contains(err.Error(), "did not answer as clipd") {
+		t.Errorf("err = %v, want it to say the listener is not clipd", err)
+	}
+	// The other listener's socket is still its own.
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Errorf("the foreign socket was disturbed: %v, %v", info, err)
 	}
 }
 

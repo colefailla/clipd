@@ -10,6 +10,7 @@ import (
 
 	"github.com/colefailla/clipd/internal/clipboard"
 	"github.com/colefailla/clipd/internal/config"
+	"github.com/colefailla/clipd/internal/drop"
 	"github.com/colefailla/clipd/internal/server"
 )
 
@@ -87,6 +88,12 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		"config", cfgPath,
 		"drop_dir", resolvedDrop,
 		"max_payload_bytes", cfg.MaxPayloadBytes)
+	// A drop that was interrupted by a crash or a power cut leaves a staging
+	// file behind, and nothing else will ever clear it up.
+	if n := drop.CleanStale(resolvedDrop); n > 0 {
+		logger.Info("removed incomplete drops left by a previous run", "count", n)
+	}
+
 	if !server.IsSocketPath(cfg.Address) {
 		// Worth saying every time. Nothing in this daemon authenticates, so a
 		// TCP listener is only ever safe on the loopback interface, and the

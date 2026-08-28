@@ -91,7 +91,7 @@ func TestShellFunctionIsValidShell(t *testing.T) {
 		t.Skip("no sh available")
 	}
 
-	clients := []string{`nc -N -U "$sock"`, `nc -U "$sock"`, `socat - UNIX-CLIENT:"$sock"`}
+	clients := []string{`nc -N -U "$_clipd_sock"`, `nc -U "$_clipd_sock"`, `socat - UNIX-CLIENT:"$_clipd_sock"`}
 	for _, client := range clients {
 		for _, hasTar := range []bool{true, false} {
 			block := shellFunction(client, "/home/cole/.clipd.sock", hasTar)
@@ -111,17 +111,19 @@ func TestShellFunctionIsValidShell(t *testing.T) {
 func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$sock"`, "/home/cole/.clipd.sock", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd.sock", true)
 
 	if !strings.Contains(block, `clipd:magic:v1\n{"type":"drop"}\n`) {
 		t.Errorf("the drop path does not emit the magic frame:\n%s", block)
 	}
-	if !strings.Contains(block, `COPYFILE_DISABLE=1 tar cf - "$@"`) {
-		t.Errorf("the drop path does not pipe a tar stream:\n%s", block)
+	// The -- is load-bearing: without it a file named
+	// "--use-compress-program=curl" is read by tar as an option and executed.
+	if !strings.Contains(block, `COPYFILE_DISABLE=1 tar cf - -- "$@"`) {
+		t.Errorf("the drop path does not pipe a tar stream with -- :\n%s", block)
 	}
 	// The socket check has to come first: without it, a session opened before
 	// setup ran fails with a netcat error instead of an explanation.
-	if !strings.Contains(block, `if [ ! -S "$sock" ]`) {
+	if !strings.Contains(block, `if [ ! -S "$_clipd_sock" ]`) {
 		t.Errorf("the function does not check the socket exists:\n%s", block)
 	}
 	if !strings.HasPrefix(block, blockStart) || !strings.HasSuffix(strings.TrimSpace(block), blockEnd) {
@@ -132,7 +134,7 @@ func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 func TestShellFunctionRefusesDropWithoutTar(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$sock"`, "/home/cole/.clipd.sock", false)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd.sock", false)
 	if strings.Contains(block, "tar cf") {
 		t.Errorf("the function uses tar on a host that has none:\n%s", block)
 	}
@@ -146,8 +148,11 @@ func TestStripBlockRemovesAManagedSection(t *testing.T) {
 
 	start, end := sshMarkers("debian")
 	give := "Host other\n  User someone\n\n" +
-		start + "\nHost debian\n  RemoteForward a:b\n" + end + "\n\nHost third\n  User x\n"
-	got := stripBlock(give, start, end)
+		start + "\nHost debian\n  RemoteForward \"/home/c/.clipd/socket\" \"/Users/c/.clipd.sock\"\n" + end + "\n\nHost third\n  User x\n"
+	got, err := stripBlock(give, start, end)
+	if err != nil {
+		t.Fatalf("stripBlock: %v", err)
+	}
 
 	if strings.Contains(got, "RemoteForward") || strings.Contains(got, start) {
 		t.Errorf("the managed block survived:\n%s", got)
@@ -164,7 +169,11 @@ func TestStripBlockLeavesUnmanagedFilesAlone(t *testing.T) {
 
 	start, end := sshMarkers("debian")
 	give := "Host debian\n  User cole\n  RemoteForward mine:yours"
-	if got := stripBlock(give, start, end); got != give {
+	got, err := stripBlock(give, start, end)
+	if err != nil {
+		t.Fatalf("stripBlock: %v", err)
+	}
+	if got != give {
 		t.Errorf("stripBlock changed an unmanaged file:\n%s", got)
 	}
 }
@@ -176,9 +185,9 @@ func TestInstallSSHConfigIsIdempotent(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	start, end := sshMarkers("debian")
-	block := start + "\nHost debian\n  RemoteForward a:b\n" + end + "\n"
+	block := start + "\nHost debian\n  RemoteForward \"/home/c/.clipd/socket\" \"/Users/c/.clipd.sock\"\n" + end + "\n"
 
-	path, changed, err := installSSHConfig("debian", block)
+	path, changed, err := installSSHConfig(t.Context(), "debian", block)
 	if err != nil {
 		t.Fatalf("first install: %v", err)
 	}
@@ -186,7 +195,7 @@ func TestInstallSSHConfigIsIdempotent(t *testing.T) {
 		t.Error("the first install reported no change")
 	}
 
-	_, changed, err = installSSHConfig("debian", block)
+	_, changed, err = installSSHConfig(t.Context(), "debian", block)
 	if err != nil {
 		t.Fatalf("second install: %v", err)
 	}
@@ -220,8 +229,8 @@ func TestInstallSSHConfigPreservesAndBacksUp(t *testing.T) {
 	}
 
 	start, end := sshMarkers("debian")
-	block := start + "\nHost debian\n  RemoteForward a:b\n" + end + "\n"
-	if _, _, err := installSSHConfig("debian", block); err != nil {
+	block := start + "\nHost debian\n  RemoteForward \"/home/c/.clipd/socket\" \"/Users/c/.clipd.sock\"\n" + end + "\n"
+	if _, _, err := installSSHConfig(t.Context(), "debian", block); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 
@@ -232,7 +241,7 @@ func TestInstallSSHConfigPreservesAndBacksUp(t *testing.T) {
 	if !strings.Contains(string(data), "IdentityFile ~/.ssh/work_ed25519") {
 		t.Errorf("the existing configuration was lost:\n%s", data)
 	}
-	if !strings.Contains(string(data), "RemoteForward a:b") {
+	if !strings.Contains(string(data), "RemoteForward \"/home/c/.clipd/socket\"") {
 		t.Errorf("the forward was not added:\n%s", data)
 	}
 
@@ -250,7 +259,7 @@ func TestInstallSSHConfigWritesRestrictivePermissions(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	start, end := sshMarkers("debian")
-	path, _, err := installSSHConfig("debian", start+"\nHost debian\n"+end+"\n")
+	path, _, err := installSSHConfig(t.Context(), "debian", start+"\nHost debian\n"+end+"\n")
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -270,16 +279,86 @@ func TestInstallSSHConfigWritesRestrictivePermissions(t *testing.T) {
 func TestHostPatternStripsTheUser(t *testing.T) {
 	t.Parallel()
 
-	tests := map[string]string{
-		"debian":            "debian",
-		"cole@debian":       "debian",
-		"cole@debian.local": "debian.local",
-		"root@10.0.0.5":     "10.0.0.5",
+	tests := map[string]struct{ user, host string }{
+		"debian":            {"", "debian"},
+		"cole@debian":       {"cole", "debian"},
+		"cole@debian.local": {"cole", "debian.local"},
+		"root@10.0.0.5":     {"root", "10.0.0.5"},
 	}
 	for give, want := range tests {
-		if got := hostPattern(give); got != want {
-			t.Errorf("hostPattern(%q) = %q, want %q", give, got, want)
+		user, host := splitDestination(give)
+		if user != want.user || host != want.host {
+			t.Errorf("splitDestination(%q) = %q, %q; want %q, %q", give, user, host, want.user, want.host)
 		}
+	}
+}
+
+// TestSSHBlockScopesToTheUser: ssh strips the user before matching Host
+// patterns, so `Host server` applies to every account on that machine. Setting
+// up bob@server then replaced alice's block and pointed her connections at
+// bob's home directory, where the forward fails with a permission error.
+func TestSSHBlockScopesToTheUser(t *testing.T) {
+	t.Parallel()
+
+	withUser, err := sshBlockFor("alice@server", "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
+	if err != nil {
+		t.Fatalf("sshBlockFor: %v", err)
+	}
+	if !strings.Contains(withUser, `Match host "server" user "alice"`) {
+		t.Errorf("a user-qualified destination did not produce a Match block:\n%s", withUser)
+	}
+
+	bare, err := sshBlockFor("server", "/home/c/.clipd/socket", "/Users/c/.clipd.sock")
+	if err != nil {
+		t.Fatalf("sshBlockFor: %v", err)
+	}
+	if !strings.Contains(bare, `Host "server"`) {
+		t.Errorf("a bare destination did not produce a Host block:\n%s", bare)
+	}
+	// Both halves of the socket's protection on a shared remote host.
+	for _, want := range []string{"StreamLocalBindMask 0177", "StreamLocalBindUnlink yes"} {
+		if !strings.Contains(bare, want) {
+			t.Errorf("the block is missing %q:\n%s", want, bare)
+		}
+	}
+}
+
+// TestSSHBlockRefusesAWideningPattern: `clipd setup '*'` would write a stanza
+// matching every host, so the forward is attempted on every connection.
+func TestSSHBlockRefusesAWideningPattern(t *testing.T) {
+	t.Parallel()
+
+	for _, destination := range []string{"*", "web?", "!prod", "a b"} {
+		if _, err := sshBlockFor(destination, "/r/socket", "/l/socket"); err == nil {
+			t.Errorf("sshBlockFor(%q) wrote a block for a pattern, not a host", destination)
+		}
+	}
+}
+
+// TestSSHBlockQuotesAndEscapes: a path with a space splits into the wrong
+// number of arguments unquoted, and ssh expands %h and friends inside these
+// values whatever the quoting.
+func TestSSHBlockQuotesAndEscapes(t *testing.T) {
+	t.Parallel()
+
+	block, err := sshBlockFor("server", "/home/100%real/my socket", "/Users/c/.clipd.sock")
+	if err != nil {
+		t.Fatalf("sshBlockFor: %v", err)
+	}
+	if !strings.Contains(block, `"/home/100%%real/my socket"`) {
+		t.Errorf("the remote path was not quoted and percent-escaped:\n%s", block)
+	}
+}
+
+// TestStripBlockRefusesAnUnmatchedMarker: the previous version skipped from a
+// start marker to the end of the file looking for a close that was not there,
+// so a half-deleted block took the rest of ~/.ssh/config with it.
+func TestStripBlockRefusesAnUnmatchedMarker(t *testing.T) {
+	t.Parallel()
+
+	content := "Host keep\n  User me\n" + blockStart + "\nHost gone\n"
+	if _, err := stripBlock(content, blockStart, blockEnd); err == nil {
+		t.Error("stripBlock accepted an unmatched start marker")
 	}
 }
 
@@ -294,8 +373,8 @@ func TestSeveralHostsCoexist(t *testing.T) {
 	hosts := []string{"debian", "debian.local", "10.0.0.5"}
 	for _, h := range hosts {
 		start, end := sshMarkers(h)
-		block := start + "\nHost " + h + "\n  RemoteForward /home/c/.clipd.sock:/Users/c/.clipd.sock\n" + end + "\n"
-		if _, _, err := installSSHConfig(h, block); err != nil {
+		block := start + "\nHost " + h + "\n  RemoteForward \"/home/c/.clipd/socket\" \"/Users/c/.clipd.sock\"\n" + end + "\n"
+		if _, _, err := installSSHConfig(t.Context(), h, block); err != nil {
 			t.Fatalf("setup %s: %v", h, err)
 		}
 	}
@@ -322,14 +401,14 @@ func TestLegacyUnhostedBlockIsReplaced(t *testing.T) {
 	if err := os.MkdirAll(sshDir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	legacy := blockStart + "\nHost debian\n  RemoteForward old:old\n" + blockEnd + "\n"
+	legacy := blockStart + "\nHost debian\n  RemoteForward \"/home/c/.clipd/socket\" \"/Users/c/.clipd.sock\"\n" + blockEnd + "\n"
 	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(legacy), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	start, end := sshMarkers("debian")
-	block := start + "\nHost debian\n  RemoteForward new:new\n" + end + "\n"
-	if _, _, err := installSSHConfig("debian", block); err != nil {
+	block := start + "\nHost debian\n  RemoteForward \"/home/c/.clipd/new\" \"/Users/c/.clipd.sock\"\n" + end + "\n"
+	if _, _, err := installSSHConfig(t.Context(), "debian", block); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 
@@ -340,36 +419,84 @@ func TestLegacyUnhostedBlockIsReplaced(t *testing.T) {
 	if strings.Contains(string(data), "old:old") {
 		t.Errorf("the legacy block survived, forwarding the socket twice:\n%s", data)
 	}
-	if !strings.Contains(string(data), "new:new") {
+	if !strings.Contains(string(data), "/home/c/.clipd/new") {
 		t.Errorf("the new block is missing:\n%s", data)
 	}
 }
 
 // TestShellFunctionHandlesBothDropForms pins the two shapes the daemon
-// distinguishes: files on the command line become a tar, and a pipeline
-// becomes one named stream.
+// distinguishes: files on the command line become a tar, and --name sends this
+// shell's stdin under a name of its own.
+//
+// The distinction used to be drawn from whether stdin was a terminal, which
+// made `ssh host 'clipd drop report.pdf'` — and every drop from a script or a
+// cron job — send a header with no body, creating an empty file under the right
+// name and reporting success.
 func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$sock"`, "/home/cole/.clipd.sock", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
 
-	if !strings.Contains(block, "if [ -t 0 ]; then") {
-		t.Errorf("the function does not branch on whether stdin is a pipe:\n%s", block)
+	if strings.Contains(block, "[ -t 0 ]") {
+		t.Errorf("the function still infers the drop form from the terminal:\n%s", block)
 	}
-	if !strings.Contains(block, `COPYFILE_DISABLE=1 tar cf - "$@"`) {
+	if !strings.Contains(block, `if [ "${1:-}" = "--name" ]`) {
+		t.Errorf("the function does not branch on an explicit --name:\n%s", block)
+	}
+	if !strings.Contains(block, `COPYFILE_DISABLE=1 tar cf - -- "$@"`) {
 		t.Errorf("the file form does not tar its arguments:\n%s", block)
 	}
 	if !strings.Contains(block, `"name":"%s"`) {
-		t.Errorf("the pipe form does not send a name:\n%s", block)
-	}
-	// A nameless file in the drop directory is worse than an ugly one.
-	if !strings.Contains(block, "drop-$(date") {
-		t.Errorf("the pipe form invents no name when none is given:\n%s", block)
+		t.Errorf("the --name form does not send a name:\n%s", block)
 	}
 	// The name lands inside a JSON string, so those two characters must be
 	// escaped or a filename with a quote produces a parse error on the daemon.
 	if !strings.Contains(block, "sed 's/") {
-		t.Errorf("the pipe form does not escape the name for JSON:\n%s", block)
+		t.Errorf("the --name form does not escape the name for JSON:\n%s", block)
+	}
+}
+
+// TestShellFunctionSurvivesNounset: a plain `printf x | clipd` passes no
+// arguments, and expanding $1 unguarded aborted the whole shell under `set -u`.
+func TestShellFunctionSurvivesNounset(t *testing.T) {
+	t.Parallel()
+
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	if strings.Contains(block, `"$1"`) {
+		t.Errorf("the function expands $1 unguarded:\n%s", block)
+	}
+	if !strings.Contains(block, `"${1:-}"`) {
+		t.Errorf("the function does not guard its first argument:\n%s", block)
+	}
+}
+
+// TestShellFunctionReportsFailureAsExitStatus: the daemon's reply is the only
+// thing that knows whether a drop was accepted, and a pipeline reports only
+// netcat's status. Without this, `clipd drop x && rm x` deleted files the
+// daemon had refused.
+func TestShellFunctionReportsFailureAsExitStatus(t *testing.T) {
+	t.Parallel()
+
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	if !strings.Contains(block, "'clipd: ok: '*) return 0 ;;") {
+		t.Errorf("the function does not turn the daemon's reply into an exit status:\n%s", block)
+	}
+	// tar's own status is lost in the pipeline unless it is carried out of it.
+	if !strings.Contains(block, "_clipd_tar") {
+		t.Errorf("the function does not recover tar's exit status:\n%s", block)
+	}
+}
+
+// TestShellFunctionDoesNotLeakVariables: this runs in the user's interactive
+// shell, where a bare `name` or `sock` would overwrite one of theirs.
+func TestShellFunctionDoesNotLeakVariables(t *testing.T) {
+	t.Parallel()
+
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	for _, bare := range []string{"\n  sock=", "\n      name=", "\n      esc="} {
+		if strings.Contains(block, bare) {
+			t.Errorf("the function assigns an unprefixed variable %q:\n%s", bare, block)
+		}
 	}
 }
 

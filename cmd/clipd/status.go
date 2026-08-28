@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"runtime"
 	"time"
@@ -38,7 +37,7 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 	switch {
 	case !config.Exists(path):
 		fmt.Fprintf(out, "  file         %s (not created; using defaults)\n", path)
-	case staleConfig(ctx, path):
+	case staleConfig(ctx, path, cfg):
 		// The values printed below come from the file, but the daemon read it
 		// once at startup. Without this line status reports an edit as though
 		// it had taken effect, which is worse than not reporting it at all.
@@ -81,8 +80,8 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 // question being asked — has the file changed since this daemon read it —
 // without having to ask launchd anything or have the daemon report its own
 // uptime.
-func staleConfig(ctx context.Context, path string) bool {
-	cfg, err := os.Stat(path)
+func staleConfig(ctx context.Context, path string, cfg config.Config) bool {
+	info, err := os.Stat(path)
 	if err != nil {
 		return false
 	}
@@ -91,20 +90,20 @@ func staleConfig(ctx context.Context, path string) bool {
 		// Nothing running, so nothing to be out of date with.
 		return false
 	}
-	started, err := daemonStart()
+	started, err := daemonStart(cfg)
 	if err != nil {
 		return false
 	}
-	return cfg.ModTime().After(started)
+	return info.ModTime().After(started)
 }
 
 // daemonStart returns when the listening socket was created, which is when the
 // running daemon came up.
-func daemonStart() (time.Time, error) {
-	cfg, _, err := loadConfig(&globalOptions{})
-	if err != nil {
-		return time.Time{}, err
-	}
+func daemonStart(cfg config.Config) (time.Time, error) {
+	// The caller's configuration, not a freshly resolved default one: with
+	// -config pointing elsewhere, reloading here compared the chosen file
+	// against a socket the default config named, and reported staleness for a
+	// daemon that was not the one being asked about.
 	if !server.IsSocketPath(cfg.Address) {
 		return time.Time{}, errors.New("not a socket")
 	}
@@ -124,12 +123,10 @@ func daemonStart() (time.Time, error) {
 func reportListener(out io.Writer, address string) int {
 	if !server.IsSocketPath(address) {
 		fmt.Fprintf(out, "  address      %s (TCP — no authentication; loopback only)\n", address)
-		conn, err := net.Dial("tcp", address)
-		if err != nil {
+		if err := server.Ping("tcp", address); err != nil {
 			fmt.Fprintf(out, "  daemon       not answering (%v)\n", err)
 			return exitFailure
 		}
-		conn.Close()
 		fmt.Fprintf(out, "  daemon       answering\n")
 		return exitOK
 	}
@@ -152,15 +149,20 @@ func reportListener(out io.Writer, address string) int {
 	}
 	fmt.Fprintf(out, "  mode         %04o\n", info.Mode().Perm())
 
-	// Dialling is the only way to tell a live socket from one a killed daemon
-	// left behind, and the difference matters: a stale file looks identical in
-	// a directory listing but accepts nothing.
-	conn, err := net.Dial("unix", path)
-	if err != nil {
-		fmt.Fprintf(out, "  daemon       not running (stale socket: %v)\n", err)
+	// Asking the listener to identify itself is the only way to tell a live
+	// socket from one a killed daemon left behind — a stale file looks
+	// identical in a directory listing but accepts nothing. It is a ping rather
+	// than a bare connect-and-close because that was indistinguishable from a
+	// zero-byte clipboard message, so checking the daemon's status used to
+	// clear the clipboard it was reporting on.
+	if err := server.Ping("unix", path); err != nil {
+		if errors.Is(err, server.ErrNotClipd) {
+			fmt.Fprintf(out, "  daemon       %v\n", err)
+		} else {
+			fmt.Fprintf(out, "  daemon       not running (stale socket: %v)\n", err)
+		}
 		return exitFailure
 	}
-	conn.Close()
 	fmt.Fprintf(out, "  daemon       listening\n")
 	return exitOK
 }

@@ -40,23 +40,26 @@ one marker to the other. Your SSH config is backed up to config.clipd-backup
 before the first edit.`,
 
 	"drop": `clipd drop <file>...
-       <command> | clipd drop [name]
+       <command> | clipd drop --name <filename>
 
 Run on the remote host, not the Mac. Sends files to the Mac's drop directory
 (default ~/Drop).
 
   clipd drop report.pdf
   clipd drop src/*.go
-  pg_dump mydb | clipd drop dump.sql
-  journalctl -u nginx | clipd drop
+  pg_dump mydb | clipd drop --name dump.sql
+  journalctl -u nginx | clipd drop --name nginx.log
 
 With files named, they are packed with tar, so names, multiple files and whole
 directories survive the trip.
 
-In a pipeline there is no file and so no name, and one is taken from the
-argument instead. Without even that, a name is built from the clock —
-drop-20260826-143022.bin — because a nameless file in the drop directory is
-worse than an ugly one.
+A pipeline has no file and so no name, and --name supplies one. The flag is
+required rather than inferred: the two forms used to be told apart by whether
+stdin was a terminal, which meant that running a drop from a script, a cron job
+or 'ssh host clipd drop report.pdf' sent no file at all and reported success.
+
+The exit status is the daemon's answer, so 'clipd drop x && rm x' is safe: a
+drop the daemon rejected, or one whose tar failed partway, exits non-zero.
 
 What arrives is deliberately flattened: every file lands
 directly in the drop directory under its own basename, with no subdirectories

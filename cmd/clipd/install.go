@@ -37,19 +37,22 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 		return fail(e, exitConfig, err)
 	}
 
-	// The agent inherits no shell environment, so a non-default config path
-	// has to be pinned into the plist or the daemon would read the default.
-	// Pinned as an absolute path: launchd starts agents with / as the working
-	// directory, so a relative -config that worked for this command would
-	// leave the daemon reading a file that does not exist and crash-looping
-	// under KeepAlive.
+	// The agent inherits no shell environment, so the config path is pinned
+	// into the plist rather than left to be resolved again at startup.
+	//
+	// Pinned unconditionally, not only for an explicit -config. XDG_CONFIG_HOME
+	// selects the default path too, and launchd does not pass it on: the daemon
+	// read ~/.config/clipd/config.json while this command reported — and wrote
+	// — the file the variable pointed at.
+	//
+	// Absolute, because launchd starts agents with / as the working directory,
+	// so a relative path that worked for this command would leave the daemon
+	// reading a file that does not exist and crash-looping under KeepAlive.
 	opts := launchagent.Options{ExecutablePath: *execPath}
-	if g.configPath != "" || e.getenv(config.EnvConfig) != "" {
-		if abs, err := filepath.Abs(path); err == nil {
-			path = abs
-		}
-		opts.ConfigPath = path
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
 	}
+	opts.ConfigPath = path
 
 	res, err := launchagent.Install(ctx, opts)
 	if err != nil {

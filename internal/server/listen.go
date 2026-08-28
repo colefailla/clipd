@@ -1,13 +1,77 @@
 package server
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/colefailla/clipd/internal/protocol"
 )
+
+// pingTimeout bounds one identification exchange. Short, because the daemon
+// answers a ping without doing any work: anything slower than this is not a
+// healthy clipd whatever else it may be.
+const pingTimeout = 2 * time.Second
+
+// maxPingReply bounds what a ping will read back, so that a listener which is
+// not clipd cannot make the caller buffer without limit.
+const maxPingReply = 512
+
+// ErrNotClipd reports that something accepted the connection but did not
+// identify itself as clipd — including by saying nothing at all.
+var ErrNotClipd = errors.New("something is listening, but it did not answer as clipd")
+
+// Ping asks whatever is listening at address to identify itself, returning nil
+// only when a clipd daemon answered.
+//
+// This replaces connecting and closing immediately, which looked like a live
+// daemon whatever was on the other end — and which, on the wire, was
+// indistinguishable from a raw clipboard message of zero bytes, so every
+// `clipd status` cleared the clipboard it was reporting on.
+//
+// A dial failure is returned as it is; anything that goes wrong after the
+// connection is accepted is wrapped in ErrNotClipd, so a caller can tell
+// "nothing there" from "something there that is not this daemon". Deleting a
+// socket file is only ever safe on the first.
+func Ping(network, address string) error {
+	conn, err := net.DialTimeout(network, address, pingTimeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := exchangePing(conn); err != nil {
+		// Both errors stay in the chain: callers test for ErrNotClipd, and
+		// probeSocket also needs to know whether the failure was a timeout.
+		return fmt.Errorf("%w (%w)", ErrNotClipd, err)
+	}
+	return nil
+}
+
+// exchangePing sends the ping frame and checks the reply.
+func exchangePing(conn net.Conn) error {
+	if err := conn.SetDeadline(time.Now().Add(pingTimeout)); err != nil {
+		return err
+	}
+	if _, err := conn.Write(protocol.Ping); err != nil {
+		return err
+	}
+	line, err := bufio.NewReader(io.LimitReader(conn, maxPingReply)).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if !strings.HasPrefix(line, protocol.StatusOK+protocol.Pong) {
+		return fmt.Errorf("unexpected reply %q", line)
+	}
+	return nil
+}
 
 // Listen opens the daemon's listening socket.
 //
@@ -82,11 +146,12 @@ func Listen(address string) (net.Listener, error) {
 // from a second daemon actually running, and the daemon crash-loops under
 // launchd's KeepAlive until someone deletes the file by hand.
 //
-// Dialling it settles the question. If something answers, a live daemon owns
-// the path and this one has no business taking it. If nothing does, the file
-// is a corpse and can be removed. This is wincent/clipper's approach, and it
-// is the fix for a failure mode that is otherwise very hard to diagnose from
-// the symptom.
+// Asking it settles the question. If a clipd daemon answers, it owns the path
+// and this one has no business taking it. If nothing accepts the connection,
+// the file is a corpse and can be removed. This is wincent/clipper's approach,
+// with the addition that the listener has to identify itself: a bare dial
+// proves only that something accepted, which is also true of a daemon that is
+// not clipd, and of a socket whose owner exited a moment ago.
 func prepareSocketPath(path string) error {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
@@ -101,14 +166,70 @@ func prepareSocketPath(path string) error {
 		// the daemon wanted is not a trade the daemon gets to make.
 		return fmt.Errorf("%s exists and is not a socket; move it or choose another address", path)
 	}
-	if conn, err := net.Dial("unix", path); err == nil {
-		conn.Close()
+
+	switch probeSocket(path) {
+	case socketLive:
 		return fmt.Errorf("a clipd daemon is already listening on %s", path)
+	case socketForeign:
+		// Something accepted and did not answer as clipd. Not ours to delete,
+		// for the same reason a non-socket file is not: it belongs to whoever
+		// put it there. A clipd daemon too busy to reply also lands here, which
+		// is the safe way round — refusing to start is recoverable, deleting a
+		// running daemon's socket is not.
+		return fmt.Errorf("%s is in use by something that did not answer as clipd; stop it or choose another address", path)
 	}
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("remove stale socket %s: %w", path, err)
 	}
 	return nil
+}
+
+// socketState is what probeSocket concluded about an existing socket file.
+type socketState int
+
+const (
+	socketDead socketState = iota
+	socketLive
+	socketForeign
+)
+
+// probeAttempts and probeGap bound the retry in probeSocket.
+const (
+	probeAttempts = 3
+	probeGap      = 50 * time.Millisecond
+)
+
+// probeSocket decides whether a socket file has a clipd daemon behind it.
+//
+// Retried, and the last attempt is what counts, because a single dial is not a
+// reliable answer: on Darwin a socket whose owner has just exited can still
+// accept a connection for a moment, which reports a live daemon that is already
+// gone and leaves the new one refusing to start. A genuinely dead socket
+// refuses every later attempt, so the last one is the honest one.
+func probeSocket(path string) socketState {
+	state := socketDead
+	for attempt := 0; attempt < probeAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(probeGap)
+		}
+		switch err := Ping("unix", path); {
+		case err == nil:
+			return socketLive
+		case errors.Is(err, ErrNotClipd):
+			// A listener that accepts and then says nothing will say nothing on
+			// the next attempt either, so there is no point spending another
+			// timeout on it. The retry below exists for the socket that fails
+			// fast — the one whose owner has just exited — not for this.
+			if isTimeout(err) {
+				return socketForeign
+			}
+			state = socketForeign
+		default:
+			// Nothing accepted the connection on this attempt.
+			state = socketDead
+		}
+	}
+	return state
 }
 
 // requireLoopback rejects any TCP address the network could reach.

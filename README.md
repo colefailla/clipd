@@ -8,8 +8,8 @@ connection you already have.
 ```bash
 ssh debian
 tail -50 error.log | clipd        # now in the Mac's clipboard
-clipd drop report.pdf             # now in the Mac's ~/Drop
-pg_dump mydb | clipd drop db.sql  # output that never touched disk
+clipd drop report.pdf                    # now in the Mac's ~/Drop
+pg_dump mydb | clipd drop --name db.sql  # output that never touched disk
 ```
 
 **Nothing is installed on the remote machine.** `clipd` there is a shell
@@ -101,6 +101,14 @@ Reconnect for the forward to take effect:
 ssh -O exit debian 2>/dev/null; ssh debian
 ```
 
+Run it once per host you use. Both halves — the remote function and the local
+`Host` block — are written together, so hosts you have not re-run it on keep
+working as they were; they just do not get the newer behaviour until you do.
+
+Setting up two accounts on the same machine works: `alice@server` and
+`bob@server` get separate blocks, scoped with `Match ... user`, rather than the
+second replacing the first.
+
 ### Why it probes
 
 `nc` is not one program. Several unrelated implementations share the name, they
@@ -149,16 +157,19 @@ ls -l | clipd                       # copy stdout
 clipd < notes.txt                   # copy a file's contents
 cat ~/.ssh/id_ed25519.pub | clipd   # grab a public key
 
-clipd drop report.pdf               # send a file to ~/Drop
-clipd drop src/*.go                 # send several
-pg_dump mydb | clipd drop db.sql    # send output as a file
-journalctl -u nginx | clipd drop    # name invented from the clock
+clipd drop report.pdf                        # send a file to ~/Drop
+clipd drop src/*.go                          # send several
+pg_dump mydb | clipd drop --name db.sql      # send output as a file
+journalctl -u nginx | clipd drop --name n.log
 ```
 
-The last two forms matter when the thing you want has no file on disk. With
-arguments, `tar` carries the names; in a pipeline there is nothing to name, so
-you supply one — or let the daemon build `drop-20260826-143022.bin` rather than
-lose the bytes.
+`--name` matters when the thing you want has no file on disk. With arguments,
+`tar` carries the names; in a pipeline there is nothing to name, so you supply
+one. The flag is required rather than guessed from whether stdin is a terminal,
+so a drop from a script or a cron job sends the file rather than an empty one.
+
+The exit status is the daemon's answer, which makes `clipd drop x && rm x` safe:
+a rejected drop, or one whose `tar` failed partway, exits non-zero.
 
 Content is sent byte for byte — newlines, tabs and the trailing newline are
 preserved. Input over `max_payload_bytes` (10 MiB by default) is rejected rather
@@ -196,11 +207,20 @@ already has your files and your shell history on that machine.
 Two things limit what it can do:
 
 - **Bracketed paste**, on by default in modern shells, means pasted text ending
-  in a newline is not executed until you press Enter.
+  in a newline is not executed until you press Enter. This is a guard against
+  the accident, not a security boundary: it is the terminal's behaviour rather
+  than clipd's, and anything that can write to the socket can still put whatever
+  it likes on the clipboard.
 - **Dropped files** are flattened to basenames so an archive cannot write
-  outside the drop directory, are never overwritten, never made executable, and
-  carry macOS's quarantine attribute so Gatekeeper treats them like downloads.
-  Symlinks, hard links and device nodes in an archive are skipped.
+  outside the drop directory, are never overwritten, and are never made
+  executable. Symlinks, hard links and device nodes in an archive are skipped,
+  as are entries of any other type that declare a body. Completed files are
+  published under their real name only once fully written, so an interrupted
+  transfer cannot be mistaken for a finished one.
+- **Quarantine** is applied where it can be: files get macOS's quarantine
+  attribute so Gatekeeper treats them like downloads. It is best effort — a drop
+  that landed safely is not reported as failed because the label could not be
+  set — so it is defence in depth on top of the rules above, not one of them.
 
 `address` also takes a `host:port` instead of a socket, for remotes whose SSH
 cannot forward one — OpenSSH before 6.7, and Windows. It must be loopback;
@@ -249,7 +269,9 @@ under a running daemon, so a forgotten restart shows up rather than looking like
 a setting that did nothing.
 
 `max_payload_bytes` is capped at 1 GB, because clipboard content is held in
-memory. The drop limits have no ceiling — those stream to disk.
+memory, and it is also checked against `max_concurrent`: the daemon buffers a
+payload per message in flight, so it is the product that has to fit. The drop
+limits stream to disk and are capped far higher.
 
 Unknown keys are rejected rather than ignored, so a typo fails loudly.
 `CLIPD_CONFIG` is the only environment variable clipd reads.

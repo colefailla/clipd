@@ -151,6 +151,11 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
 		return res, fmt.Errorf("create LaunchAgents directory: %w", err)
 	}
+	// The plist as it stands, kept so a failed install can put it back. Without
+	// it, overwriting the file and then failing every bootstrap attempt left the
+	// user with no running daemon and no previous job to fall back on — the one
+	// outcome worse than the install simply not happening.
+	previous, hadPrevious := os.ReadFile(plistPath)
 	if err := os.WriteFile(plistPath, data, plistPerm); err != nil {
 		return res, fmt.Errorf("write %s: %w", plistPath, err)
 	}
@@ -186,6 +191,17 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 		case <-ctx.Done():
 			return res, ctx.Err()
 		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	// Every attempt failed, and the old job was booted out to make room for
+	// this one. Put the previous plist back and load it, so a failed upgrade
+	// leaves the daemon that was working before rather than nothing at all.
+	if hadPrevious == nil {
+		if err := os.WriteFile(plistPath, previous, plistPerm); err == nil {
+			if _, err := runLaunchctl(ctx, "bootstrap", domain, plistPath); err == nil {
+				return res, fmt.Errorf("load LaunchAgent: %w (the previous one was restored)", lastErr)
+			}
 		}
 	}
 	return res, fmt.Errorf("load LaunchAgent: %w", lastErr)

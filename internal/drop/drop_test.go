@@ -183,10 +183,10 @@ func TestExtractSkipsNonRegularEntries(t *testing.T) {
 	}
 }
 
-// TestExtractWillNotFollowAPlantedSymlink pins the reason createUnique uses
-// O_EXCL. With a symlink already sitting at the target name, an extraction
-// that opened it normally would write through the link to whatever it points
-// at.
+// TestExtractWillNotFollowAPlantedSymlink pins the reason publish uses
+// os.Link rather than os.Rename. With a symlink already sitting at the target
+// name, a rename would replace the link and an ordinary open would write
+// straight through it to whatever it points at; link refuses outright.
 func TestExtractWillNotFollowAPlantedSymlink(t *testing.T) {
 	t.Parallel()
 

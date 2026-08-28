@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,6 +56,32 @@ const maxNameBytes = 200
 // stat its way through an unbounded sequence by repeatedly dropping the same
 // name.
 const maxCollisionAttempts = 100
+
+// stagePrefix marks a drop that is still arriving.
+//
+// Bytes land under this prefix and take their real name only once they are
+// complete, so a crash, a power cut, or a shutdown that outruns its grace
+// period cannot leave a half-written file that looks exactly like a finished
+// one. The leading dot also keeps a transfer in progress out of an ordinary
+// listing of the drop directory.
+const stagePrefix = ".clipd-part-"
+
+// staleStageAge is how old a leftover staging file must be before CleanStale
+// will remove it. Long enough that no transfer could still be using it.
+const staleStageAge = time.Hour
+
+// wirePerEntry is the wire budget each archive entry gets for its framing, on
+// top of the bytes that reach disk: a 512-byte header, up to 511 bytes of
+// padding, and room for the PAX records a long name or a large size needs.
+const wirePerEntry = 4 << 10
+
+// maxNameInError bounds how much of an archive's own name is quoted back into
+// an error.
+//
+// A PAX header can carry a name approaching a megabyte, and every rejection
+// interpolates one — into a response, and into a log file launchd never
+// rotates.
+const maxNameInError = 80
 
 // Options configures an extraction. Dir is required; the limits fall back to
 // conservative defaults when unset.
@@ -129,28 +156,49 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 		res     Result
 		written []string
 	)
-	// Anything that goes wrong after the first file is written unwinds the
-	// whole drop: a partial archive on disk looks exactly like a complete one
-	// and there is no way for the user to tell them apart later.
-	cleanup := func() {
+	// fail unwinds the files this call created and returns the error the caller
+	// should see. Anything that goes wrong after the first file is written
+	// undoes the whole drop: a partial archive on disk looks exactly like a
+	// complete one, and there is no way for the user to tell them apart later.
+	//
+	// A removal that itself fails is reported rather than swallowed, because
+	// files left behind by a rejected drop are precisely the state this unwind
+	// exists to prevent.
+	fail := func(err error) (Result, error) {
+		stuck := 0
 		for _, path := range written {
-			_ = os.Remove(path)
+			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+				stuck++
+			}
 		}
+		if stuck > 0 {
+			return Result{}, fmt.Errorf("%w (and %d file(s) could not be removed from %s)",
+				err, stuck, opts.Dir)
+		}
+		return Result{}, err
 	}
 
-	tr := tar.NewReader(r)
-	for entries := 0; ; entries++ {
-		if entries >= maxEntries {
-			cleanup()
-			return Result{}, fmt.Errorf("drop: archive holds more than %d entries", maxEntries)
-		}
+	// The wire budget is the file bytes the caller allows, plus framing for the
+	// most entries the archive may hold. Both terms are bounded by config
+	// validation, so the sum cannot overflow.
+	budget := maxBytes + int64(maxEntries)*wirePerEntry
+	wire := &wireReader{r: r, remaining: budget}
+
+	tr := tar.NewReader(wire)
+	entries := 0
+	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			cleanup()
-			return Result{}, fmt.Errorf("drop: read archive: %w", err)
+			return fail(readError(err, budget))
+		}
+		// Counted after the header arrives rather than before it, so an archive
+		// holding exactly maxEntries is accepted rather than refused one short.
+		entries++
+		if entries > maxEntries {
+			return fail(fmt.Errorf("drop: archive holds more than %d entries", maxEntries))
 		}
 
 		// Only regular files. Everything else a tar can describe — symlinks,
@@ -158,39 +206,123 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 		// either a way to write outside Dir or a way to create something the
 		// sender has no business creating on this machine.
 		if header.Typeflag != tar.TypeReg {
+			// Skipping is not the same as ignoring. archive/tar discards a
+			// skipped entry's declared body from the wire on the next call, so
+			// an entry of an unsupported type that claims a huge size is a way
+			// to send unbounded data that never counts against MaxBytes,
+			// because none of it reaches disk. The wire budget above stops it
+			// eventually; refusing it here says why.
+			if header.Size > 0 {
+				return fail(fmt.Errorf("drop: archive entry %q is type %q and declares a %d byte body",
+					shortName(header.Name), rune(header.Typeflag), header.Size))
+			}
 			continue
 		}
 
 		name, err := safeName(header.Name)
 		if err != nil {
-			cleanup()
-			return Result{}, err
+			return fail(err)
 		}
 
 		if len(res.Names) >= maxFiles {
-			cleanup()
-			return Result{}, fmt.Errorf("drop: archive holds more than %d files", maxFiles)
+			return fail(fmt.Errorf("drop: archive holds more than %d files", maxFiles))
 		}
 
-		remaining := maxBytes - res.Bytes
-		path, n, err := writeFile(tr, opts.Dir, name, remaining)
-		if path != "" {
-			written = append(written, path)
+		staged, n, err := stage(tr, opts.Dir, maxBytes-res.Bytes)
+		if staged != "" {
+			written = append(written, staged)
 		}
 		if err != nil {
-			cleanup()
-			return Result{}, err
+			return fail(readError(err, budget))
 		}
+
+		// Marked before it is published, so the attribute is already on the
+		// inode by the time the file has a name a user could open.
+		quarantine(staged)
+		path, err := publish(staged, opts.Dir, name)
+		if err != nil {
+			return fail(err)
+		}
+		// The bytes now live under the published name; track that instead, so
+		// an unwind removes the file rather than a staging name that is gone.
+		written[len(written)-1] = path
 
 		res.Names = append(res.Names, filepath.Base(path))
 		res.Bytes += n
 	}
 
 	if len(res.Names) == 0 {
-		cleanup()
-		return Result{}, ErrNoFiles
+		return fail(ErrNoFiles)
 	}
 	return res, nil
+}
+
+// wireReader bounds the total bytes read from a peer for one archive.
+//
+// The other limits here count what is written, which a hostile archive can
+// decouple from what is sent. A run of PAX extended headers is consumed inside
+// archive/tar and never surfaces as an entry at all, so the entry counter never
+// advances and Next never returns; an entry whose type this package skips can
+// still declare a body the reader discards from the wire. Neither writes a
+// byte, so neither is caught by MaxBytes or MaxFiles, and every read refreshes
+// the connection's idle deadline — so both stream for as long as the sender
+// cares to keep going. This is the one bound that does not depend on the
+// archive's account of itself.
+type wireReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+// errWireLimit is internal: readError turns it into something a user can act
+// on, since "wire limit" surfacing out of archive/tar would say nothing.
+var errWireLimit = errors.New("drop: wire budget exhausted")
+
+func (w *wireReader) Read(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, errWireLimit
+	}
+	if int64(len(p)) > w.remaining {
+		p = p[:w.remaining]
+	}
+	n, err := w.r.Read(p)
+	w.remaining -= int64(n)
+	return n, err
+}
+
+// readError explains a failure that came back through archive/tar.
+func readError(err error, budget int64) error {
+	if errors.Is(err, errWireLimit) {
+		return fmt.Errorf("drop: sender exceeded the %d byte transfer budget for one archive", budget)
+	}
+	return fmt.Errorf("drop: read archive: %w", err)
+}
+
+// CleanStale removes staging files a daemon that did not shut down cleanly left
+// behind, and reports how many went.
+//
+// Only files old enough that no transfer could still be using them are touched,
+// so this is safe to call at startup without having to establish whether
+// anything else is writing to the directory.
+func CleanStale(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-staleStageAge)
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), stagePrefix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if os.Remove(filepath.Join(dir, entry.Name())) == nil {
+			removed++
+		}
+	}
+	return removed
 }
 
 // Save writes a single stream into opts.Dir under name.
@@ -217,11 +349,17 @@ func Save(r io.Reader, name string, opts Options) (Result, error) {
 		return Result{}, fmt.Errorf("drop: create %s: %w", opts.Dir, err)
 	}
 
-	path, n, err := writeFile(r, opts.Dir, safe, maxBytes)
+	staged, n, err := stage(r, opts.Dir, maxBytes)
 	if err != nil {
-		if path != "" {
-			_ = os.Remove(path)
+		if staged != "" {
+			_ = os.Remove(staged)
 		}
+		return Result{}, err
+	}
+	quarantine(staged)
+	path, err := publish(staged, opts.Dir, safe)
+	if err != nil {
+		_ = os.Remove(staged)
 		return Result{}, err
 	}
 	return Result{Names: []string{filepath.Base(path)}, Bytes: n}, nil
@@ -242,12 +380,12 @@ func safeName(raw string) (string, error) {
 
 	switch name {
 	case "", ".", "..", string(filepath.Separator):
-		return "", fmt.Errorf("drop: archive entry %q has no usable filename", raw)
+		return "", fmt.Errorf("drop: archive entry %q has no usable filename", shortName(raw))
 	}
 	if strings.ContainsRune(name, filepath.Separator) {
 		// Unreachable after Base, and checked anyway: this is the invariant
 		// the whole package rests on, and it costs one comparison to assert.
-		return "", fmt.Errorf("drop: archive entry %q resolved to a path", raw)
+		return "", fmt.Errorf("drop: archive entry %q resolved to a path", shortName(raw))
 	}
 	// Control characters are refused rather than escaped on output. The name
 	// is both written to disk and echoed back to the sender's terminal in the
@@ -255,7 +393,8 @@ func safeName(raw string) (string, error) {
 	// and an ANSI escape drives the terminal directly. Refusing them here fixes
 	// both at once, and no filename worth having contains one.
 	if i := strings.IndexFunc(name, isControl); i >= 0 {
-		return "", fmt.Errorf("drop: archive entry %q contains a control character at byte %d", raw, i)
+		return "", fmt.Errorf("drop: archive entry %q contains a control character at byte %d",
+			shortName(raw), i)
 	}
 	if len(name) > maxNameBytes {
 		return "", fmt.Errorf("drop: archive entry name exceeds %d bytes", maxNameBytes)
@@ -263,56 +402,96 @@ func safeName(raw string) (string, error) {
 	return name, nil
 }
 
-// isControl reports whether r is a C0 control character or DEL.
-func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
+// shortName bounds an archive's own name before it is quoted into an error.
+//
+// Truncation is on bytes and may split a rune, which is harmless: every use
+// site formats with %q, and that escapes an invalid byte rather than emitting
+// it.
+func shortName(raw string) string {
+	if len(raw) <= maxNameInError {
+		return raw
+	}
+	return raw[:maxNameInError] + "..."
+}
 
-// writeFile writes one entry, returning the path created and the bytes
-// written. The path is returned even on error so the caller can clean up a
-// partial file.
-func writeFile(r io.Reader, dir, name string, remaining int64) (string, int64, error) {
+// isControl reports whether r is a character no filename should carry.
+//
+// C0 and DEL are refused because the name is echoed back to the sender's
+// terminal in the acknowledgement, where an embedded newline forges a second
+// response line and an ANSI escape drives the terminal directly. C1 is refused
+// for the same reason, since some terminals still act on it. The bidirectional
+// overrides are refused because they make a name render as something other than
+// what was written to disk, which turns the acknowledgement into a lie.
+func isControl(r rune) bool {
+	switch {
+	case r < 0x20, r == 0x7f:
+		return true
+	case r >= 0x80 && r <= 0x9f:
+		return true
+	case r == 0x061c, r == 0x200e, r == 0x200f:
+		return true
+	case r >= 0x202a && r <= 0x202e:
+		return true
+	case r >= 0x2066 && r <= 0x2069:
+		return true
+	}
+	return false
+}
+
+// stage writes at most remaining bytes of r into a staging file in dir.
+//
+// The bytes land under a staging name rather than the caller's chosen one. The
+// previous version created the file under its final name and wrote into it, so
+// an interrupted transfer left a truncated file that was indistinguishable from
+// a completed drop — and Extract's unwind only covers errors it lives to see,
+// not a SIGKILL or a power cut.
+func stage(r io.Reader, dir string, remaining int64) (path string, n int64, err error) {
 	if remaining <= 0 {
 		return "", 0, errors.New("drop: archive exceeds the size limit")
 	}
 
-	f, path, err := createUnique(dir, name)
+	f, err := os.CreateTemp(dir, stagePrefix+"*")
 	if err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("drop: create staging file in %s: %w", dir, err)
 	}
+	path = f.Name()
 	defer f.Close()
+
+	// CreateTemp already uses 0600; setting it explicitly means the mode does
+	// not depend on that remaining true.
+	if err := f.Chmod(filePerm); err != nil {
+		return path, 0, fmt.Errorf("drop: restrict staging file: %w", err)
+	}
 
 	// One byte past the budget, so that exceeding it is detected here rather
 	// than discovered after the disk has already taken the data. The header's
 	// declared size is never trusted — only what actually arrives is counted.
-	n, err := io.CopyN(f, r, remaining+1)
+	n, err = io.CopyN(f, r, remaining+1)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return path, n, fmt.Errorf("drop: write %s: %w", name, err)
+		return path, n, err
 	}
 	if n > remaining {
 		return path, n, errors.New("drop: archive exceeds the size limit")
 	}
 	if err := f.Close(); err != nil {
-		return path, n, fmt.Errorf("drop: write %s: %w", name, err)
+		return path, n, fmt.Errorf("drop: write staging file: %w", err)
 	}
-
-	quarantine(path)
 	return path, n, nil
 }
 
-// createUnique creates a new file under dir, adding a numeric suffix if the
-// name is taken.
+// publish gives a completed staging file its real name, adding a numeric
+// suffix if that name is taken.
 //
-// O_EXCL is doing two jobs, and the second one is the load-bearing half.
+// os.Link rather than os.Rename, and the distinction is the load-bearing part:
+// rename silently replaces whatever is already at the destination, which is the
+// difference between receiving a drop and losing one. Link fails with EEXIST
+// instead — the same guarantee O_CREATE|O_EXCL gave the version this replaced —
+// and it does not follow a symlink planted at the destination either, so a link
+// an attacker left in Dir cannot redirect the publish out of it.
 //
-// It refuses to overwrite a file already there, which is the difference
-// between receiving a drop and losing one. And POSIX requires open() with
-// O_CREAT|O_EXCL to fail on a symlink whatever the link points at — so it also
-// refuses to follow a link an attacker planted in Dir, which is the difference
-// between writing into Dir and writing anywhere on the filesystem. O_NOFOLLOW
-// would restate that, and is not portable through the os package, so the
-// guarantee is documented here instead.
-func createUnique(dir, name string) (*os.File, string, error) {
-	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
-
+// Bounded rather than open-ended so that a sender cannot make the daemon walk
+// an unbounded sequence by repeatedly dropping the same name.
+func publish(staged, dir, name string) (string, error) {
 	stem, ext := splitName(name)
 	for attempt := 0; attempt < maxCollisionAttempts; attempt++ {
 		candidate := name
@@ -320,15 +499,18 @@ func createUnique(dir, name string) (*os.File, string, error) {
 			candidate = stem + "-" + strconv.Itoa(attempt) + ext
 		}
 		path := filepath.Join(dir, candidate)
-		f, err := os.OpenFile(path, flags, filePerm)
+		err := os.Link(staged, path)
 		if err == nil {
-			return f, path, nil
+			// Only the staging name goes; the content lives on under the
+			// published name, which is now the same inode.
+			_ = os.Remove(staged)
+			return path, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return nil, "", fmt.Errorf("drop: create %s: %w", candidate, err)
+			return "", fmt.Errorf("drop: publish %s: %w", candidate, err)
 		}
 	}
-	return nil, "", fmt.Errorf("drop: %s already exists (and %d alternatives)", name, maxCollisionAttempts)
+	return "", fmt.Errorf("drop: %s already exists (and %d alternatives)", name, maxCollisionAttempts)
 }
 
 // splitName divides a filename into the part a suffix goes after and its

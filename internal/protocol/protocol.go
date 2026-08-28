@@ -53,11 +53,37 @@ const (
 	// TypeDrop is a file transfer: the JSON line is followed by a tar stream
 	// on the same connection.
 	TypeDrop = "drop"
+
+	// TypePing asks the listener to identify itself and does nothing else.
+	//
+	// It exists because the obvious way to ask "is a daemon there" — connect
+	// and close — is indistinguishable on the wire from a raw clipboard
+	// message of zero bytes, so it used to clear the clipboard every time
+	// `clipd status` ran. A request the daemon can recognise answers the
+	// question without touching anything, and answers a second one for free:
+	// whether the thing listening is clipd at all.
+	TypePing = "ping"
 )
 
-// ErrNoMagic reports that a stream did not begin with Magic, and so is raw
-// clipboard content rather than a structured request.
-var ErrNoMagic = errors.New("protocol: not a structured request")
+// Ping is the complete byte sequence a client sends for a TypePing request.
+//
+// A literal rather than something marshalled, because both callers send
+// exactly this and a fixed slice cannot fail to encode.
+var Ping = []byte(Magic + `{"type":"ping"}` + "\n")
+
+// Pong is the message a daemon answers a Ping with, after StatusOK.
+const Pong = "pong"
+
+// Response status prefixes.
+//
+// The daemon's reply is plain text so that an unmodified `nc` displays
+// something useful, but the first token is machine-readable so the generated
+// shell function can turn a result into an exit status. Without it every drop
+// exited 0, including the ones the daemon rejected.
+const (
+	StatusOK    = "clipd: ok: "
+	StatusError = "clipd: error: "
+)
 
 // Request is the envelope carried on the line after Magic.
 //
@@ -118,6 +144,12 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 	var req Request
 	if err := dec.Decode(&req); err != nil {
 		return Request{}, fmt.Errorf("protocol: parse request: %w", err)
+	}
+	// One JSON value per frame. Decoding once and stopping would silently
+	// accept a second value after the first, which is a way to make the
+	// daemon and the sender disagree about what was requested.
+	if dec.More() {
+		return Request{}, errors.New("protocol: trailing data after the request frame")
 	}
 	if req.Type == "" {
 		return Request{}, errors.New("protocol: request has no type")

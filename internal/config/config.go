@@ -69,6 +69,21 @@ const (
 	// MaxAllowedPayloadBytes is the ceiling Validate enforces, well above any
 	// plausible paste and well below anything that would trouble a Mac.
 	MaxAllowedPayloadBytes int64 = 1 << 30
+
+	// The remaining ceilings exist so that every limit the daemon derives from
+	// this file stays in a range where the arithmetic is provably safe.
+	//
+	// The drop package multiplies MaxDropFiles to get an entry cap and adds a
+	// per-entry framing budget on top of MaxDropBytes to get a wire cap. Left
+	// unbounded, a large enough value in either field overflows int64 and the
+	// resulting negative limit rejects every drop instead of bounding one — a
+	// setting that reads like "allow more" that in fact allows nothing.
+	MaxAllowedDropBytes int64 = 64 << 30
+	MaxAllowedDropFiles       = 1 << 16
+
+	// MaxAllowedConcurrent matches the daemon's own connection ceiling. Above
+	// it, work slots outnumber the sockets that could occupy them.
+	MaxAllowedConcurrent = 64
 )
 
 // Config is the on-disk configuration.
@@ -200,6 +215,11 @@ func Load(path string) (Config, error) {
 	if err := dec.Decode(&file); err != nil {
 		return cfg, fmt.Errorf("parse %s: %w", path, err)
 	}
+	// A config file holds one object. Decoding once and stopping would accept a
+	// second one silently, leaving the user editing settings nothing reads.
+	if dec.More() {
+		return cfg, fmt.Errorf("parse %s: trailing data after the configuration object", path)
+	}
 
 	if file.Address != "" {
 		cfg.Address = file.Address
@@ -269,13 +289,27 @@ func (c Config) Save(path string) error {
 		return err
 	}
 	dir := filepath.Dir(path)
+	// Whether the directory is clipd's own is what decides whether its mode is
+	// this function's to set.
+	//
+	// MkdirAll leaves an existing directory's mode alone, so a clipd directory
+	// that something else created loosely still has to be tightened explicitly
+	// — that is why the Chmod is here at all. But the previous version applied
+	// it to whatever the parent happened to be, and `-config ./config.json`
+	// makes that the current working directory: saving a config took an
+	// ordinary 0755 directory to 0700 as a side effect. Owning the name is the
+	// line between the two.
+	_, statErr := os.Stat(dir)
+	owned := filepath.Base(dir) == AppName || errors.Is(statErr, fs.ErrNotExist)
 	if err := os.MkdirAll(dir, DirPerm); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
-	// MkdirAll leaves an existing directory's mode alone, and the mode above is
-	// masked by umask in any case, so the intended mode is set explicitly.
-	if err := os.Chmod(dir, DirPerm); err != nil {
-		return fmt.Errorf("restrict %s: %w", dir, err)
+	if owned {
+		// The mode passed to MkdirAll is masked by umask, so the intended mode
+		// is set explicitly.
+		if err := os.Chmod(dir, DirPerm); err != nil {
+			return fmt.Errorf("restrict %s: %w", dir, err)
+		}
 	}
 
 	data, err := json.MarshalIndent(c, "", "  ")
@@ -307,11 +341,23 @@ func (c Config) Validate() error {
 	if c.MaxDropBytes < 0 {
 		return fmt.Errorf("max_drop_bytes: %d must not be negative", c.MaxDropBytes)
 	}
+	if c.MaxDropBytes > MaxAllowedDropBytes {
+		return fmt.Errorf("max_drop_bytes: %d exceeds the %s ceiling",
+			c.MaxDropBytes, FormatSize(MaxAllowedDropBytes))
+	}
 	if c.MaxDropFiles < 0 {
 		return fmt.Errorf("max_drop_files: %d must not be negative", c.MaxDropFiles)
 	}
+	if c.MaxDropFiles > MaxAllowedDropFiles {
+		return fmt.Errorf("max_drop_files: %d exceeds the %d ceiling",
+			c.MaxDropFiles, MaxAllowedDropFiles)
+	}
 	if c.MaxConcurrent < 0 {
 		return fmt.Errorf("max_concurrent: %d must not be negative", c.MaxConcurrent)
+	}
+	if c.MaxConcurrent > MaxAllowedConcurrent {
+		return fmt.Errorf("max_concurrent: %d exceeds the %d ceiling",
+			c.MaxConcurrent, MaxAllowedConcurrent)
 	}
 	return nil
 }

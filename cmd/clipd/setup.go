@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/colefailla/clipd/internal/server"
 )
@@ -21,22 +23,41 @@ import (
 //
 // The remote rc file uses these plain markers, because a host has exactly one
 // clipd function however many names you reach it by. The local SSH config
-// cannot: setup is run once per host and every host needs its own block, so
-// there the markers carry the host name. See sshMarkers.
+// cannot: setup is run once per destination and every destination needs its own
+// block, so there the markers carry the destination. See sshMarkers.
 const (
 	blockStart = "# >>> clipd >>>"
 	blockEnd   = "# <<< clipd <<<"
 )
 
-// sshMarkers returns the markers bracketing one host's block in the SSH config.
+// sshMarkers returns the markers bracketing one destination's block in the SSH
+// config.
 //
-// Naming the host is what lets `clipd setup debian` and `clipd setup pi`
-// coexist. With one shared marker the second run stripped the first run's
-// block on its way to writing its own, so only the most recent host kept a
-// forward — and the earlier ones failed later with nothing to explain why.
-func sshMarkers(host string) (start, end string) {
-	return "# >>> clipd: " + host + " >>>", "# <<< clipd: " + host + " <<<"
+// Naming the destination is what lets `clipd setup debian` and `clipd setup pi`
+// coexist. With one shared marker the second run stripped the first run's block
+// on its way to writing its own, so only the most recent host kept a forward —
+// and the earlier ones failed later with nothing to explain why.
+//
+// The whole destination, not just the host: `alice@server` and `bob@server`
+// forward different remote paths for different accounts, and keying on the host
+// alone made setting up the second silently discard the first.
+func sshMarkers(destination string) (start, end string) {
+	return "# >>> clipd: " + destination + " >>>", "# <<< clipd: " + destination + " <<<"
 }
+
+// maxProbeOutput bounds what setup will buffer from a remote command.
+//
+// Nothing setup reads from a host needs more than this, and without a cap a
+// hostile or badly misconfigured server can stream until the Mac runs out of
+// memory.
+const maxProbeOutput = 64 << 10
+
+// setupCommandTimeout bounds one ssh invocation.
+//
+// Generous, because the first one may be waiting for a person: ssh reads a
+// password from /dev/tty, so the prompt is answered by the user rather than by
+// anything this program controls.
+const setupCommandTimeout = 3 * time.Minute
 
 // probeScript asks a remote host what it has, rather than assuming.
 //
@@ -52,6 +73,7 @@ printf 'home=%s\n' "$HOME"
 printf 'os=%s\n' "$(uname -s)"
 printf 'shell=%s\n' "${SHELL:-/bin/sh}"
 if command -v tar >/dev/null 2>&1; then printf 'tar=yes\n'; fi
+if command -v mktemp >/dev/null 2>&1; then printf 'mktemp=yes\n'; fi
 if command -v nc >/dev/null 2>&1; then
   printf 'nc=yes\n'
   if nc -h 2>&1 | grep -q -- '-U'; then printf 'nc_unix=yes\n'; fi
@@ -66,6 +88,7 @@ type remoteFacts struct {
 	os         string
 	shell      string
 	hasTar     bool
+	hasMktemp  bool
 	hasNC      bool
 	ncUnix     bool
 	ncShutdown bool
@@ -85,7 +108,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	if flags.NArg() != 1 {
 		return failf(e, exitUsage, "setup needs exactly one ssh host, got %d", flags.NArg())
 	}
-	host := flags.Arg(0)
+	destination := flags.Arg(0)
 
 	cfg, _, err := loadConfig(g)
 	if err != nil {
@@ -109,11 +132,11 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	// The master outlives this process by ControlPersist seconds; closing it
 	// here keeps a stray authenticated connection from lingering.
 	defer func() {
-		_ = exec.Command("ssh", "-o", "ControlPath="+control, "-O", "exit", host).Run()
+		_ = exec.Command("ssh", "-o", "ControlPath="+control, "-O", "exit", destination).Run()
 	}()
 
-	fmt.Fprintf(e.stdout, "Probing %s (you may be asked for your password)...\n", host)
-	facts, err := probe(ctx, host, control)
+	fmt.Fprintf(e.stdout, "Probing %s (you may be asked for your password)...\n", destination)
+	facts, err := probe(ctx, destination, control)
 	if err != nil {
 		return fail(e, exitFailure, err)
 	}
@@ -122,9 +145,17 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	if err != nil {
 		return fail(e, exitFailure, err)
 	}
-	remoteSocket := facts.home + "/.clipd.sock"
+	// A directory of its own, not a socket loose in $HOME: the mode on the
+	// directory is what protects the socket on a host that ignores a socket's
+	// own permissions. installScript creates it 0700.
+	remoteSocket := facts.home + "/.clipd/socket"
 	rcFile := rcFileFor(facts)
 	block := shellFunction(client, remoteSocket, facts.hasTar)
+
+	sshBlock, err := sshBlockFor(destination, remoteSocket, localSocket)
+	if err != nil {
+		return fail(e, exitConfig, err)
+	}
 
 	fmt.Fprintf(e.stdout, "\n  remote shell   %s\n", facts.shell)
 	fmt.Fprintf(e.stdout, "  remote client  %s\n", client)
@@ -132,28 +163,38 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	fmt.Fprintf(e.stdout, "  remote socket  %s\n", remoteSocket)
 	fmt.Fprintf(e.stdout, "  local socket   %s\n", localSocket)
 	if !facts.hasTar {
-		fmt.Fprintf(e.stdout, "\n  note: %s has no tar, so 'clipd drop' is unavailable there.\n", host)
+		fmt.Fprintf(e.stdout, "\n  note: %s has no tar, so 'clipd drop' is unavailable there.\n", destination)
+	} else if !facts.hasMktemp {
+		// The status file is how the function recovers tar's exit code from
+		// inside a pipeline. Without it a drop still works, but a tar that
+		// failed halfway cannot be distinguished from one that did not.
+		fmt.Fprintf(e.stdout, "\n  note: %s has no mktemp, so a partial 'clipd drop' cannot be detected.\n", destination)
+	}
+	if unsupportedShell(facts.shell) {
+		fmt.Fprintf(e.stdout, "\n  note: %s does not read %s. The function is POSIX shell, so add\n"+
+			"        it to that shell's own startup file by hand, or run a POSIX shell.\n",
+			filepath.Base(facts.shell), rcFile)
 	}
 
-	forward := fmt.Sprintf("RemoteForward %s:%s", remoteSocket, localSocket)
-	pattern := hostPattern(host)
-	sshStart, sshEnd := sshMarkers(pattern)
-	sshBlock := fmt.Sprintf("%s\nHost %s\n  %s\n%s\n", sshStart, pattern, forward, sshEnd)
-
 	if *printOnly {
-		fmt.Fprintf(e.stdout, "\n--- would append to %s on %s ---\n%s", rcFile, host, block)
+		fmt.Fprintf(e.stdout, "\n--- would append to %s on %s ---\n%s", rcFile, destination, block)
 		fmt.Fprintf(e.stdout, "\n--- would append to ~/.ssh/config ---\n%s", sshBlock)
 		return exitOK
 	}
 
-	if err := installRemote(ctx, host, control, rcFile, block); err != nil {
+	if err := installRemote(ctx, destination, control, rcFile, block); err != nil {
 		return fail(e, exitFailure, err)
 	}
-	fmt.Fprintf(e.stdout, "\nInstalled the clipd function in %s on %s.\n", rcFile, host)
+	fmt.Fprintf(e.stdout, "\nInstalled the clipd function in %s on %s.\n", rcFile, destination)
 
-	sshPath, changed, err := installSSHConfig(pattern, sshBlock)
+	sshPath, changed, err := installSSHConfig(ctx, destination, sshBlock)
 	if err != nil {
-		return fail(e, exitFailure, err)
+		// The remote edit has already happened. Saying so is the difference
+		// between a user who knows the two halves disagree and one who finds
+		// out later from a forward that never appears.
+		return failf(e, exitFailure,
+			"%v\n       The clipd function was already installed on %s; re-run setup once this is fixed.",
+			err, destination)
 	}
 	if changed {
 		fmt.Fprintf(e.stdout, "Added the socket forward to %s.\n", sshPath)
@@ -170,26 +211,36 @@ Then, on %s:
 
   ls -l | clipd
   clipd drop notes.txt
+  pg_dump db | clipd drop --name dump.sql
 
 An existing SSH session will not have the forward. If you multiplex with
 ControlMaster, the old master has to go first, which is what the -O exit above
 is for.
-`, host, host, host)
+`, destination, destination, destination)
 	return exitOK
 }
 
-// hostPattern reduces an ssh destination to something a Host block can match.
-//
-// ssh strips the user before matching Host patterns, so a block written as
-// "Host cole@debian" matches nothing at all — and the failure is silent: the
-// forward simply never happens and the socket never appears on the remote.
-// Verified with `ssh -G`, which resolves "cole@debian" against "Host debian"
-// and ignores "Host cole@debian" entirely.
-func hostPattern(destination string) string {
-	if _, host, ok := strings.Cut(destination, "@"); ok {
-		return host
+// splitDestination separates an ssh destination into its user and host.
+func splitDestination(destination string) (user, host string) {
+	if u, h, ok := strings.Cut(destination, "@"); ok {
+		return u, h
 	}
-	return destination
+	return "", destination
+}
+
+// unsupportedShell reports whether the remote login shell will not read the
+// file setup writes to.
+//
+// The generated function is POSIX shell, and .profile is where every POSIX
+// shell looks. fish and the csh family are neither, so they read none of it —
+// and reporting a successful install for a function that never loads is the
+// worst of the available outcomes.
+func unsupportedShell(shell string) bool {
+	switch filepath.Base(shell) {
+	case "fish", "csh", "tcsh":
+		return true
+	}
+	return false
 }
 
 // sshOptions are the options every connection setup makes shares.
@@ -226,24 +277,64 @@ func controlPath() (string, func(), error) {
 	return filepath.Join(dir, "c"), func() { os.RemoveAll(dir) }, nil
 }
 
-// probe runs probeScript on the host and parses its key=value output.
-func probe(ctx context.Context, host, control string) (remoteFacts, error) {
-	args := append(sshOptions(control), host, "sh -s")
+// capWriter keeps the first max bytes written to it and discards the rest.
+//
+// Every write is reported as fully accepted, so a remote command that keeps
+// producing output is not killed with EPIPE partway through something else.
+type capWriter struct {
+	b   bytes.Buffer
+	max int
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if room := w.max - w.b.Len(); room > 0 {
+		if len(p) > room {
+			p = p[:room]
+		}
+		w.b.Write(p)
+	}
+	return len(p), nil
+}
+
+func (w *capWriter) String() string { return w.b.String() }
+
+// runRemote runs one script on the host over the shared control connection.
+//
+// Both streams are capped and the whole command is bounded in time, because
+// everything here is what a remote host chose to send: setup has authenticated
+// to it, but that is not a reason to let it decide how much memory this process
+// uses or how long it runs.
+func runRemote(ctx context.Context, destination, control, script string) (stdout string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, setupCommandTimeout)
+	defer cancel()
+
+	args := append(sshOptions(control), destination, "sh -s")
 	cmd := exec.CommandContext(ctx, "ssh", args...)
-	cmd.Stdin = strings.NewReader(probeScript)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdin = strings.NewReader(script)
+	out := &capWriter{max: maxProbeOutput}
+	errOut := &capWriter{max: maxProbeOutput}
+	cmd.Stdout = out
+	cmd.Stderr = errOut
+
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
+		msg := strings.TrimSpace(errOut.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return remoteFacts{}, fmt.Errorf("probe %s: %s", host, msg)
+		return out.String(), errors.New(msg)
+	}
+	return out.String(), nil
+}
+
+// probe runs probeScript on the host and parses its key=value output.
+func probe(ctx context.Context, destination, control string) (remoteFacts, error) {
+	stdout, err := runRemote(ctx, destination, control, probeScript)
+	if err != nil {
+		return remoteFacts{}, fmt.Errorf("probe %s: %s", destination, err)
 	}
 
 	facts := remoteFacts{}
-	for _, line := range strings.Split(stdout.String(), "\n") {
+	for _, line := range strings.Split(stdout, "\n") {
 		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
 		if !ok {
 			continue
@@ -257,6 +348,8 @@ func probe(ctx context.Context, host, control string) (remoteFacts, error) {
 			facts.shell = value
 		case "tar":
 			facts.hasTar = true
+		case "mktemp":
+			facts.hasMktemp = true
 		case "nc":
 			facts.hasNC = true
 		case "nc_unix":
@@ -268,7 +361,7 @@ func probe(ctx context.Context, host, control string) (remoteFacts, error) {
 		}
 	}
 	if facts.home == "" {
-		return facts, fmt.Errorf("probe %s: the host did not report a home directory", host)
+		return facts, fmt.Errorf("probe %s: the host did not report a home directory", destination)
 	}
 	return facts, nil
 }
@@ -289,22 +382,22 @@ func clientCommand(f remoteFacts) (string, error) {
 		// timeout value". This netcat closes the socket on stdin EOF anyway,
 		// so the flag is not needed. Checked ahead of the -N cases because the
 		// flag is present here and means something else.
-		return `nc -U "$sock"`, nil
+		return `nc -U "$_clipd_sock"`, nil
 	case f.hasNC && f.ncUnix && f.ncShutdown:
-		return `nc -N -U "$sock"`, nil
+		return `nc -N -U "$_clipd_sock"`, nil
 	case f.hasSocat:
-		return `socat - UNIX-CLIENT:"$sock"`, nil
+		return `socat - UNIX-CLIENT:"$_clipd_sock"`, nil
 	case f.hasNC && f.ncUnix:
 		// -U but no -N, on something that is not macOS: netcat-openbsd from
 		// before the flag existed. Without a half-close the daemon never sees
 		// the end of the message, so it never replies and the client waits out
 		// its deadline. socat is preferred above; reaching here means there is
 		// none.
-		return "", fmt.Errorf("the host's netcat cannot half-close a connection (no -N flag), so a copy would hang: install a newer netcat-openbsd, or socat")
+		return "", errors.New("the host's netcat cannot half-close a connection (no -N flag), so a copy would hang: install a newer netcat-openbsd, or socat")
 	case f.hasNC:
-		return "", fmt.Errorf("the host's netcat has no -U flag, so it cannot use a UNIX socket: install netcat-openbsd (Debian/Ubuntu) or socat")
+		return "", errors.New("the host's netcat has no -U flag, so it cannot use a UNIX socket: install netcat-openbsd (Debian/Ubuntu) or socat")
 	default:
-		return "", fmt.Errorf("the host has neither nc nor socat: install netcat-openbsd or socat")
+		return "", errors.New("the host has neither nc nor socat: install netcat-openbsd or socat")
 	}
 }
 
@@ -328,43 +421,83 @@ func rcFileFor(f remoteFacts) string {
 // nothing is installed on the remote side. The daemon's own name is what the
 // user types, so the two halves stay in sync in their head even though only
 // one of them is a program.
+//
+// Every variable is prefixed, because this runs in the user's interactive
+// shell and a bare `name` or `sock` would overwrite theirs.
 func shellFunction(client, socket string, hasTar bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", blockStart)
 	fmt.Fprintf(&b, "# Sends to the clipd daemon on the Mac, through the socket SSH forwards.\n")
 	fmt.Fprintf(&b, "# Managed by 'clipd setup'; edits between these markers are overwritten.\n")
 	fmt.Fprintf(&b, "clipd() {\n")
-	fmt.Fprintf(&b, "  sock=%q\n", socket)
-	fmt.Fprintf(&b, "  if [ ! -S \"$sock\" ]; then\n")
-	fmt.Fprintf(&b, "    printf 'clipd: %%s is missing; reconnect with the socket forward\\n' \"$sock\" >&2\n")
+	fmt.Fprintf(&b, "  _clipd_sock=%q\n", socket)
+	fmt.Fprintf(&b, "  _clipd_tar=0\n")
+	fmt.Fprintf(&b, "  _clipd_reply=\n")
+	fmt.Fprintf(&b, "  if [ ! -S \"$_clipd_sock\" ]; then\n")
+	fmt.Fprintf(&b, "    printf 'clipd: %%s is missing; reconnect with the socket forward\\n' \"$_clipd_sock\" >&2\n")
 	fmt.Fprintf(&b, "    return 1\n")
 	fmt.Fprintf(&b, "  fi\n")
-	fmt.Fprintf(&b, "  if [ \"$1\" = \"drop\" ]; then\n")
+	// ${1:-} rather than $1, so that a shell running under `set -u` does not
+	// abort on a plain `printf x | clipd`, which passes no arguments at all.
+	fmt.Fprintf(&b, "  if [ \"${1:-}\" = \"drop\" ]; then\n")
 	fmt.Fprintf(&b, "    shift\n")
 	if hasTar {
-		// Two ways to drop, told apart by whether stdin is a terminal.
+		// Two ways to drop, told apart by an explicit flag.
 		//
-		// With files on the command line, tar carries their names. In a
-		// pipeline there is no file and no name, so one is taken from the
-		// first argument, or invented from the clock when even that is
-		// missing — a nameless file in the drop directory is worse than an
-		// ugly one.
-		fmt.Fprintf(&b, "    if [ -t 0 ]; then\n")
-		fmt.Fprintf(&b, "      if [ $# -eq 0 ]; then printf 'clipd drop: no files given\\n' >&2; return 64; fi\n")
-		fmt.Fprintf(&b, "      { printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n'; COPYFILE_DISABLE=1 tar cf - \"$@\"; } | %s\n", client)
-		fmt.Fprintf(&b, "    else\n")
-		fmt.Fprintf(&b, "      name=${1:-drop-$(date +%%Y%%m%%d-%%H%%M%%S).bin}\n")
+		// They used to be told apart by whether stdin was a terminal, which
+		// made `ssh host 'clipd drop report.pdf'` — and any drop from a script,
+		// a cron job or a non-interactive shell — send a header and no body,
+		// creating an empty file under the right name and reporting success.
+		// Reading the file is now what `clipd drop file` always means.
+		fmt.Fprintf(&b, "    if [ \"${1:-}\" = \"--name\" ]; then\n")
+		fmt.Fprintf(&b, "      shift\n")
+		fmt.Fprintf(&b, "      _clipd_name=${1:-}\n")
+		fmt.Fprintf(&b, "      if [ -z \"$_clipd_name\" ]; then\n")
+		fmt.Fprintf(&b, "        printf 'clipd drop: --name needs a filename\\n' >&2\n")
+		fmt.Fprintf(&b, "        return 64\n")
+		fmt.Fprintf(&b, "      fi\n")
 		// The name lands inside a JSON string, so the two characters JSON
 		// escapes have to be escaped here. Everything else the daemon rejects.
-		fmt.Fprintf(&b, "      esc=$(printf '%%s' \"$name\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n")
-		fmt.Fprintf(&b, "      { printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\"}\\n' \"$esc\"; cat; } | %s\n", client)
+		fmt.Fprintf(&b, "      _clipd_esc=$(printf '%%s' \"$_clipd_name\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n")
+		fmt.Fprintf(&b, "      _clipd_reply=$( { printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\"}\\n' \"$_clipd_esc\"; cat; } | %s )\n", client)
+		fmt.Fprintf(&b, "    else\n")
+		fmt.Fprintf(&b, "      if [ $# -eq 0 ]; then\n")
+		fmt.Fprintf(&b, "        printf 'clipd drop: no files given (use --name to send stdin)\\n' >&2\n")
+		fmt.Fprintf(&b, "        return 64\n")
+		fmt.Fprintf(&b, "      fi\n")
+		// tar's status is lost in a pipeline, which reports only its last
+		// command. A tar that fails halfway still emits a valid archive of the
+		// files it managed to read, so the daemon accepts it and answers "ok"
+		// for an incomplete transfer — and `clipd drop x && rm x` deletes the
+		// original. A status file is the portable way to recover it.
+		fmt.Fprintf(&b, "      _clipd_rc=$(mktemp 2>/dev/null)\n")
+		// The -- is what keeps a file called "--use-compress-program=curl"
+		// from being read by tar as an option and executed.
+		fmt.Fprintf(&b, "      _clipd_reply=$( { printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n'; COPYFILE_DISABLE=1 tar cf - -- \"$@\"; echo \"$?\" >\"${_clipd_rc:-/dev/null}\"; } | %s )\n", client)
+		fmt.Fprintf(&b, "      if [ -n \"$_clipd_rc\" ]; then\n")
+		fmt.Fprintf(&b, "        _clipd_tar=$(cat \"$_clipd_rc\" 2>/dev/null)\n")
+		fmt.Fprintf(&b, "        rm -f \"$_clipd_rc\"\n")
+		fmt.Fprintf(&b, "      fi\n")
 		fmt.Fprintf(&b, "    fi\n")
 	} else {
 		fmt.Fprintf(&b, "    printf 'clipd drop: this host has no tar\\n' >&2; return 1\n")
 	}
 	fmt.Fprintf(&b, "  else\n")
-	fmt.Fprintf(&b, "    %s\n", client)
+	fmt.Fprintf(&b, "    _clipd_reply=$(%s)\n", client)
 	fmt.Fprintf(&b, "  fi\n")
+	// The daemon's reply is the whole user interface for the result, so it is
+	// printed whatever it says; the status prefix on it is what turns the
+	// result into an exit code.
+	fmt.Fprintf(&b, "  if [ -n \"$_clipd_reply\" ]; then printf '%%s\\n' \"$_clipd_reply\"; fi\n")
+	fmt.Fprintf(&b, "  if [ \"${_clipd_tar:-0}\" != \"0\" ]; then\n")
+	fmt.Fprintf(&b, "    printf 'clipd drop: tar exited %%s; the drop may be incomplete\\n' \"$_clipd_tar\" >&2\n")
+	fmt.Fprintf(&b, "    return 1\n")
+	fmt.Fprintf(&b, "  fi\n")
+	fmt.Fprintf(&b, "  case $_clipd_reply in\n")
+	fmt.Fprintf(&b, "    'clipd: ok: '*) return 0 ;;\n")
+	fmt.Fprintf(&b, "    '') printf 'clipd: no reply from the daemon\\n' >&2; return 1 ;;\n")
+	fmt.Fprintf(&b, "    *) return 1 ;;\n")
+	fmt.Fprintf(&b, "  esac\n")
 	fmt.Fprintf(&b, "}\n")
 	fmt.Fprintf(&b, "%s\n", blockEnd)
 	return b.String()
@@ -377,12 +510,41 @@ func shellFunction(client, socket string, hasTar bool) string {
 // `cat >` rather than `mv` keeps the rc file's existing inode and permissions:
 // a temp file created by mktemp is 0600, and silently tightening someone's
 // .bashrc is not setup's business.
+//
+// The marker count is checked first. The awk pass skips from a start marker to
+// the next end marker, so a file with an unmatched start — someone deleted half
+// a block by hand — used to lose everything after it.
 const installScript = `set -e
 rc="%s"
+start='` + blockStart + `'
+end='` + blockEnd + `'
+
+# The socket gets a directory of its own, mode 0700. OpenSSH creates the socket
+# itself 0600 by default, but it documents that not every operating system
+# honours a socket's mode — and every one of them honours a directory's. On a
+# shared host this is what stops another account reaching the forward.
+mkdir -p "$HOME/.clipd"
+chmod 700 "$HOME/.clipd"
+# A socket directly in $HOME is clipd's own leftover, from before the directory.
+if [ -S "$HOME/.clipd.sock" ]; then rm -f "$HOME/.clipd.sock"; fi
+
+if [ -f "$rc" ]; then
+  opens=$(grep -c -- "^$start$" "$rc" || true)
+  closes=$(grep -c -- "^$end$" "$rc" || true)
+  if [ "$opens" != "$closes" ]; then
+    printf 'clipd: %%s has %%s start markers and %%s end markers; fix the block by hand\n' "$rc" "$opens" "$closes" >&2
+    exit 1
+  fi
+  # The first backup is the one worth keeping: it is the file before clipd
+  # touched it. Later runs would replace it with a copy that already has a
+  # clipd block in it.
+  [ -f "$rc.clipd-backup" ] || cp "$rc" "$rc.clipd-backup"
+fi
+
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 if [ -f "$rc" ]; then
-  awk '/^# >>> clipd >>>$/{skip=1} skip==0{print} /^# <<< clipd <<<$/{skip=0}' "$rc" > "$tmp"
+  awk -v s="$start" -v e="$end" '$0==s{skip=1} skip==0{print} $0==e{skip=0}' "$rc" > "$tmp"
 else
   : > "$tmp"
 fi
@@ -394,31 +556,110 @@ cat "$tmp" > "$rc"
 `
 
 // installRemote writes the shell function into the host's rc file.
-func installRemote(ctx context.Context, host, control, rcFile, block string) error {
+func installRemote(ctx context.Context, destination, control, rcFile, block string) error {
 	script := fmt.Sprintf(installScript, rcFile, strings.TrimRight(block, "\n"))
-	args := append(sshOptions(control), host, "sh -s")
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	cmd.Stdin = strings.NewReader(script)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("install the clipd function on %s: %s", host, msg)
+	if _, err := runRemote(ctx, destination, control, script); err != nil {
+		return fmt.Errorf("install the clipd function on %s: %s", destination, err)
 	}
 	return nil
+}
+
+// sshQuote renders a value as one quoted ssh_config argument.
+//
+// Quoted because a socket path may contain a space, and an unquoted one splits
+// into the wrong number of arguments — a RemoteForward that ssh then rejects.
+// The doubled %% is a separate problem: ssh expands %h, %u and the rest inside
+// these values whatever the quoting, so a literal one has to be escaped or a
+// home directory containing it is silently rewritten.
+func sshQuote(v string) string {
+	return `"` + strings.ReplaceAll(v, "%", "%%") + `"`
+}
+
+// validSSHValue rejects a value that cannot be encoded as an ssh_config
+// argument at all.
+//
+// Quoting handles spaces. Nothing handles an embedded quote or a newline: the
+// first ends the argument early and the second starts a new directive, so a
+// path containing either could turn into configuration the user never wrote.
+func validSSHValue(what, v string) error {
+	if v == "" {
+		return fmt.Errorf("%s is empty", what)
+	}
+	if i := strings.IndexAny(v, "\"\\\n\r"); i >= 0 {
+		return fmt.Errorf("%s %q contains %q, which an ssh config cannot carry", what, v, string(v[i]))
+	}
+	return nil
+}
+
+// validHostPattern rejects a destination that would widen the block beyond the
+// host it was written for.
+//
+// `clipd setup '*'` is the case that matters: it writes a stanza matching every
+// host, so the forward is attempted on every connection the user ever makes.
+func validHostPattern(host string) error {
+	if host == "" {
+		return errors.New("the ssh destination has no host")
+	}
+	if i := strings.IndexAny(host, "*?!/: \t"); i >= 0 {
+		return fmt.Errorf("ssh destination %q contains %q; setup writes a block for one named host, so give it one",
+			host, string(host[i]))
+	}
+	return validSSHValue("ssh destination", host)
+}
+
+// sshBlockFor renders the stanza carrying one destination's forward.
+//
+// A destination that names a user gets a Match block rather than a Host block.
+// ssh strips the user before matching Host patterns, so `Host server` applies to
+// every account on that machine: `setup bob@server` after `setup alice@server`
+// pointed alice's connections at bob's home directory, where the forward fails
+// with a permission error and nothing to explain it.
+func sshBlockFor(destination, remoteSocket, localSocket string) (string, error) {
+	user, host := splitDestination(destination)
+	if err := validHostPattern(host); err != nil {
+		return "", err
+	}
+	if user != "" {
+		if err := validSSHValue("ssh user", user); err != nil {
+			return "", err
+		}
+	}
+	if err := validSSHValue("remote socket path", remoteSocket); err != nil {
+		return "", err
+	}
+	if err := validSSHValue("local socket path", localSocket); err != nil {
+		return "", err
+	}
+
+	start, end := sshMarkers(destination)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n", start)
+	if user != "" {
+		fmt.Fprintf(&b, "Match host %s user %s\n", sshQuote(host), sshQuote(user))
+	} else {
+		fmt.Fprintf(&b, "Host %s\n", sshQuote(host))
+	}
+	fmt.Fprintf(&b, "  RemoteForward %s %s\n", sshQuote(remoteSocket), sshQuote(localSocket))
+	// OpenSSH's default mask already yields a 0600 socket, but a
+	// StreamLocalBindMask the user set elsewhere in this file would apply here
+	// too, and 0000 there publishes the socket to every account on the host.
+	fmt.Fprintf(&b, "  StreamLocalBindMask 0177\n")
+	// Without this, a socket left behind by a session that died uncleanly makes
+	// every later forward fail — and the failure is reported only in the remote
+	// sshd's log, so from this side clipd just stops working with nothing said.
+	fmt.Fprintf(&b, "  StreamLocalBindUnlink yes\n")
+	fmt.Fprintf(&b, "%s\n", end)
+	return b.String(), nil
 }
 
 // installSSHConfig adds the socket forward to the user's SSH config, replacing
 // any block a previous run left.
 //
-// The block is a Host stanza of its own rather than an edit to one the user
-// already wrote. SSH accumulates RemoteForward across matching blocks, so this
-// adds the forward without touching, reordering, or having to parse whatever
-// else is in the file.
-func installSSHConfig(host, block string) (path string, changed bool, err error) {
+// The block is a stanza of its own rather than an edit to one the user already
+// wrote. SSH accumulates RemoteForward across matching blocks, so this adds the
+// forward without touching, reordering, or having to parse whatever else is in
+// the file.
+func installSSHConfig(ctx context.Context, destination, block string) (path string, changed bool, err error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", false, fmt.Errorf("locate home directory: %w", err)
@@ -435,13 +676,20 @@ func installSSHConfig(host, block string) (path string, changed bool, err error)
 		return path, false, fmt.Errorf("read %s: %w", path, err)
 	}
 
-	start, end := sshMarkers(host)
-	stripped := stripBlock(string(existing), start, end)
-	// Also drop a block from before the markers carried a host name. There can
-	// only be one, it names some host this run may not be for, and leaving it
-	// would forward the same socket twice — which fails at connect time with
+	start, end := sshMarkers(destination)
+	stripped, err := stripBlock(string(existing), start, end)
+	if err != nil {
+		return path, false, fmt.Errorf("%s: %w", path, err)
+	}
+	// Also drop a block from before the markers carried a destination. There
+	// can only be one, it names some host this run may not be for, and leaving
+	// it would forward the same socket twice — which fails at connect time with
 	// "remote port forwarding failed" and no clue as to the cause.
-	stripped = stripBlock(stripped, blockStart, blockEnd)
+	stripped, err = stripBlock(stripped, blockStart, blockEnd)
+	if err != nil {
+		return path, false, fmt.Errorf("%s: %w", path, err)
+	}
+
 	updated := stripped
 	if updated != "" && !strings.HasSuffix(updated, "\n") {
 		updated += "\n"
@@ -454,26 +702,119 @@ func installSSHConfig(host, block string) (path string, changed bool, err error)
 	if string(existing) == updated {
 		return path, false, nil
 	}
+	if err := verifySSHConfig(ctx, updated, destination); err != nil {
+		return path, false, err
+	}
 	// A backup before the first edit, because this file is often hand-tuned
-	// and losing it is a bad afternoon.
+	// and losing it is a bad afternoon. Only the first: later runs would
+	// overwrite it with a copy that already contains a clipd block, which is
+	// not the file the user wants back.
+	backup := path + ".clipd-backup"
 	if len(existing) > 0 {
-		if err := os.WriteFile(path+".clipd-backup", existing, 0o600); err != nil {
-			return path, false, fmt.Errorf("back up %s: %w", path, err)
+		if _, err := os.Stat(backup); errors.Is(err, os.ErrNotExist) {
+			if err := os.WriteFile(backup, existing, 0o600); err != nil {
+				return path, false, fmt.Errorf("back up %s: %w", path, err)
+			}
 		}
 	}
-	if err := os.WriteFile(path, []byte(updated), 0o600); err != nil {
-		return path, false, fmt.Errorf("write %s: %w", path, err)
+	if err := writeFileAtomic(path, []byte(updated), 0o600); err != nil {
+		return path, false, err
 	}
 	return path, true, nil
 }
 
+// verifySSHConfig asks ssh to parse a candidate file before it replaces the
+// real one.
+//
+// `ssh -G` resolves a destination against a config and exits non-zero if it
+// cannot read it. Checking here turns a quoting mistake into a refusal to
+// write, instead of an ~/.ssh/config that ssh rejects wholesale — which would
+// break every host the user has, not only the one being set up.
+//
+// A check that cannot be run is not a failure. If ssh is missing or a temporary
+// file cannot be made, the install proceeds unverified rather than blocking on
+// the absence of a second opinion.
+func verifySSHConfig(ctx context.Context, content, destination string) error {
+	f, err := os.CreateTemp("", "clipd-sshcheck-*")
+	if err != nil {
+		return nil
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		return nil
+	}
+	if err := f.Close(); err != nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ssh", "-G", "-F", f.Name(), destination)
+	stderr := &capWriter{max: maxProbeOutput}
+	cmd.Stderr = stderr
+	cmd.Stdout = &capWriter{max: maxProbeOutput}
+	if err := cmd.Run(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("the generated SSH configuration would not parse: %s", msg)
+	}
+	return nil
+}
+
+// writeFileAtomic replaces a file's contents in one step.
+//
+// A plain write truncates first, so an interruption between the truncate and
+// the write leaves an empty ~/.ssh/config — not a file to be casual with. The
+// temporary is made in the same directory, so the rename cannot cross a
+// filesystem boundary and fall back to a copy.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".clipd-*")
+	if err != nil {
+		return fmt.Errorf("create a temporary file in %s: %w", dir, err)
+	}
+	tmp := f.Name()
+	// A no-op once the rename below has succeeded.
+	defer os.Remove(tmp)
+
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return fmt.Errorf("restrict %s: %w", tmp, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace %s: %w", path, err)
+	}
+	return nil
+}
+
 // stripBlock removes a previously managed block, markers included.
-func stripBlock(s, start, end string) string {
+//
+// An unmatched start marker is an error rather than a silent truncation. The
+// previous version skipped from a start marker to the end of the file looking
+// for a close that was not there, so a block someone had half-deleted by hand
+// took everything after it out of ~/.ssh/config on the next run.
+func stripBlock(s, start, end string) (string, error) {
 	var out []string
 	skip := false
 	for _, line := range strings.Split(s, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == start {
+			if skip {
+				return "", fmt.Errorf("found a second %q before the matching %q; fix the clipd block by hand", start, end)
+			}
 			skip = true
 			continue
 		}
@@ -485,5 +826,8 @@ func stripBlock(s, start, end string) string {
 			out = append(out, line)
 		}
 	}
-	return strings.TrimRight(strings.Join(out, "\n"), "\n")
+	if skip {
+		return "", fmt.Errorf("found %q with no matching %q; fix the clipd block by hand", start, end)
+	}
+	return strings.TrimRight(strings.Join(out, "\n"), "\n"), nil
 }
