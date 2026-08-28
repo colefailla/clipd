@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/colefailla/clipd/internal/config"
 	"github.com/colefailla/clipd/internal/launchagent"
@@ -33,10 +35,17 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 	fmt.Fprintf(out, "clipd %s (%s/%s)\n\n", version, runtime.GOOS, runtime.GOARCH)
 
 	fmt.Fprintf(out, "configuration\n")
-	if config.Exists(path) {
-		fmt.Fprintf(out, "  file         %s\n", path)
-	} else {
+	switch {
+	case !config.Exists(path):
 		fmt.Fprintf(out, "  file         %s (not created; using defaults)\n", path)
+	case staleConfig(ctx, path):
+		// The values printed below come from the file, but the daemon read it
+		// once at startup. Without this line status reports an edit as though
+		// it had taken effect, which is worse than not reporting it at all.
+		fmt.Fprintf(out, "  file         %s\n", path)
+		fmt.Fprintf(out, "               EDITED since the daemon started — run 'clipd restart'\n")
+	default:
+		fmt.Fprintf(out, "  file         %s\n", path)
 	}
 	// Before v3 this lived under Application Support. Nothing reads it now, and
 	// an upgrader looking for their settings should be told that rather than
@@ -62,6 +71,52 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 		reportAgent(ctx, out)
 	}
 	return code
+}
+
+// staleConfig reports whether the config has been modified since the daemon
+// last started.
+//
+// The daemon's start time is taken from the socket, which it creates on the way
+// up and removes on the way down. That makes the comparison exact for the
+// question being asked — has the file changed since this daemon read it —
+// without having to ask launchd anything or have the daemon report its own
+// uptime.
+func staleConfig(ctx context.Context, path string) bool {
+	cfg, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	state, err := launchagent.Status(ctx)
+	if err != nil || !state.Loaded || state.PID == 0 {
+		// Nothing running, so nothing to be out of date with.
+		return false
+	}
+	started, err := daemonStart()
+	if err != nil {
+		return false
+	}
+	return cfg.ModTime().After(started)
+}
+
+// daemonStart returns when the listening socket was created, which is when the
+// running daemon came up.
+func daemonStart() (time.Time, error) {
+	cfg, _, err := loadConfig(&globalOptions{})
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !server.IsSocketPath(cfg.Address) {
+		return time.Time{}, errors.New("not a socket")
+	}
+	sock, err := server.ExpandPath(cfg.Address)
+	if err != nil {
+		return time.Time{}, err
+	}
+	info, err := os.Lstat(sock)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
 }
 
 // reportListener says whether something is actually accepting on the

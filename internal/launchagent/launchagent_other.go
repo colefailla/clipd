@@ -30,6 +30,9 @@ type State struct {
 // LogPath is unavailable off macOS.
 func LogPath() (string, error) { return "", ErrUnsupported }
 
+// Restart is unavailable off macOS.
+func Restart(context.Context) error { return ErrUnsupported }
+
 // Install is unavailable off macOS.
 func Install(context.Context, Options) (Result, error) { return Result{}, ErrUnsupported }
 

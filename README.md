@@ -226,6 +226,31 @@ daemon with no config file is a working daemon.
 }
 ```
 
+**Sizes are in bytes.** Common values:
+
+| | Bytes |
+|---|---|
+| 10 MB | `10485760` |
+| 50 MB | `52428800` |
+| 256 MB | `268435456` |
+| 1 GB | `1073741824` |
+
+`clipd status` prints them back in human terms, so you write bytes and read
+`10 MiB`.
+
+**The config is read once, when the daemon starts.** After editing:
+
+```bash
+clipd restart
+```
+
+`clipd status` says `EDITED since the daemon started` when the file has changed
+under a running daemon, so a forgotten restart shows up rather than looking like
+a setting that did nothing.
+
+`max_payload_bytes` is capped at 1 GB, because clipboard content is held in
+memory. The drop limits have no ceiling — those stream to disk.
+
 Unknown keys are rejected rather than ignored, so a typo fails loudly.
 `CLIPD_CONFIG` is the only environment variable clipd reads.
 

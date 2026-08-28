@@ -78,6 +78,10 @@ const (
 	// maxAcceptBackoff caps the retry delay after a transient accept failure.
 	maxAcceptBackoff = time.Second
 
+	// drainCap bounds how much of a rejected message is read and thrown away
+	// before the connection closes. See drainRejected.
+	drainCap = 256 << 10
+
 	// warnWindow and warnBudget bound how many peer-driven warnings reach the
 	// log per window.
 	//
@@ -440,6 +444,7 @@ func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, r io.Reader
 	if n > s.maxPayload {
 		s.warnPeer("payload rejected", "limit_bytes", s.maxPayload)
 		s.respond(conn, fmt.Sprintf("payload exceeds the %d byte limit", s.maxPayload))
+		drainRejected(r)
 		return
 	}
 
@@ -515,11 +520,32 @@ func (s *Server) handleDrop(conn net.Conn, r io.Reader, name string) {
 		// to basenames — but the contents never are, and never appear here.
 		s.warnPeer("drop rejected", "error", err)
 		s.respond(conn, err.Error())
+		drainRejected(r)
 		return
 	}
 	s.log.Info("files dropped", "count", len(res.Names), "bytes", res.Bytes, "dir", s.dropDir)
 	s.respond(conn, fmt.Sprintf("dropped %s (%d bytes) into %s",
 		strings.Join(res.Names, ", "), res.Bytes, s.dropDir))
+}
+
+// drainRejected reads and discards what the sender is still transmitting, so
+// that closing the connection does not destroy the rejection just written.
+//
+// A socket closed while data is still arriving is torn down abruptly, and the
+// reply sitting in the sender's receive buffer goes with it. Whether the sender
+// sees the message therefore depends on whether it happened to be idle at that
+// instant — which in practice depends on how fast its disk is. The same command
+// against the same directory reports the error six times out of ten and says
+// nothing the other four. Reading the remainder first makes the close orderly
+// and the message reliable.
+//
+// Bounded, because the alternative is unbounded: a sender 50 GB over the limit
+// cannot be waited out, and reading it all would be a denial of service dressed
+// as politeness. Past the cap the abrupt close is accepted and the message may
+// still be lost. net/http makes the same trade at the same size, for the same
+// reason.
+func drainRejected(r io.Reader) {
+	_, _ = io.CopyN(io.Discard, r, drainCap)
 }
 
 // respond writes a single human-readable line back to the peer.

@@ -109,14 +109,15 @@ func (h *harness) send(payload []byte) string {
 	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		h.t.Fatalf("deadline: %v", err)
 	}
-	if _, err := conn.Write(payload); err != nil {
-		h.t.Fatalf("write: %v", err)
-	}
+	// A write error is not fatal. When the daemon rejects a message it stops
+	// reading, and a sender far enough past the limit will see the connection
+	// go away mid-write — which is exactly what nc does, and nc goes on to read
+	// whatever reply arrived. Failing the test here would test the harness
+	// rather than the daemon.
+	_, _ = conn.Write(payload)
 	// Half-close so the daemon sees EOF, which is what tells it the message is
 	// complete. This is exactly what nc's -N does.
-	if err := conn.(*net.UnixConn).CloseWrite(); err != nil {
-		h.t.Fatalf("close write: %v", err)
-	}
+	_ = conn.(*net.UnixConn).CloseWrite()
 	reply, err := io.ReadAll(conn)
 	if err != nil {
 		h.t.Fatalf("read reply: %v", err)
@@ -508,5 +509,58 @@ func TestNamedDropCannotEscape(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(h.dropDir, "escaped.txt")); err != nil {
 		t.Errorf("the file did not land in the drop directory: %v", err)
+	}
+}
+
+// TestRejectionSurvivesAnInFlightPayload pins the drain.
+//
+// A payload small enough to fit in the socket buffers is fully sent before the
+// daemon rejects it, so the reply is never at risk. This one is large enough
+// that the sender is still writing when the rejection is issued — and closing
+// a socket with data still arriving tears it down abruptly, taking the reply
+// with it. In the field the same command reported the error six times in ten
+// and said nothing the other four, the difference being how fast the source
+// disk was.
+func TestRejectionSurvivesAnInFlightPayload(t *testing.T) {
+	t.Parallel()
+
+	const limit = 64 << 10
+	h := newHarness(t, withMaxPayload(limit))
+
+	// Past the limit by less than drainCap. That is the range the drain can
+	// actually cover: the daemon reads the remainder, closes cleanly, and the
+	// reply survives. A sender megabytes past the limit is beyond what any
+	// bounded drain can absorb, and may still lose the message — the drain
+	// narrows this failure rather than eliminating it.
+	reply := h.send(bytes.Repeat([]byte("x"), limit+(128<<10)))
+
+	if reply == "" {
+		t.Fatal("the rejection was lost")
+	}
+	if !strings.Contains(reply, "exceeds") {
+		t.Errorf("reply = %q, want it to mention the limit", reply)
+	}
+	if h.clip.WriteCount() != 0 {
+		t.Error("an oversized payload reached the clipboard")
+	}
+}
+
+// TestDropRejectionSurvivesAnInFlightArchive is the same guarantee on the drop
+// path, which has it for the same reason and lost it in the same way.
+func TestDropRejectionSurvivesAnInFlightArchive(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, withDropLimits(64<<10, 16))
+	big := map[string]string{}
+	for i := range 4 {
+		big[string(rune('a'+i))+".bin"] = strings.Repeat("x", 48<<10)
+	}
+
+	reply := h.send(dropRequest(tarOf(t, big)))
+	if reply == "" {
+		t.Fatal("the drop rejection was lost")
+	}
+	if !strings.Contains(reply, "limit") {
+		t.Errorf("reply = %q, want it to mention the limit", reply)
 	}
 }

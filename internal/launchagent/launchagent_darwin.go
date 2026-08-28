@@ -191,6 +191,24 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 	return res, fmt.Errorf("load LaunchAgent: %w", lastErr)
 }
 
+// Restart asks launchd to stop and start the agent.
+//
+// kickstart -k rather than bootout followed by bootstrap: it is one call, it
+// leaves the agent enabled, and it works whether or not the daemon is currently
+// running. Replacing the binary or editing the config does nothing on its own —
+// launchd keeps executing what it already started — so this is the other half
+// of every change to either.
+func Restart(ctx context.Context) error {
+	domain, err := guiDomain()
+	if err != nil {
+		return err
+	}
+	if out, err := runLaunchctl(ctx, "kickstart", "-k", domain+"/"+Label); err != nil {
+		return fmt.Errorf("restart %s: %w: %s", Label, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // Uninstall unloads the agent and removes its plist.
 //
 // A missing plist or an already-unloaded service is not an error: uninstall

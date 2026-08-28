@@ -163,6 +163,18 @@ crashes. No root privileges are required.
 Options:
   -exec <path>   binary path to record in the plist (default: this binary)`,
 
+	"restart": `clipd restart
+
+macOS only. Stops and starts the LaunchAgent.
+
+The config file is read once, when the daemon starts, so editing it has no
+effect until this is run. 'clipd status' says when the file has been edited
+since the daemon last started.
+
+Equivalent to:
+
+  launchctl kickstart -k gui/$(id -u)/com.clipd.agent`,
+
 	"uninstall": `clipd uninstall
 
 macOS only. Unloads the LaunchAgent and removes its plist. The config file and
@@ -188,5 +200,5 @@ toolchain and target platform.`,
 	"help": `clipd help [topic]
 
 With no topic, prints the command list. Topics: serve, setup, drop, config,
-security, install, uninstall, status, version.`,
+security, install, restart, uninstall, status, version.`,
 }

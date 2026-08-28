@@ -58,6 +58,7 @@ var commands = map[string]commandFunc{
 	"setup":     cmdSetup,
 	"status":    cmdStatus,
 	"install":   cmdInstall,
+	"restart":   cmdRestart,
 	"uninstall": cmdUninstall,
 	"version":   cmdVersion,
 	"help":      cmdHelp,
@@ -201,6 +202,7 @@ Commands:
   setup       configure a remote host to talk to this daemon
   status      show the daemon's configuration and state
   install     macOS: install and start the LaunchAgent
+  restart     macOS: reload the daemon after editing the config
   uninstall   macOS: stop and remove the LaunchAgent
   version     print build information
   help        show help for a command
