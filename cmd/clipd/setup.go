@@ -73,7 +73,6 @@ printf 'home=%s\n' "$HOME"
 printf 'os=%s\n' "$(uname -s)"
 printf 'shell=%s\n' "${SHELL:-/bin/sh}"
 if command -v tar >/dev/null 2>&1; then printf 'tar=yes\n'; fi
-if command -v mktemp >/dev/null 2>&1; then printf 'mktemp=yes\n'; fi
 if command -v nc >/dev/null 2>&1; then
   printf 'nc=yes\n'
   if nc -h 2>&1 | grep -q -- '-U'; then printf 'nc_unix=yes\n'; fi
@@ -88,7 +87,6 @@ type remoteFacts struct {
 	os         string
 	shell      string
 	hasTar     bool
-	hasMktemp  bool
 	hasNC      bool
 	ncUnix     bool
 	ncShutdown bool
@@ -150,9 +148,10 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	// A directory of its own, not a socket loose in $HOME: the mode on the
 	// directory is what protects the socket on a host that ignores a socket's
 	// own permissions. installScript creates it 0700.
-	remoteSocket := facts.home + "/.clipd/socket"
+	remoteDir := facts.home + "/.clipd"
+	remoteSocket := remoteDir + "/socket"
 	rcFile := rcFileFor(facts)
-	block := shellFunction(client, remoteSocket, facts.hasTar, facts.hasMktemp)
+	block := shellFunction(client, remoteSocket, remoteDir, facts.hasTar)
 
 	sshBlock, err := sshBlockFor(destination, remoteSocket, localSocket)
 	if err != nil {
@@ -166,9 +165,6 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	fmt.Fprintf(e.stdout, "  local socket   %s\n", localSocket)
 	if !facts.hasTar {
 		fmt.Fprintf(e.stdout, "\n  note: %s has no tar, so 'clipd drop' is unavailable there.\n", destination)
-	} else if !facts.hasMktemp {
-		fmt.Fprintf(e.stdout, "\n  note: %s has no mktemp, so file/archive drops are unavailable there;\n"+
-			"        clipboard copies and 'clipd drop --name' still work.\n", destination)
 	}
 	if unsupportedShell(facts.shell) {
 		fmt.Fprintf(e.stdout, "\n  note: %s does not read %s. The function is POSIX shell, so add\n"+
@@ -349,8 +345,6 @@ func probe(ctx context.Context, destination, control string) (remoteFacts, error
 			facts.shell = value
 		case "tar":
 			facts.hasTar = true
-		case "mktemp":
-			facts.hasMktemp = true
 		case "nc":
 			facts.hasNC = true
 		case "nc_unix":
@@ -426,13 +420,14 @@ func rcFileFor(f remoteFacts) string {
 // The body is a subshell so none of its scratch variables or signal traps can
 // leak into the user's interactive shell. Names remain prefixed as well, which
 // keeps the generated block easy to audit when read on its own.
-func shellFunction(client, socket string, hasTar, hasMktemp bool) string {
+func shellFunction(client, socket, dir string, hasTar bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", blockStart)
 	fmt.Fprintf(&b, "# Sends to the clipd daemon on the Mac, through the socket SSH forwards.\n")
 	fmt.Fprintf(&b, "# Managed by 'clipd setup'; edits between these markers are overwritten.\n")
 	fmt.Fprintf(&b, "clipd() (\n")
 	fmt.Fprintf(&b, "  _clipd_sock=%s\n", shellQuote(socket))
+	fmt.Fprintf(&b, "  _clipd_dir=%s\n", shellQuote(dir))
 	fmt.Fprintf(&b, "  _clipd_reply=\n")
 	fmt.Fprintf(&b, "  _clipd_client=0\n")
 	fmt.Fprintf(&b, "  if [ ! -S \"$_clipd_sock\" ]; then\n")
@@ -477,15 +472,36 @@ func shellFunction(client, socket string, hasTar, hasMktemp bool) string {
 		fmt.Fprintf(&b, "        printf 'clipd drop: no files given (use --name to send stdin)\\n' >&2\n")
 		fmt.Fprintf(&b, "        return 64\n")
 		fmt.Fprintf(&b, "      fi\n")
-		if hasMktemp {
+		{
 			// Do not stream tar directly to the daemon. tar can emit a valid
 			// prefix and then fail, which previously let the daemon publish a
 			// partial drop before the shell learned tar's status. Building the
 			// complete framed request first means the socket is never opened on
 			// that failure path. The command substitution is a subshell, so its
 			// signal traps do not replace traps in the user's interactive shell.
+			//
+			// The staging file is made by hand rather than with mktemp, which
+			// is not in POSIX and so is one more thing a host has to have. The
+			// pattern is the one installScript already uses: a name from the
+			// shell's PID, 0600 through umask, and noclobber so an existing
+			// file is refused rather than followed or overwritten. It lives in
+			// clipd's own 0700 directory, which is what makes a predictable
+			// name safe — the same name under a world-writable /tmp would be a
+			// symlink target. $$ does not change inside a subshell, so two
+			// backgrounded drops from one shell would collide on the first
+			// name; the sequence is what lets the second pick another, and it
+			// steps over a file a killed drop left behind.
 			fmt.Fprintf(&b, "      if ! _clipd_reply=$(\n")
-			fmt.Fprintf(&b, "        _clipd_payload=$(mktemp 2>/dev/null) || { printf 'clipd drop: could not create a private temporary file; nothing was sent\\n' >&2; exit 1; }\n")
+			fmt.Fprintf(&b, "        _clipd_seq=0\n")
+			fmt.Fprintf(&b, "        while :; do\n")
+			fmt.Fprintf(&b, "          _clipd_payload=\"$_clipd_dir/drop.$$.$_clipd_seq\"\n")
+			fmt.Fprintf(&b, "          (umask 077; set -C; : > \"$_clipd_payload\") 2>/dev/null && break\n")
+			fmt.Fprintf(&b, "          _clipd_seq=$((_clipd_seq + 1))\n")
+			fmt.Fprintf(&b, "          if [ \"$_clipd_seq\" -ge 64 ]; then\n")
+			fmt.Fprintf(&b, "            printf 'clipd drop: no free staging name in %%s; nothing was sent\\n' \"$_clipd_dir\" >&2\n")
+			fmt.Fprintf(&b, "            exit 1\n")
+			fmt.Fprintf(&b, "          fi\n")
+			fmt.Fprintf(&b, "        done\n")
 			fmt.Fprintf(&b, "        trap 'rm -f \"$_clipd_payload\"' 0\n")
 			fmt.Fprintf(&b, "        trap 'exit 1' 1 2 15\n")
 			fmt.Fprintf(&b, "        printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n' > \"$_clipd_payload\" || exit 1\n")
@@ -501,9 +517,6 @@ func shellFunction(client, socket string, hasTar, hasMktemp bool) string {
 			fmt.Fprintf(&b, "        if [ -n \"${_clipd_reply:-}\" ]; then printf '%%s\\n' \"$_clipd_reply\"; fi\n")
 			fmt.Fprintf(&b, "        return 1\n")
 			fmt.Fprintf(&b, "      fi\n")
-		} else {
-			fmt.Fprintf(&b, "      printf 'clipd drop: this host has no mktemp; file/archive drop was not sent (use --name for stdin)\\n' >&2\n")
-			fmt.Fprintf(&b, "      return 1\n")
 		}
 		fmt.Fprintf(&b, "    fi\n")
 	} else {
@@ -542,8 +555,8 @@ func shellQuote(v string) string {
 // The awk pass drops any previous block before the new one is appended, so
 // running setup twice leaves one function rather than two. Writing through
 // `cat >` rather than `mv` keeps the rc file's existing inode and permissions:
-// a temp file created by mktemp is 0600, and silently tightening someone's
-// .bashrc is not setup's business.
+// the staging file is created 0600, and silently tightening someone's .bashrc
+// is not setup's business.
 //
 // The awk pass validates marker order while it writes only to the temporary
 // file. A malformed rc file is therefore rejected before its contents or its
@@ -562,8 +575,9 @@ chmod 700 "$HOME/.clipd"
 # A socket directly in $HOME is clipd's own leftover, from before the directory.
 if [ -S "$HOME/.clipd.sock" ]; then rm -f "$HOME/.clipd.sock"; fi
 
-# setup itself must also work on the hosts where mktemp is absent. This file is
-# inside clipd's private directory, and noclobber refuses the vanishingly rare
+# Made by hand rather than with mktemp, which is not in POSIX: clipd asks a host
+# for tar, a shell and one of nc or socat, and nothing else. This file is inside
+# clipd's private directory, and noclobber refuses the vanishingly rare
 # stale-file/PID-reuse collision rather than following or overwriting it.
 tmp="$HOME/.clipd/setup.$$"
 if ! (umask 077; set -C; : > "$tmp") 2>/dev/null; then

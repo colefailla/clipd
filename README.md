@@ -218,13 +218,17 @@ The exit status is the daemon's answer, which makes `clipd drop x && rm x` safe:
 a rejected drop exits non-zero, and one whose `tar` fails sends nothing at all.
 
 That last guarantee costs something worth knowing about. Dropping files builds
-the archive into a temporary file on the remote host before sending it, so the
-host needs free temporary space about the size of what you are sending, and it
-needs `mktemp` — `clipd setup` reports it if the host has neither. Streaming
-straight into the socket would be cheaper, but a `tar` that failed halfway would
-already have sent a valid archive of the files it managed to read, and the
-daemon would accept it. `clipd drop --name` still streams, because there is a
-single file's bytes and nothing to go half-right.
+the archive into a staging file under `~/.clipd/` on the remote host before
+sending it, so that host needs free space there about the size of what you are
+sending. Streaming straight into the socket would be cheaper, but a `tar` that
+failed halfway would already have sent a valid archive of the files it managed
+to read, and the daemon would accept it. `clipd drop --name` still streams,
+because there is a single file's bytes and nothing to go half-right.
+
+The staging file is made with the shell alone — a name from its process id,
+`0600` through `umask`, and `set -C` so an existing file is refused rather than
+followed. Not `mktemp`, which is not in POSIX: what clipd asks of a remote host
+is a POSIX shell, `tar`, and one of `nc` or `socat`.
 
 Content is sent byte for byte — newlines, tabs and the trailing newline are
 preserved. Input over `max_payload_bytes` (10 MiB by default) is rejected rather
