@@ -703,8 +703,21 @@ func sshBlockFor(destination, remoteSocket, localSocket string) (string, error) 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", start)
 	if user != "" {
-		fmt.Fprintf(&b, "Match host %s user %s\n", sshQuote(host), sshQuote(user))
+		// originalhost, not host: `Match host` is evaluated against the name
+		// after HostName substitution, so for an alias like
+		//
+		//	Host myserver
+		//	  HostName real.example.com
+		//
+		// `Match host "myserver"` never fires — ssh is by then looking at
+		// real.example.com. originalhost matches the name as typed, which is
+		// the one setup was given. The failure was silent: a block that reads
+		// correctly, matches nothing, and leaves the forward simply not
+		// happening. Verified with `ssh -G`.
+		fmt.Fprintf(&b, "Match originalhost %s user %s\n", sshQuote(host), sshQuote(user))
 	} else {
+		// A Host pattern already matches the name as typed, so the bare
+		// destination needs no equivalent.
 		fmt.Fprintf(&b, "Host %s\n", sshQuote(host))
 	}
 	fmt.Fprintf(&b, "  RemoteForward %s %s\n", sshQuote(remoteSocket), sshQuote(localSocket))

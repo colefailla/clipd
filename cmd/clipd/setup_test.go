@@ -772,7 +772,7 @@ func TestSSHBlockScopesToTheUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sshBlockFor: %v", err)
 	}
-	if !strings.Contains(withUser, `Match host "server" user "alice"`) {
+	if !strings.Contains(withUser, `Match originalhost "server" user "alice"`) {
 		t.Errorf("a user-qualified destination did not produce a Match block:\n%s", withUser)
 	}
 
@@ -788,6 +788,29 @@ func TestSSHBlockScopesToTheUser(t *testing.T) {
 		if !strings.Contains(bare, want) {
 			t.Errorf("the block is missing %q:\n%s", want, bare)
 		}
+	}
+}
+
+// TestSSHBlockMatchesTheNameAsTyped guards a failure with no symptom.
+//
+// `Match host` is evaluated after HostName substitution, so against an alias
+// like "Host myserver / HostName real.example.com" it compares the pattern to
+// real.example.com and never fires. The generated block reads correctly, the
+// forward silently never happens, and the first sign of trouble is clipd not
+// working on that host. `Match originalhost` compares the name the user typed,
+// which is the one setup was given.
+func TestSSHBlockMatchesTheNameAsTyped(t *testing.T) {
+	t.Parallel()
+
+	block, err := sshBlockFor("alice@myserver", "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
+	if err != nil {
+		t.Fatalf("sshBlockFor: %v", err)
+	}
+	if strings.Contains(block, "Match host ") {
+		t.Errorf("the block matches on the resolved hostname, which an alias defeats:\n%s", block)
+	}
+	if !strings.Contains(block, `Match originalhost "myserver"`) {
+		t.Errorf("the block does not match on the name as typed:\n%s", block)
 	}
 }
 
