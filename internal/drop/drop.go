@@ -17,10 +17,11 @@ package drop
 
 import (
 	"archive/tar"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,18 +58,21 @@ const maxNameBytes = 200
 // name.
 const maxCollisionAttempts = 100
 
-// stagePrefix marks a drop that is still arriving.
-//
-// Bytes land under this prefix and take their real name only once they are
-// complete, so a crash, a power cut, or a shutdown that outruns its grace
-// period cannot leave a half-written file that looks exactly like a finished
-// one. The leading dot also keeps a transfer in progress out of an ordinary
-// listing of the drop directory.
-const stagePrefix = ".clipd-part-"
+// Each in-flight request gets a private directory under stageDirPrefix. A
+// directory, rather than a distinctive filename in the drop directory, gives
+// cleanup a structurally separate namespace: a user may legitimately receive
+// a file called ".clipd-part-notes", and cleanup must never mistake it for
+// daemon state merely because its name shares a prefix.
+const (
+	stageDirPrefix = ".clipd-stage-"
+	stageMarker    = ".clipd-owned"
+	stageMarkerV1  = "clipd staging directory v1\n"
+)
 
-// staleStageAge is how old a leftover staging file must be before CleanStale
-// will remove it. Long enough that no transfer could still be using it.
-const staleStageAge = time.Hour
+// StaleCleanupInterval is both the minimum age CleanStale will remove and how
+// often the daemon revisits leftovers. It is longer than the server's absolute
+// connection lifetime, so cleanup cannot race a live daemon transfer.
+const StaleCleanupInterval = time.Hour
 
 // wirePerEntry is the wire budget each archive entry gets for its framing, on
 // top of the bytes that reach disk: a 512-byte header, up to 511 bytes of
@@ -117,6 +121,153 @@ const (
 // this package is willing to write.
 var ErrNoFiles = errors.New("drop: the archive contained no regular files")
 
+// A transaction owns one private staging directory and the files accumulated
+// there. Paths are relative to the opened drop root, so os.Root keeps every
+// operation confined even if a directory entry is replaced with a symlink.
+type transaction struct {
+	dir   string
+	files []stagedFile
+}
+
+type stagedFile struct {
+	path string
+	name string
+}
+
+type publishedFile struct {
+	staged string
+	name   string
+}
+
+// beginTransaction creates a name that cannot collide predictably with a
+// sender-controlled filename. The marker is what lets CleanStale distinguish
+// clipd state from a directory a user happened to name similarly.
+func beginTransaction(root *os.Root) (transaction, error) {
+	for range 10 {
+		var random [16]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return transaction{}, fmt.Errorf("drop: generate staging name: %w", err)
+		}
+		dir := stageDirPrefix + hex.EncodeToString(random[:])
+		if err := root.Mkdir(dir, dirPerm); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
+			return transaction{}, fmt.Errorf("drop: create staging directory: %w", err)
+		}
+		if err := writeStageMarker(root, dir); err != nil {
+			_ = root.Remove(dir)
+			return transaction{}, fmt.Errorf("drop: mark staging directory: %w", err)
+		}
+		return transaction{dir: dir}, nil
+	}
+	return transaction{}, errors.New("drop: could not allocate a unique staging directory")
+}
+
+func writeStageMarker(root *os.Root, dir string) error {
+	f, err := root.OpenFile(filepath.Join(dir, stageMarker), os.O_WRONLY|os.O_CREATE|os.O_EXCL, filePerm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(f, stageMarkerV1); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func hasStageMarker(root *os.Root, dir string) bool {
+	f, err := root.Open(filepath.Join(dir, stageMarker))
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, int64(len(stageMarkerV1)+1)))
+	return err == nil && string(data) == stageMarkerV1
+}
+
+// removeTransaction removes only the exact flat shape beginTransaction and
+// stage create. Refusing unexpected entries is intentional: even with a valid
+// marker, cleanup must not recursively delete a directory somebody repurposed.
+func removeTransaction(root *os.Root, dir string) error {
+	f, err := root.Open(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	entries, readErr := f.ReadDir(-1)
+	closeErr := f.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name != stageMarker {
+			index, err := strconv.Atoi(name)
+			if err != nil || index < 0 || strconv.Itoa(index) != name {
+				return fmt.Errorf("unexpected entry %q", name)
+			}
+		}
+		info, err := root.Lstat(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unexpected non-regular entry %q", name)
+		}
+	}
+	for _, entry := range entries {
+		if err := root.Remove(filepath.Join(dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return root.Remove(dir)
+}
+
+// rollback removes final names before staging state. A cleanup failure is
+// included in the returned error: silently leaving a file after reporting a
+// rejected drop would break the all-or-nothing guarantee this path exists for.
+func rollback(root *os.Root, stageDir string, published []publishedFile, cause error) error {
+	var cleanup []error
+	for _, file := range published {
+		// A watcher may have moved the received file and put something else at
+		// its name before a later publish failed. Compare inode identity with the
+		// still-staged hard link so rollback never deletes that replacement.
+		stagedInfo, stagedErr := root.Stat(file.staged)
+		finalInfo, finalErr := root.Stat(file.name)
+		if errors.Is(finalErr, os.ErrNotExist) {
+			continue
+		}
+		if stagedErr != nil || finalErr != nil {
+			cleanup = append(cleanup, fmt.Errorf("verify published %s before removal: %v", file.name, errors.Join(stagedErr, finalErr)))
+			continue
+		}
+		if !os.SameFile(stagedInfo, finalInfo) {
+			cleanup = append(cleanup, fmt.Errorf("published %s was replaced before rollback; left the replacement untouched", file.name))
+			continue
+		}
+		if err := root.Remove(file.name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanup = append(cleanup, fmt.Errorf("remove published %s: %w", file.name, err))
+		}
+	}
+	if err := removeTransaction(root, stageDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		cleanup = append(cleanup, fmt.Errorf("remove staging directory: %w", err))
+	}
+	if len(cleanup) > 0 {
+		return fmt.Errorf("%w (cleanup also failed: %v)", cause, errors.Join(cleanup...))
+	}
+	return cause
+}
+
 // Extract reads a tar stream from r and writes its regular files into
 // opts.Dir.
 //
@@ -151,32 +302,25 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 	if err := os.MkdirAll(opts.Dir, dirPerm); err != nil {
 		return Result{}, fmt.Errorf("drop: create %s: %w", opts.Dir, err)
 	}
+	root, err := os.OpenRoot(opts.Dir)
+	if err != nil {
+		return Result{}, fmt.Errorf("drop: open destination %s: %w", opts.Dir, err)
+	}
+	defer root.Close()
 
-	var (
-		res     Result
-		written []string
-	)
-	// fail unwinds the files this call created and returns the error the caller
-	// should see. Anything that goes wrong after the first file is written
-	// undoes the whole drop: a partial archive on disk looks exactly like a
-	// complete one, and there is no way for the user to tell them apart later.
-	//
-	// A removal that itself fails is reported rather than swallowed, because
-	// files left behind by a rejected drop are precisely the state this unwind
-	// exists to prevent.
-	fail := func(err error) (Result, error) {
-		stuck := 0
-		for _, path := range written {
-			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
-				stuck++
-			}
-		}
-		if stuck > 0 {
-			return Result{}, fmt.Errorf("%w (and %d file(s) could not be removed from %s)",
-				err, stuck, opts.Dir)
-		}
+	txn, err := beginTransaction(root)
+	if err != nil {
 		return Result{}, err
 	}
+	var published []publishedFile
+	// No final name is created until the complete archive has parsed. If
+	// publishing or cleanup then fails, remove every final name this request
+	// created as well as its private staging directory.
+	fail := func(cause error) (Result, error) {
+		return Result{}, rollback(root, txn.dir, published, cause)
+	}
+
+	var res Result
 
 	// The wire budget is the file bytes the caller allows, plus framing for the
 	// most entries the archive may hold. Both terms are bounded by config
@@ -224,35 +368,38 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 			return fail(err)
 		}
 
-		if len(res.Names) >= maxFiles {
+		if len(txn.files) >= maxFiles {
 			return fail(fmt.Errorf("drop: archive holds more than %d files", maxFiles))
 		}
 
-		staged, n, err := stage(tr, opts.Dir, maxBytes-res.Bytes)
-		if staged != "" {
-			written = append(written, staged)
-		}
+		staged, n, err := stage(tr, root, txn.dir, len(txn.files), maxBytes-res.Bytes)
 		if err != nil {
 			return fail(readError(err, budget))
 		}
-
-		// Marked before it is published, so the attribute is already on the
-		// inode by the time the file has a name a user could open.
-		quarantine(staged)
-		path, err := publish(staged, opts.Dir, name)
-		if err != nil {
-			return fail(err)
-		}
-		// The bytes now live under the published name; track that instead, so
-		// an unwind removes the file rather than a staging name that is gone.
-		written[len(written)-1] = path
-
-		res.Names = append(res.Names, filepath.Base(path))
+		txn.files = append(txn.files, stagedFile{path: staged, name: name})
 		res.Bytes += n
 	}
 
-	if len(res.Names) == 0 {
+	if len(txn.files) == 0 {
 		return fail(ErrNoFiles)
+	}
+
+	// Publication begins only after Next returned EOF for the whole archive.
+	// A corrupt or truncated later entry therefore cannot expose the valid
+	// prefix as though it were the complete drop.
+	for _, file := range txn.files {
+		// Marked before it is published, so the attribute is already on the
+		// inode by the time the file has a name a user could open.
+		quarantine(filepath.Join(opts.Dir, file.path))
+		name, err := publish(root, file.path, file.name)
+		if err != nil {
+			return fail(err)
+		}
+		published = append(published, publishedFile{staged: file.path, name: name})
+		res.Names = append(res.Names, name)
+	}
+	if err := removeTransaction(root, txn.dir); err != nil {
+		return fail(fmt.Errorf("drop: remove completed staging directory: %w", err))
 	}
 	return res, nil
 }
@@ -297,28 +444,43 @@ func readError(err error, budget int64) error {
 	return fmt.Errorf("drop: read archive: %w", err)
 }
 
-// CleanStale removes staging files a daemon that did not shut down cleanly left
-// behind, and reports how many went.
+// CleanStale removes transaction directories a daemon that did not shut down
+// cleanly left behind, and reports how many went.
 //
-// Only files old enough that no transfer could still be using them are touched,
-// so this is safe to call at startup without having to establish whether
-// anything else is writing to the directory.
+// A matching name is not sufficient. The entry must be a directory, contain
+// clipd's exact ownership marker, and be older than any server connection can
+// remain alive. This deliberately leaves legacy .clipd-part-* files alone:
+// those names were not reserved, so an old one may be a user's real file.
 func CleanStale(dir string) int {
-	entries, err := os.ReadDir(dir)
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return 0
 	}
-	cutoff := time.Now().Add(-staleStageAge)
+	defer root.Close()
+	dirFile, err := root.Open(".")
+	if err != nil {
+		return 0
+	}
+	entries, err := dirFile.ReadDir(-1)
+	_ = dirFile.Close()
+	if err != nil {
+		return 0
+	}
+
+	cutoff := time.Now().Add(-StaleCleanupInterval)
 	removed := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), stagePrefix) {
+		if !strings.HasPrefix(entry.Name(), stageDirPrefix) {
 			continue
 		}
-		info, err := entry.Info()
-		if err != nil || info.ModTime().After(cutoff) {
+		info, err := root.Lstat(entry.Name())
+		if err != nil || !info.IsDir() || info.ModTime().After(cutoff) {
 			continue
 		}
-		if os.Remove(filepath.Join(dir, entry.Name())) == nil {
+		if !hasStageMarker(root, entry.Name()) {
+			continue
+		}
+		if removeTransaction(root, entry.Name()) == nil {
 			removed++
 		}
 	}
@@ -348,21 +510,30 @@ func Save(r io.Reader, name string, opts Options) (Result, error) {
 	if err := os.MkdirAll(opts.Dir, dirPerm); err != nil {
 		return Result{}, fmt.Errorf("drop: create %s: %w", opts.Dir, err)
 	}
+	root, err := os.OpenRoot(opts.Dir)
+	if err != nil {
+		return Result{}, fmt.Errorf("drop: open destination %s: %w", opts.Dir, err)
+	}
+	defer root.Close()
+	txn, err := beginTransaction(root)
+	if err != nil {
+		return Result{}, err
+	}
 
-	staged, n, err := stage(r, opts.Dir, maxBytes)
+	staged, n, err := stage(r, root, txn.dir, 0, maxBytes)
 	if err != nil {
-		if staged != "" {
-			_ = os.Remove(staged)
-		}
-		return Result{}, err
+		return Result{}, rollback(root, txn.dir, nil, err)
 	}
-	quarantine(staged)
-	path, err := publish(staged, opts.Dir, safe)
+	quarantine(filepath.Join(opts.Dir, staged))
+	finalName, err := publish(root, staged, safe)
 	if err != nil {
-		_ = os.Remove(staged)
-		return Result{}, err
+		return Result{}, rollback(root, txn.dir, nil, err)
 	}
-	return Result{Names: []string{filepath.Base(path)}, Bytes: n}, nil
+	if err := removeTransaction(root, txn.dir); err != nil {
+		return Result{}, rollback(root, txn.dir, []publishedFile{{staged: staged, name: finalName}},
+			fmt.Errorf("drop: remove completed staging directory: %w", err))
+	}
+	return Result{Names: []string{finalName}, Bytes: n}, nil
 }
 
 // safeName reduces an archive entry's name to a bare filename that cannot
@@ -438,27 +609,25 @@ func isControl(r rune) bool {
 	return false
 }
 
-// stage writes at most remaining bytes of r into a staging file in dir.
+// stage writes at most remaining bytes of r into one transaction file.
 //
-// The bytes land under a staging name rather than the caller's chosen one. The
-// previous version created the file under its final name and wrote into it, so
-// an interrupted transfer left a truncated file that was indistinguishable from
-// a completed drop — and Extract's unwind only covers errors it lives to see,
-// not a SIGKILL or a power cut.
-func stage(r io.Reader, dir string, remaining int64) (path string, n int64, err error) {
+// The bytes land in a private directory rather than under the caller's chosen
+// name. os.Root confines the create beneath the already-open drop directory,
+// including if a directory entry is replaced with a symlink on a shared path.
+func stage(r io.Reader, root *os.Root, txnDir string, index int, remaining int64) (path string, n int64, err error) {
 	if remaining <= 0 {
 		return "", 0, errors.New("drop: archive exceeds the size limit")
 	}
 
-	f, err := os.CreateTemp(dir, stagePrefix+"*")
+	path = filepath.Join(txnDir, strconv.Itoa(index))
+	f, err := root.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, filePerm)
 	if err != nil {
-		return "", 0, fmt.Errorf("drop: create staging file in %s: %w", dir, err)
+		return "", 0, fmt.Errorf("drop: create staging file: %w", err)
 	}
-	path = f.Name()
 	defer f.Close()
 
-	// CreateTemp already uses 0600; setting it explicitly means the mode does
-	// not depend on that remaining true.
+	// OpenFile's mode is still subject to umask. Chmod explicitly so this does
+	// not depend on the daemon having installed its restrictive one first.
 	if err := f.Chmod(filePerm); err != nil {
 		return path, 0, fmt.Errorf("drop: restrict staging file: %w", err)
 	}
@@ -473,13 +642,17 @@ func stage(r io.Reader, dir string, remaining int64) (path string, n int64, err 
 	if n > remaining {
 		return path, n, errors.New("drop: archive exceeds the size limit")
 	}
+	// The file must be durable before a final name can point at its inode.
+	if err := f.Sync(); err != nil {
+		return path, n, fmt.Errorf("drop: sync staging file: %w", err)
+	}
 	if err := f.Close(); err != nil {
 		return path, n, fmt.Errorf("drop: write staging file: %w", err)
 	}
 	return path, n, nil
 }
 
-// publish gives a completed staging file its real name, adding a numeric
+// publish gives a completed transaction file its real name, adding a numeric
 // suffix if that name is taken.
 //
 // os.Link rather than os.Rename, and the distinction is the load-bearing part:
@@ -491,20 +664,22 @@ func stage(r io.Reader, dir string, remaining int64) (path string, n int64, err 
 //
 // Bounded rather than open-ended so that a sender cannot make the daemon walk
 // an unbounded sequence by repeatedly dropping the same name.
-func publish(staged, dir, name string) (string, error) {
+func publish(root *os.Root, staged, name string) (string, error) {
 	stem, ext := splitName(name)
 	for attempt := 0; attempt < maxCollisionAttempts; attempt++ {
 		candidate := name
 		if attempt > 0 {
 			candidate = stem + "-" + strconv.Itoa(attempt) + ext
 		}
-		path := filepath.Join(dir, candidate)
-		err := os.Link(staged, path)
+		// Go 1.24's os.Root does not yet expose Link. Both names are still
+		// derived inside the already-open root: staged is generated by this
+		// package and candidate is a validated basename.
+		err := os.Link(filepath.Join(root.Name(), staged), filepath.Join(root.Name(), candidate))
 		if err == nil {
-			// Only the staging name goes; the content lives on under the
-			// published name, which is now the same inode.
-			_ = os.Remove(staged)
-			return path, nil
+			// The staging link remains until every file in the transaction has
+			// a final name. Removing the transaction directory then commits the
+			// whole validated archive; rollback can remove the final links first.
+			return candidate, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return "", fmt.Errorf("drop: publish %s: %w", candidate, err)

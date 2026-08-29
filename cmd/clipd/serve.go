@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/colefailla/clipd/internal/clipboard"
 	"github.com/colefailla/clipd/internal/config"
@@ -106,6 +107,25 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	// commands keep the default Ctrl-C behaviour.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// A crash leaves a fresh private staging directory that is intentionally
+	// too young for the startup pass above. Revisit it once it is older than
+	// every possible connection instead of requiring yet another restart to
+	// recover the disk space.
+	go func() {
+		ticker := time.NewTicker(drop.StaleCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n := drop.CleanStale(resolvedDrop); n > 0 {
+					logger.Info("removed incomplete drops left by an earlier process", "count", n)
+				}
+			}
+		}
+	}()
 
 	if err := srv.Serve(ctx, ln); err != nil {
 		return fail(e, exitFailure, err)

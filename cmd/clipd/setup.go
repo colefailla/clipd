@@ -120,7 +120,9 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	}
 	if !server.IsSocketPath(cfg.Address) {
 		return failf(e, exitConfig,
-			"setup forwards a UNIX socket, but this daemon is configured to listen on %q; set address to a path first",
+			"setup forwards a UNIX socket, but this daemon is configured to listen on %q.\n"+
+				"       Set address to a socket path to use setup, or configure the host by hand:\n"+
+				"       see \"Hosts that cannot forward a socket\" in the README.",
 			cfg.Address)
 	}
 
@@ -150,7 +152,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	// own permissions. installScript creates it 0700.
 	remoteSocket := facts.home + "/.clipd/socket"
 	rcFile := rcFileFor(facts)
-	block := shellFunction(client, remoteSocket, facts.hasTar)
+	block := shellFunction(client, remoteSocket, facts.hasTar, facts.hasMktemp)
 
 	sshBlock, err := sshBlockFor(destination, remoteSocket, localSocket)
 	if err != nil {
@@ -165,10 +167,8 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	if !facts.hasTar {
 		fmt.Fprintf(e.stdout, "\n  note: %s has no tar, so 'clipd drop' is unavailable there.\n", destination)
 	} else if !facts.hasMktemp {
-		// The status file is how the function recovers tar's exit code from
-		// inside a pipeline. Without it a drop still works, but a tar that
-		// failed halfway cannot be distinguished from one that did not.
-		fmt.Fprintf(e.stdout, "\n  note: %s has no mktemp, so a partial 'clipd drop' cannot be detected.\n", destination)
+		fmt.Fprintf(e.stdout, "\n  note: %s has no mktemp, so file/archive drops are unavailable there;\n"+
+			"        clipboard copies and 'clipd drop --name' still work.\n", destination)
 	}
 	if unsupportedShell(facts.shell) {
 		fmt.Fprintf(e.stdout, "\n  note: %s does not read %s. The function is POSIX shell, so add\n"+
@@ -287,13 +287,14 @@ type capWriter struct {
 }
 
 func (w *capWriter) Write(p []byte) (int, error) {
+	written := len(p)
 	if room := w.max - w.b.Len(); room > 0 {
 		if len(p) > room {
 			p = p[:room]
 		}
 		w.b.Write(p)
 	}
-	return len(p), nil
+	return written, nil
 }
 
 func (w *capWriter) String() string { return w.b.String() }
@@ -422,17 +423,18 @@ func rcFileFor(f remoteFacts) string {
 // user types, so the two halves stay in sync in their head even though only
 // one of them is a program.
 //
-// Every variable is prefixed, because this runs in the user's interactive
-// shell and a bare `name` or `sock` would overwrite theirs.
-func shellFunction(client, socket string, hasTar bool) string {
+// The body is a subshell so none of its scratch variables or signal traps can
+// leak into the user's interactive shell. Names remain prefixed as well, which
+// keeps the generated block easy to audit when read on its own.
+func shellFunction(client, socket string, hasTar, hasMktemp bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", blockStart)
 	fmt.Fprintf(&b, "# Sends to the clipd daemon on the Mac, through the socket SSH forwards.\n")
 	fmt.Fprintf(&b, "# Managed by 'clipd setup'; edits between these markers are overwritten.\n")
-	fmt.Fprintf(&b, "clipd() {\n")
-	fmt.Fprintf(&b, "  _clipd_sock=%q\n", socket)
-	fmt.Fprintf(&b, "  _clipd_tar=0\n")
+	fmt.Fprintf(&b, "clipd() (\n")
+	fmt.Fprintf(&b, "  _clipd_sock=%s\n", shellQuote(socket))
 	fmt.Fprintf(&b, "  _clipd_reply=\n")
+	fmt.Fprintf(&b, "  _clipd_client=0\n")
 	fmt.Fprintf(&b, "  if [ ! -S \"$_clipd_sock\" ]; then\n")
 	fmt.Fprintf(&b, "    printf 'clipd: %%s is missing; reconnect with the socket forward\\n' \"$_clipd_sock\" >&2\n")
 	fmt.Fprintf(&b, "    return 1\n")
@@ -451,56 +453,88 @@ func shellFunction(client, socket string, hasTar bool) string {
 		// Reading the file is now what `clipd drop file` always means.
 		fmt.Fprintf(&b, "    if [ \"${1:-}\" = \"--name\" ]; then\n")
 		fmt.Fprintf(&b, "      shift\n")
-		fmt.Fprintf(&b, "      _clipd_name=${1:-}\n")
-		fmt.Fprintf(&b, "      if [ -z \"$_clipd_name\" ]; then\n")
-		fmt.Fprintf(&b, "        printf 'clipd drop: --name needs a filename\\n' >&2\n")
+		fmt.Fprintf(&b, "      if [ \"$#\" -ne 1 ] || [ -z \"${1:-}\" ]; then\n")
+		fmt.Fprintf(&b, "        printf 'clipd drop: --name needs exactly one filename\\n' >&2\n")
+		fmt.Fprintf(&b, "        return 64\n")
+		fmt.Fprintf(&b, "      fi\n")
+		fmt.Fprintf(&b, "      _clipd_name=$1\n")
+		// JSON does not permit literal control characters in a string, and the
+		// daemon refuses them in filenames anyway. Reject them before framing so a
+		// newline cannot turn one request envelope into several lines.
+		fmt.Fprintf(&b, "      case $_clipd_name in *'\n'*)\n")
+		fmt.Fprintf(&b, "        printf 'clipd drop: the filename contains a control character\\n' >&2; return 64 ;;\n")
+		fmt.Fprintf(&b, "      esac\n")
+		fmt.Fprintf(&b, "      if printf '%%s' \"$_clipd_name\" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then\n")
+		fmt.Fprintf(&b, "        printf 'clipd drop: the filename contains a control character\\n' >&2\n")
 		fmt.Fprintf(&b, "        return 64\n")
 		fmt.Fprintf(&b, "      fi\n")
 		// The name lands inside a JSON string, so the two characters JSON
 		// escapes have to be escaped here. Everything else the daemon rejects.
-		fmt.Fprintf(&b, "      _clipd_esc=$(printf '%%s' \"$_clipd_name\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n")
-		fmt.Fprintf(&b, "      _clipd_reply=$( { printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\"}\\n' \"$_clipd_esc\"; cat; } | %s )\n", client)
+		fmt.Fprintf(&b, "      _clipd_esc=$(printf '%%s' \"$_clipd_name\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g') || return 1\n")
+		fmt.Fprintf(&b, "      if _clipd_reply=$( { printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\"}\\n' \"$_clipd_esc\"; cat; } | %s ); then :; else _clipd_client=$?; fi\n", client)
 		fmt.Fprintf(&b, "    else\n")
 		fmt.Fprintf(&b, "      if [ $# -eq 0 ]; then\n")
 		fmt.Fprintf(&b, "        printf 'clipd drop: no files given (use --name to send stdin)\\n' >&2\n")
 		fmt.Fprintf(&b, "        return 64\n")
 		fmt.Fprintf(&b, "      fi\n")
-		// tar's status is lost in a pipeline, which reports only its last
-		// command. A tar that fails halfway still emits a valid archive of the
-		// files it managed to read, so the daemon accepts it and answers "ok"
-		// for an incomplete transfer — and `clipd drop x && rm x` deletes the
-		// original. A status file is the portable way to recover it.
-		fmt.Fprintf(&b, "      _clipd_rc=$(mktemp 2>/dev/null)\n")
-		// The -- is what keeps a file called "--use-compress-program=curl"
-		// from being read by tar as an option and executed.
-		fmt.Fprintf(&b, "      _clipd_reply=$( { printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n'; COPYFILE_DISABLE=1 tar cf - -- \"$@\"; echo \"$?\" >\"${_clipd_rc:-/dev/null}\"; } | %s )\n", client)
-		fmt.Fprintf(&b, "      if [ -n \"$_clipd_rc\" ]; then\n")
-		fmt.Fprintf(&b, "        _clipd_tar=$(cat \"$_clipd_rc\" 2>/dev/null)\n")
-		fmt.Fprintf(&b, "        rm -f \"$_clipd_rc\"\n")
-		fmt.Fprintf(&b, "      fi\n")
+		if hasMktemp {
+			// Do not stream tar directly to the daemon. tar can emit a valid
+			// prefix and then fail, which previously let the daemon publish a
+			// partial drop before the shell learned tar's status. Building the
+			// complete framed request first means the socket is never opened on
+			// that failure path. The command substitution is a subshell, so its
+			// signal traps do not replace traps in the user's interactive shell.
+			fmt.Fprintf(&b, "      if ! _clipd_reply=$(\n")
+			fmt.Fprintf(&b, "        _clipd_payload=$(mktemp 2>/dev/null) || { printf 'clipd drop: could not create a private temporary file; nothing was sent\\n' >&2; exit 1; }\n")
+			fmt.Fprintf(&b, "        trap 'rm -f \"$_clipd_payload\"' 0\n")
+			fmt.Fprintf(&b, "        trap 'exit 1' 1 2 15\n")
+			fmt.Fprintf(&b, "        printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n' > \"$_clipd_payload\" || exit 1\n")
+			// The -- is what keeps a file called
+			// "--use-compress-program=curl" from being read by tar as an option
+			// and executed.
+			fmt.Fprintf(&b, "        if ! COPYFILE_DISABLE=1 tar cf - -- \"$@\" >> \"$_clipd_payload\"; then\n")
+			fmt.Fprintf(&b, "          printf 'clipd drop: tar failed; nothing was sent\\n' >&2\n")
+			fmt.Fprintf(&b, "          exit 1\n")
+			fmt.Fprintf(&b, "        fi\n")
+			fmt.Fprintf(&b, "        %s < \"$_clipd_payload\"\n", client)
+			fmt.Fprintf(&b, "      ); then\n")
+			fmt.Fprintf(&b, "        if [ -n \"${_clipd_reply:-}\" ]; then printf '%%s\\n' \"$_clipd_reply\"; fi\n")
+			fmt.Fprintf(&b, "        return 1\n")
+			fmt.Fprintf(&b, "      fi\n")
+		} else {
+			fmt.Fprintf(&b, "      printf 'clipd drop: this host has no mktemp; file/archive drop was not sent (use --name for stdin)\\n' >&2\n")
+			fmt.Fprintf(&b, "      return 1\n")
+		}
 		fmt.Fprintf(&b, "    fi\n")
 	} else {
 		fmt.Fprintf(&b, "    printf 'clipd drop: this host has no tar\\n' >&2; return 1\n")
 	}
 	fmt.Fprintf(&b, "  else\n")
-	fmt.Fprintf(&b, "    _clipd_reply=$(%s)\n", client)
+	fmt.Fprintf(&b, "    if _clipd_reply=$(%s); then :; else _clipd_client=$?; fi\n", client)
 	fmt.Fprintf(&b, "  fi\n")
 	// The daemon's reply is the whole user interface for the result, so it is
 	// printed whatever it says; the status prefix on it is what turns the
 	// result into an exit code.
 	fmt.Fprintf(&b, "  if [ -n \"$_clipd_reply\" ]; then printf '%%s\\n' \"$_clipd_reply\"; fi\n")
-	fmt.Fprintf(&b, "  if [ \"${_clipd_tar:-0}\" != \"0\" ]; then\n")
-	fmt.Fprintf(&b, "    printf 'clipd drop: tar exited %%s; the drop may be incomplete\\n' \"$_clipd_tar\" >&2\n")
-	fmt.Fprintf(&b, "    return 1\n")
-	fmt.Fprintf(&b, "  fi\n")
+	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ]; then return 1; fi\n")
 	fmt.Fprintf(&b, "  case $_clipd_reply in\n")
 	fmt.Fprintf(&b, "    'clipd: ok: '*) return 0 ;;\n")
 	fmt.Fprintf(&b, "    '') printf 'clipd: no reply from the daemon\\n' >&2; return 1 ;;\n")
 	fmt.Fprintf(&b, "    *) return 1 ;;\n")
 	fmt.Fprintf(&b, "  esac\n")
-	fmt.Fprintf(&b, "}\n")
+	fmt.Fprintf(&b, ")\n")
 	fmt.Fprintf(&b, "%s\n", blockEnd)
 	return b.String()
+}
+
+// shellQuote renders one literal POSIX shell word.
+//
+// Double quotes are insufficient here: a remote home directory containing a
+// dollar sign or backtick would still perform expansion when the generated rc
+// file is sourced. A single quote is represented by ending the quoted word,
+// writing a quoted quote, and starting it again.
+func shellQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", "'\"'\"'") + "'"
 }
 
 // installScript rewrites the managed block in a remote rc file.
@@ -511,9 +545,9 @@ func shellFunction(client, socket string, hasTar bool) string {
 // a temp file created by mktemp is 0600, and silently tightening someone's
 // .bashrc is not setup's business.
 //
-// The marker count is checked first. The awk pass skips from a start marker to
-// the next end marker, so a file with an unmatched start — someone deleted half
-// a block by hand — used to lose everything after it.
+// The awk pass validates marker order while it writes only to the temporary
+// file. A malformed rc file is therefore rejected before its contents or its
+// backup are changed.
 const installScript = `set -e
 rc="%s"
 start='` + blockStart + `'
@@ -528,23 +562,43 @@ chmod 700 "$HOME/.clipd"
 # A socket directly in $HOME is clipd's own leftover, from before the directory.
 if [ -S "$HOME/.clipd.sock" ]; then rm -f "$HOME/.clipd.sock"; fi
 
+# setup itself must also work on the hosts where mktemp is absent. This file is
+# inside clipd's private directory, and noclobber refuses the vanishingly rare
+# stale-file/PID-reuse collision rather than following or overwriting it.
+tmp="$HOME/.clipd/setup.$$"
+if ! (umask 077; set -C; : > "$tmp") 2>/dev/null; then
+  printf 'clipd: could not create private setup file %%s\n' "$tmp" >&2
+  exit 1
+fi
+trap 'rm -f "$tmp"' 0
 if [ -f "$rc" ]; then
-  opens=$(grep -c -- "^$start$" "$rc" || true)
-  closes=$(grep -c -- "^$end$" "$rc" || true)
-  if [ "$opens" != "$closes" ]; then
-    printf 'clipd: %%s has %%s start markers and %%s end markers; fix the block by hand\n' "$rc" "$opens" "$closes" >&2
+  if ! awk -v s="$start" -v e="$end" '
+    {
+      line=$0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line == s) {
+        if (open || seen) bad=1
+        open=1
+        next
+      }
+      if (line == e) {
+        if (!open) bad=1
+        open=0
+        seen=1
+        next
+      }
+      if (!open) print
+    }
+    END { if (open || bad) exit 1 }
+  ' "$rc" > "$tmp"; then
+    printf 'clipd: %%s has malformed clipd markers; expected at most one start followed by one end\n' "$rc" >&2
     exit 1
   fi
   # The first backup is the one worth keeping: it is the file before clipd
   # touched it. Later runs would replace it with a copy that already has a
   # clipd block in it.
   [ -f "$rc.clipd-backup" ] || cp "$rc" "$rc.clipd-backup"
-fi
-
-tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
-if [ -f "$rc" ]; then
-  awk -v s="$start" -v e="$end" '$0==s{skip=1} skip==0{print} $0==e{skip=0}' "$rc" > "$tmp"
 else
   : > "$tmp"
 fi
@@ -670,8 +724,12 @@ func installSSHConfig(ctx context.Context, destination, block string) (path stri
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return path, false, fmt.Errorf("create %s: %w", dir, err)
 	}
+	writePath, err := resolvedWritePath(path)
+	if err != nil {
+		return path, false, err
+	}
 
-	existing, err := os.ReadFile(path)
+	existing, err := os.ReadFile(writePath)
 	if err != nil && !os.IsNotExist(err) {
 		return path, false, fmt.Errorf("read %s: %w", path, err)
 	}
@@ -717,10 +775,45 @@ func installSSHConfig(ctx context.Context, destination, block string) (path stri
 			}
 		}
 	}
-	if err := writeFileAtomic(path, []byte(updated), 0o600); err != nil {
+	if err := writeFileAtomic(writePath, []byte(updated), 0o600); err != nil {
 		return path, false, err
 	}
 	return path, true, nil
+}
+
+// resolvedWritePath preserves a config symlink while retaining atomic writes.
+//
+// Replacing ~/.ssh/config itself would replace the symlink, which is a common
+// way to manage dotfiles. Resolve an existing link once and atomically replace
+// its regular-file target instead. A dangling link is refused: guessing where
+// to create its target could write outside the user's intended location.
+func resolvedWritePath(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("refusing to replace %s: it is not a regular file", path)
+		}
+		return path, nil
+	}
+
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", path, err)
+	}
+	targetInfo, err := os.Stat(target)
+	if err != nil {
+		return "", fmt.Errorf("inspect target of %s: %w", path, err)
+	}
+	if !targetInfo.Mode().IsRegular() {
+		return "", fmt.Errorf("refusing to replace %s: its target %s is not a regular file", path, target)
+	}
+	return target, nil
 }
 
 // verifySSHConfig asks ssh to parse a candidate file before it replaces the
@@ -802,31 +895,35 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 
 // stripBlock removes a previously managed block, markers included.
 //
-// An unmatched start marker is an error rather than a silent truncation. The
-// previous version skipped from a start marker to the end of the file looking
-// for a close that was not there, so a block someone had half-deleted by hand
-// took everything after it out of ~/.ssh/config on the next run.
+// Exactly zero or one complete block is accepted. Reversed, nested, duplicate,
+// or unmatched markers mean the file was edited by hand or corrupted; refusing
+// it is safer than guessing which surrounding lines belong to the user.
 func stripBlock(s, start, end string) (string, error) {
 	var out []string
-	skip := false
+	inside := false
+	seen := false
 	for _, line := range strings.Split(s, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == start {
-			if skip {
-				return "", fmt.Errorf("found a second %q before the matching %q; fix the clipd block by hand", start, end)
+			if inside || seen {
+				return "", fmt.Errorf("found duplicate or nested %q; fix the clipd block by hand", start)
 			}
-			skip = true
+			inside = true
 			continue
 		}
 		if trimmed == end {
-			skip = false
+			if !inside {
+				return "", fmt.Errorf("found %q before a matching %q; fix the clipd block by hand", end, start)
+			}
+			inside = false
+			seen = true
 			continue
 		}
-		if !skip {
+		if !inside {
 			out = append(out, line)
 		}
 	}
-	if skip {
+	if inside {
 		return "", fmt.Errorf("found %q with no matching %q; fix the clipd block by hand", start, end)
 	}
 	return strings.TrimRight(strings.Join(out, "\n"), "\n"), nil

@@ -28,6 +28,11 @@ const (
 
 	// launchctlTimeout bounds each launchctl invocation.
 	launchctlTimeout = 15 * time.Second
+
+	// rollbackTimeout covers one bootout, one bootstrap, and the short retry
+	// delays between bootstrap attempts. It is deliberately independent of the
+	// caller's context: cancellation must not strand an upgrade halfway through.
+	rollbackTimeout = 2*launchctlTimeout + time.Second
 )
 
 // launchctlPath is the binary this package drives.
@@ -121,6 +126,14 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 	}
 	res.LogPath = logPath
 
+	// Resolve the launchd domain before touching the installed plist. If the
+	// current account cannot be identified, the existing agent must remain
+	// exactly as it was.
+	domain, err := guiDomain()
+	if err != nil {
+		return res, err
+	}
+
 	if err := os.MkdirAll(filepath.Dir(logPath), logDirPerm); err != nil {
 		return res, fmt.Errorf("create log directory: %w", err)
 	}
@@ -151,60 +164,152 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
 		return res, fmt.Errorf("create LaunchAgents directory: %w", err)
 	}
-	// The plist as it stands, kept so a failed install can put it back. Without
-	// it, overwriting the file and then failing every bootstrap attempt left the
-	// user with no running daemon and no previous job to fall back on — the one
-	// outcome worse than the install simply not happening.
-	previous, hadPrevious := os.ReadFile(plistPath)
-	if err := os.WriteFile(plistPath, data, plistPerm); err != nil {
-		return res, fmt.Errorf("write %s: %w", plistPath, err)
-	}
-	if err := os.Chmod(plistPath, plistPerm); err != nil {
-		return res, fmt.Errorf("set permissions on %s: %w", plistPath, err)
-	}
 
-	domain, err := guiDomain()
-	if err != nil {
-		return res, err
+	// Keep the exact previous contents and mode so every failure after bootout
+	// can restore a working installation. Errors other than a missing file are
+	// real preflight failures; treating them as "not installed" could destroy a
+	// plist that merely could not be read.
+	previous, readErr := os.ReadFile(plistPath)
+	hadPrevious := readErr == nil
+	previousMode := plistPerm
+	if hadPrevious {
+		info, err := os.Stat(plistPath)
+		if err != nil {
+			return res, fmt.Errorf("inspect existing %s: %w", plistPath, err)
+		}
+		previousMode = info.Mode().Perm()
+	} else if !errors.Is(readErr, fs.ErrNotExist) {
+		return res, fmt.Errorf("read existing %s: %w", plistPath, readErr)
 	}
-
-	// Unload any previous incarnation first: bootstrap fails outright if the
-	// label is already loaded, which would make `clipd install` a one-shot
-	// command that breaks on upgrade.
-	_, _ = runLaunchctl(ctx, "bootout", domain+"/"+Label)
 
 	// A service the user once ran `launchctl disable` on stays disabled
 	// through bootstrap, and the failure mode — loads fine, never starts — is
-	// invisible. Enabling is idempotent.
-	_, _ = runLaunchctl(ctx, "enable", domain+"/"+Label)
+	// invisible. Do this before bootout so an enable failure cannot stop the
+	// currently working agent. Enabling is idempotent.
+	if _, err := runLaunchctl(ctx, "enable", domain+"/"+Label); err != nil {
+		return res, fmt.Errorf("enable LaunchAgent: %w", err)
+	}
+
+	// Unload any previous incarnation next: bootstrap fails outright if the
+	// label is already loaded. A missing service is the normal first-install
+	// case; every other bootout error must stop before the plist is replaced.
+	if out, err := runLaunchctl(ctx, "bootout", domain+"/"+Label); err != nil && !isNotLoaded(out) {
+		return res, fmt.Errorf("unload existing LaunchAgent: %w", err)
+	}
+
+	// From this point onward the previous job has been stopped. Any failure
+	// must run rollback even when ctx was canceled; otherwise an interrupted
+	// install could leave neither the old nor the new agent running.
+	rollback := func(cause error) error {
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		defer cancel()
+
+		rollbackErr := rollbackInstall(rollbackCtx, domain, plistPath, previous, previousMode, hadPrevious)
+		if rollbackErr != nil {
+			return fmt.Errorf("%w; rollback failed: %v", cause, rollbackErr)
+		}
+		if hadPrevious {
+			return fmt.Errorf("%w (the previous LaunchAgent was restored)", cause)
+		}
+		return cause
+	}
+
+	if err := writeFileAtomic(plistPath, data, plistPerm); err != nil {
+		cause := fmt.Errorf("write %s: %w", plistPath, err)
+		return res, rollback(cause)
+	}
 
 	// bootout is asynchronous: the domain may still be tearing down the old
 	// job when bootstrap arrives, which surfaces as EBUSY.
+	if err := bootstrapWithRetry(ctx, domain, plistPath); err != nil {
+		return res, rollback(fmt.Errorf("load LaunchAgent: %w", err))
+	}
+	return res, nil
+}
+
+// bootstrapWithRetry tolerates launchd's short asynchronous bootout window.
+// It returns cancellation directly so callers can distinguish an interrupted
+// install while still using a separate context for rollback.
+func bootstrapWithRetry(ctx context.Context, domain, plistPath string) error {
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		if _, err := runLaunchctl(ctx, "bootstrap", domain, plistPath); err == nil {
-			return res, nil
+			return nil
 		} else {
 			lastErr = err
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if attempt == 4 {
+			break
+		}
+
+		timer := time.NewTimer(200 * time.Millisecond)
 		select {
 		case <-ctx.Done():
-			return res, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
 		}
+	}
+	return lastErr
+}
+
+// rollbackInstall removes any replacement that launchd may have partially
+// loaded, then restores the exact prior on-disk state. A previous plist is
+// loaded again; a first install is returned to having no plist at all.
+func rollbackInstall(ctx context.Context, domain, plistPath string, previous []byte, previousMode fs.FileMode, hadPrevious bool) error {
+	var rollbackErrs []error
+
+	if out, err := runLaunchctl(ctx, "bootout", domain+"/"+Label); err != nil && !isNotLoaded(out) {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("unload replacement: %w", err))
 	}
 
-	// Every attempt failed, and the old job was booted out to make room for
-	// this one. Put the previous plist back and load it, so a failed upgrade
-	// leaves the daemon that was working before rather than nothing at all.
-	if hadPrevious == nil {
-		if err := os.WriteFile(plistPath, previous, plistPerm); err == nil {
-			if _, err := runLaunchctl(ctx, "bootstrap", domain, plistPath); err == nil {
-				return res, fmt.Errorf("load LaunchAgent: %w (the previous one was restored)", lastErr)
-			}
+	if !hadPrevious {
+		if err := os.Remove(plistPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("remove replacement plist: %w", err))
 		}
+		return errors.Join(rollbackErrs...)
 	}
-	return res, fmt.Errorf("load LaunchAgent: %w", lastErr)
+
+	if err := writeFileAtomic(plistPath, previous, previousMode); err != nil {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("restore previous plist: %w", err))
+		return errors.Join(rollbackErrs...)
+	}
+	if err := bootstrapWithRetry(ctx, domain, plistPath); err != nil {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("reload previous LaunchAgent: %w", err))
+	}
+	return errors.Join(rollbackErrs...)
+}
+
+// writeFileAtomic writes a complete plist to a temporary file in the same
+// directory, then renames it into place. launchd can therefore see either the
+// old complete plist or the new complete plist, never a truncated file.
+func writeFileAtomic(path string, data []byte, perm fs.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // Restart asks launchd to stop and start the agent.

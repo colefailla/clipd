@@ -146,9 +146,14 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 		return Request{}, fmt.Errorf("protocol: parse request: %w", err)
 	}
 	// One JSON value per frame. Decoding once and stopping would silently
-	// accept a second value after the first, which is a way to make the
-	// daemon and the sender disagree about what was requested.
-	if dec.More() {
+	// accept a second value after the first. Decoder.More reports whether an
+	// array or object has another element; it is not a top-level EOF check and
+	// incorrectly accepts unmatched closing delimiters such as an extra "}".
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return Request{}, fmt.Errorf("protocol: trailing data after the request frame: %w", err)
+		}
 		return Request{}, errors.New("protocol: trailing data after the request frame")
 	}
 	if req.Type == "" {

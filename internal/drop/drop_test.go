@@ -326,6 +326,193 @@ func TestExtractCleansUpAfterAFailure(t *testing.T) {
 	assertDirEmpty(t, dir)
 }
 
+// A valid prefix is not a complete archive. In particular, tar can emit one
+// good file and then fail while opening the next input. Nothing from that
+// prefix may become visible under a final name while Extract is still waiting
+// to learn whether the rest of the archive is valid.
+func TestExtractPublishesOnlyAfterTheWholeArchiveArrives(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "drop")
+	pr, pw := io.Pipe()
+	firstWritten := make(chan struct{})
+	finish := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		tw := tar.NewWriter(pw)
+		if err := tw.WriteHeader(&tar.Header{Name: "first.txt", Mode: 0o600, Size: 5, Typeflag: tar.TypeReg}); err != nil {
+			writerDone <- err
+			return
+		}
+		if _, err := tw.Write([]byte("first")); err != nil {
+			writerDone <- err
+			return
+		}
+		if err := tw.Flush(); err != nil {
+			writerDone <- err
+			return
+		}
+		close(firstWritten)
+		<-finish
+		if err := tw.Close(); err != nil {
+			writerDone <- err
+			return
+		}
+		writerDone <- pw.Close()
+	}()
+
+	type outcome struct {
+		res Result
+		err error
+	}
+	extracted := make(chan outcome, 1)
+	go func() {
+		res, err := Extract(pr, Options{Dir: dir})
+		extracted <- outcome{res: res, err: err}
+	}()
+	<-firstWritten
+
+	// Wait until the first entry has reached private staging; checking sooner
+	// would prove only that the extractor had not read it yet.
+	deadline := time.Now().Add(2 * time.Second)
+	for !hasStagedData(t, dir) {
+		if time.Now().After(deadline) {
+			t.Fatal("first archive entry never reached staging")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "first.txt")); !os.IsNotExist(err) {
+		t.Fatalf("first.txt became visible before archive EOF: %v", err)
+	}
+
+	close(finish)
+	if err := <-writerDone; err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	got := <-extracted
+	if got.err != nil {
+		t.Fatalf("Extract: %v", got.err)
+	}
+	if len(got.res.Names) != 1 || got.res.Names[0] != "first.txt" {
+		t.Fatalf("wrote %v, want [first.txt]", got.res.Names)
+	}
+}
+
+func hasStagedData(t *testing.T, dir string) bool {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("read drop dir: %v", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), stageDirPrefix) {
+			continue
+		}
+		staged, err := os.ReadDir(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatalf("read staging dir: %v", err)
+		}
+		for _, file := range staged {
+			if file.Name() == "0" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestCleanStaleRemovesOnlyMarkedTransactionDirectories(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, ".clipd-part-real-file")
+	if err := os.WriteFile(legacy, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write legacy-shaped file: %v", err)
+	}
+	lookalike := filepath.Join(dir, stageDirPrefix+"user-directory")
+	if err := os.Mkdir(lookalike, 0o700); err != nil {
+		t.Fatalf("make lookalike: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(lookalike, "notes"), []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write lookalike: %v", err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	stale, err := beginTransaction(root)
+	if err != nil {
+		root.Close()
+		t.Fatalf("begin stale transaction: %v", err)
+	}
+	fresh, err := beginTransaction(root)
+	if err != nil {
+		root.Close()
+		t.Fatalf("begin fresh transaction: %v", err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatalf("close root: %v", err)
+	}
+
+	old := time.Now().Add(-2 * StaleCleanupInterval)
+	for _, path := range []string{legacy, lookalike, filepath.Join(dir, stale.dir)} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("age %s: %v", path, err)
+		}
+	}
+
+	if got := CleanStale(dir); got != 1 {
+		t.Fatalf("CleanStale removed %d transactions, want 1", got)
+	}
+	for _, path := range []string{legacy, lookalike, filepath.Join(dir, fresh.dir)} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("CleanStale removed %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, stale.dir)); !os.IsNotExist(err) {
+		t.Errorf("stale transaction still exists: %v", err)
+	}
+}
+
+func TestRollbackDoesNotDeleteAReplacedPublishedName(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	txn, err := beginTransaction(root)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	staged, _, err := stage(strings.NewReader("received"), root, txn.dir, 0, 64)
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	name, err := publish(root, staged, "report.txt")
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if err := root.Remove(name); err != nil {
+		t.Fatalf("move published name out of the way: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("user replacement"), 0o600); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+
+	err = rollback(root, txn.dir, []publishedFile{{staged: staged, name: name}}, errors.New("later publish failed"))
+	if err == nil || !strings.Contains(err.Error(), "left the replacement untouched") {
+		t.Fatalf("rollback error = %v, want a replacement warning", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if string(got) != "user replacement" {
+		t.Fatalf("rollback changed replacement to %q", got)
+	}
+}
+
 // TestSafeNameRejectsUnusableNames exercises safeName directly rather than
 // through Extract, because Go's tar writer refuses to encode some of these —
 // a trailing slash, for instance. A hostile archive is not produced by Go's

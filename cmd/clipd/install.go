@@ -59,9 +59,14 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 		return fail(e, exitFailure, err)
 	}
 
-	socket, err := server.ExpandPath(cfg.Address)
-	if err != nil {
-		return fail(e, exitConfig, err)
+	listenerLabel := "address"
+	listenerAddress := cfg.Address
+	if server.IsSocketPath(cfg.Address) {
+		listenerLabel = "socket"
+		listenerAddress, err = server.ExpandPath(cfg.Address)
+		if err != nil {
+			return fail(e, exitConfig, err)
+		}
 	}
 	dropDir, err := server.ExpandPath(cfg.DropDir)
 	if err != nil {
@@ -74,11 +79,16 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 	fmt.Fprintf(out, "  plist        %s\n", res.PlistPath)
 	fmt.Fprintf(out, "  log          %s\n", res.LogPath)
 	fmt.Fprintf(out, "  config       %s\n", path)
-	fmt.Fprintf(out, "  socket       %s\n", socket)
+	fmt.Fprintf(out, "  %-12s %s\n", listenerLabel, listenerAddress)
 	fmt.Fprintf(out, "  drop dir     %s\n", dropDir)
 
-	fmt.Fprintf(out, "\nNothing is listening on the network: the socket is a file, and it\n")
-	fmt.Fprintf(out, "reaches other machines only when SSH forwards it.\n")
+	if server.IsSocketPath(cfg.Address) {
+		fmt.Fprintf(out, "\nNothing is listening on the network: the socket is a file, and it\n")
+		fmt.Fprintf(out, "reaches other machines only when SSH forwards it.\n")
+	} else {
+		fmt.Fprintf(out, "\nThe daemon is using the loopback TCP fallback. It is not reachable from\n")
+		fmt.Fprintf(out, "your network, but other local accounts can reach a loopback port.\n")
+	}
 	fmt.Fprintf(out, "\nTo use it from a remote host:\n\n  clipd setup <ssh-host>\n")
 	return exitOK
 }

@@ -1,12 +1,36 @@
 package main
 
 import (
+	"archive/tar"
+	"bufio"
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/colefailla/clipd/internal/protocol"
 )
+
+func TestCapWriterReportsDiscardedBytesAsAccepted(t *testing.T) {
+	t.Parallel()
+
+	w := &capWriter{max: 3}
+	if n, err := w.Write([]byte("abcdef")); err != nil || n != 6 {
+		t.Fatalf("first Write = %d, %v; want 6, nil", n, err)
+	}
+	if n, err := w.Write([]byte("gh")); err != nil || n != 2 {
+		t.Fatalf("second Write = %d, %v; want 2, nil", n, err)
+	}
+	if got := w.String(); got != "abc" {
+		t.Fatalf("buffered output = %q, want %q", got, "abc")
+	}
+}
 
 func TestClientCommandPicksWhatTheHostHas(t *testing.T) {
 	t.Parallel()
@@ -94,7 +118,7 @@ func TestShellFunctionIsValidShell(t *testing.T) {
 	clients := []string{`nc -N -U "$_clipd_sock"`, `nc -U "$_clipd_sock"`, `socat - UNIX-CLIENT:"$_clipd_sock"`}
 	for _, client := range clients {
 		for _, hasTar := range []bool{true, false} {
-			block := shellFunction(client, "/home/cole/.clipd.sock", hasTar)
+			block := shellFunction(client, "/home/cole/.clipd.sock", hasTar, hasTar)
 
 			cmd := exec.Command(sh, "-n")
 			cmd.Stdin = strings.NewReader(block)
@@ -106,12 +130,44 @@ func TestShellFunctionIsValidShell(t *testing.T) {
 	}
 }
 
+func TestShellFunctionQuotesSocketAsLiteralShellData(t *testing.T) {
+	t.Parallel()
+
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh available")
+	}
+
+	socket := "/home/$USER/`printf injected`/it's a \"socket\""
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, socket, true, true)
+	var assignment string
+	for _, line := range strings.Split(block, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "_clipd_sock=") {
+			assignment = strings.TrimSpace(line)
+			break
+		}
+	}
+	if assignment == "" {
+		t.Fatal("generated function has no socket assignment")
+	}
+
+	cmd := exec.Command(sh, "-c", assignment+`; printf '%s' "$_clipd_sock"`)
+	cmd.Env = append(os.Environ(), "USER=expanded-by-shell")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("evaluate socket assignment: %v", err)
+	}
+	if got := string(out); got != socket {
+		t.Fatalf("socket assignment expanded shell syntax: got %q, want %q\n%s", got, socket, assignment)
+	}
+}
+
 // TestShellFunctionSendsTheRightFrame pins the two shapes the daemon parses:
 // a bare stream for the clipboard, and magic plus envelope plus tar for a drop.
 func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd.sock", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd.sock", true, true)
 
 	if !strings.Contains(block, `clipd:magic:v1\n{"type":"drop"}\n`) {
 		t.Errorf("the drop path does not emit the magic frame:\n%s", block)
@@ -134,12 +190,251 @@ func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 func TestShellFunctionRefusesDropWithoutTar(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd.sock", false)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd.sock", false, false)
 	if strings.Contains(block, "tar cf") {
 		t.Errorf("the function uses tar on a host that has none:\n%s", block)
 	}
 	if !strings.Contains(block, "no tar") {
 		t.Errorf("the function does not explain why drop is unavailable:\n%s", block)
+	}
+}
+
+func TestShellFunctionRefusesArchiveDropWithoutMktemp(t *testing.T) {
+	t.Parallel()
+
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd.sock", true, false)
+	if strings.Contains(block, "tar cf") {
+		t.Fatalf("the function can start an archive without a safe temporary file:\n%s", block)
+	}
+	if !strings.Contains(block, "has no mktemp") || !strings.Contains(block, "was not sent") {
+		t.Fatalf("the function does not explain why archive drops are refused:\n%s", block)
+	}
+	if !strings.Contains(block, `"type":"drop","name":"%s"`) {
+		t.Fatalf("refusing archive drops also removed --name support:\n%s", block)
+	}
+}
+
+func TestShellFunctionValidatesAndEscapesNamedDrops(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh available")
+	}
+	dir, err := os.MkdirTemp("", "clipd-name-")
+	if err != nil {
+		t.Fatalf("create short test directory: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "socket")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("create test socket: %v", err)
+	}
+	defer listener.Close()
+
+	called := filepath.Join(dir, "called")
+	capture := filepath.Join(dir, "request")
+	clientPath := filepath.Join(dir, "client.sh")
+	clientScript := "#!/bin/sh\n" +
+		`: > "$CLIPD_TEST_CALLED" || exit 1` + "\n" +
+		`cat > "$CLIPD_TEST_CAPTURE" || exit 1` + "\n" +
+		`printf 'clipd: ok: dropped\n'` + "\n"
+	if err := os.WriteFile(clientPath, []byte(clientScript), 0o600); err != nil {
+		t.Fatalf("write fake client: %v", err)
+	}
+	block := shellFunction("sh "+shellQuote(clientPath), socket, true, true)
+
+	for _, tc := range []struct {
+		name string
+		args string
+	}{
+		{name: "missing filename", args: "--name"},
+		{name: "extra argument", args: "--name safe.txt ignored.txt"},
+		{name: "control character", args: "--name " + shellQuote("bad\nname.txt")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Remove(called)
+			cmd := exec.Command(sh, "-c", block+"\nprintf payload | clipd drop "+tc.args)
+			cmd.Env = append(os.Environ(), "CLIPD_TEST_CALLED="+called, "CLIPD_TEST_CAPTURE="+capture)
+			out, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != exitUsage {
+				t.Fatalf("exit = %v, output %q; want %d", err, out, exitUsage)
+			}
+			if _, err := os.Stat(called); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("client ran for invalid arguments: %v", err)
+			}
+		})
+	}
+
+	name := `quote"and\backslash.txt`
+	cmd := exec.Command(sh, "-c", block+"\nprintf payload | clipd drop --name "+shellQuote(name))
+	cmd.Env = append(os.Environ(), "CLIPD_TEST_CALLED="+called, "CLIPD_TEST_CAPTURE="+capture)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("valid named drop failed: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatalf("read captured request: %v", err)
+	}
+	r := bufio.NewReader(bytes.NewReader(data))
+	structured, err := protocol.Sniff(r)
+	if err != nil || !structured {
+		t.Fatalf("Sniff = %v, %v; want a structured request", structured, err)
+	}
+	req, err := protocol.ReadRequest(r)
+	if err != nil {
+		t.Fatalf("ReadRequest: %v", err)
+	}
+	if req.Name != name {
+		t.Fatalf("decoded name = %q, want %q", req.Name, name)
+	}
+	body, err := io.ReadAll(r)
+	if err != nil || string(body) != "payload" {
+		t.Fatalf("body = %q, %v; want payload", body, err)
+	}
+}
+
+func TestShellFunctionDoesNotChangeInteractiveVariables(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh available")
+	}
+	dir, err := os.MkdirTemp("", "clipd-vars-")
+	if err != nil {
+		t.Fatalf("create short test directory: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "socket")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("create test socket: %v", err)
+	}
+	defer listener.Close()
+
+	block := shellFunction(`printf 'clipd: ok: copied\n'`, socket, true, true)
+	script := `_clipd_sock=mine; _clipd_reply=mine; _clipd_client=73
+` + block + `
+clipd </dev/null >/dev/null || exit
+printf '%s|%s|%s' "$_clipd_sock" "$_clipd_reply" "$_clipd_client"
+`
+	out, err := exec.Command(sh, "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("run generated function: %v\n%s", err, out)
+	}
+	if got := string(out); got != "mine|mine|73" {
+		t.Fatalf("interactive variables changed to %q", got)
+	}
+}
+
+// TestShellFunctionOnlySendsCompleteArchives covers the failure shape that is
+// easy to miss: tar can write a valid archive prefix and then exit non-zero.
+// The client must not be invoked at all until that exit status is known.
+func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh available")
+	}
+
+	tests := []struct {
+		name       string
+		arguments  string
+		wantSent   bool
+		wantStatus string
+	}{
+		{name: "complete archive", arguments: "source.txt", wantSent: true},
+		{name: "tar fails after one file", arguments: "source.txt missing.txt", wantStatus: "nothing was sent"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// macOS caps UNIX socket paths near 104 bytes, while t.TempDir's
+			// test-derived name can exceed that before "/socket" is appended.
+			dir, err := os.MkdirTemp("", "clipd-shell-")
+			if err != nil {
+				t.Fatalf("create short test directory: %v", err)
+			}
+			t.Cleanup(func() { os.RemoveAll(dir) })
+			socket := filepath.Join(dir, "socket")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatalf("create test socket: %v", err)
+			}
+			defer listener.Close()
+
+			if err := os.WriteFile(filepath.Join(dir, "source.txt"), []byte("complete contents"), 0o600); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			clientPath := filepath.Join(dir, "client.sh")
+			clientScript := "#!/bin/sh\n" +
+				`: > "$CLIPD_TEST_CALLED" || exit 1` + "\n" +
+				`cat > "$CLIPD_TEST_CAPTURE" || exit 1` + "\n" +
+				`printf 'clipd: ok: dropped\n'` + "\n"
+			if err := os.WriteFile(clientPath, []byte(clientScript), 0o600); err != nil {
+				t.Fatalf("write fake client: %v", err)
+			}
+
+			tempPath := filepath.Join(dir, "framed-request.tmp")
+			calledPath := filepath.Join(dir, "client-called")
+			capturePath := filepath.Join(dir, "request")
+			block := shellFunction("sh "+shellQuote(clientPath), socket, true, true)
+			script := `mktemp() {
+  umask 077
+  : > "$CLIPD_TEST_TEMP" || return 1
+  printf '%s\n' "$CLIPD_TEST_TEMP"
+}
+` + block + "\nclipd drop " + tc.arguments + "\n"
+			cmd := exec.Command(sh, "-c", script)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(),
+				"CLIPD_TEST_TEMP="+tempPath,
+				"CLIPD_TEST_CALLED="+calledPath,
+				"CLIPD_TEST_CAPTURE="+capturePath,
+			)
+			out, runErr := cmd.CombinedOutput()
+
+			if _, err := os.Stat(tempPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("temporary request survived function exit: %v", err)
+			}
+			if !tc.wantSent {
+				if runErr == nil {
+					t.Fatalf("failed tar reported success:\n%s", out)
+				}
+				if !strings.Contains(string(out), tc.wantStatus) {
+					t.Fatalf("failure output = %q, want %q", out, tc.wantStatus)
+				}
+				if _, err := os.Stat(calledPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("client ran after tar failed: %v", err)
+				}
+				return
+			}
+
+			if runErr != nil {
+				t.Fatalf("complete archive failed: %v\n%s", runErr, out)
+			}
+			payload, err := os.ReadFile(capturePath)
+			if err != nil {
+				t.Fatalf("read captured request: %v", err)
+			}
+			frame := []byte("clipd:magic:v1\n{\"type\":\"drop\"}\n")
+			if !bytes.HasPrefix(payload, frame) {
+				t.Fatalf("request has no complete protocol frame: %q", payload)
+			}
+			tr := tar.NewReader(bytes.NewReader(payload[len(frame):]))
+			hdr, err := tr.Next()
+			if err != nil {
+				t.Fatalf("read captured tar header: %v", err)
+			}
+			if hdr.Name != "source.txt" {
+				t.Fatalf("tar entry = %q, want source.txt", hdr.Name)
+			}
+			contents, err := io.ReadAll(tr)
+			if err != nil {
+				t.Fatalf("read captured tar entry: %v", err)
+			}
+			if string(contents) != "complete contents" {
+				t.Fatalf("tar contents = %q", contents)
+			}
+		})
 	}
 }
 
@@ -175,6 +470,81 @@ func TestStripBlockLeavesUnmanagedFilesAlone(t *testing.T) {
 	}
 	if got != give {
 		t.Errorf("stripBlock changed an unmanaged file:\n%s", got)
+	}
+}
+
+func TestStripBlockRefusesMalformedMarkerOrder(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"unmatched end":       blockEnd + "\nkeep",
+		"reversed":            blockEnd + "\ninside\n" + blockStart,
+		"nested":              blockStart + "\n" + blockStart + "\n" + blockEnd + "\n" + blockEnd,
+		"duplicate blocks":    blockStart + "\n" + blockEnd + "\n" + blockStart + "\n" + blockEnd,
+		"duplicate end":       blockStart + "\n" + blockEnd + "\n" + blockEnd,
+		"duplicate start":     blockStart + "\n" + blockStart + "\n" + blockEnd,
+		"start without close": "keep\n" + blockStart + "\ninside",
+	}
+	for name, content := range tests {
+		name, content := name, content
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := stripBlock(content, blockStart, blockEnd); err == nil {
+				t.Fatalf("stripBlock accepted malformed markers:\n%s", content)
+			}
+		})
+	}
+}
+
+// TestInstallScriptRejectsMalformedMarkersBeforeWriting exercises the script
+// that actually runs remotely. Equal marker counts are not enough: reversed or
+// nested pairs previously passed that check and made awk discard user content.
+func TestInstallScriptRejectsMalformedMarkersBeforeWriting(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh available")
+	}
+
+	tests := map[string]string{
+		"unmatched start":  "keep\n" + blockStart + "\ninside\n",
+		"unmatched end":    blockEnd + "\nkeep\n",
+		"reversed":         blockEnd + "\ninside\n" + blockStart + "\n",
+		"nested":           blockStart + "\n" + blockStart + "\ninside\n" + blockEnd + "\n" + blockEnd + "\n",
+		"duplicate blocks": blockStart + "\nold one\n" + blockEnd + "\n" + blockStart + "\nold two\n" + blockEnd + "\n",
+	}
+	for name, original := range tests {
+		name, original := name, original
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			home := t.TempDir()
+			rcPath := filepath.Join(home, ".profile")
+			if err := os.WriteFile(rcPath, []byte(original), 0o600); err != nil {
+				t.Fatalf("seed rc file: %v", err)
+			}
+			newBlock := blockStart + "\nclipd() { :; }\n" + blockEnd
+			script := fmt.Sprintf(installScript, "$HOME/.profile", newBlock)
+			cmd := exec.Command(sh, "-c", script)
+			cmd.Env = append(os.Environ(), "HOME="+home)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("install script accepted malformed markers:\n%s", original)
+			}
+			if !strings.Contains(string(out), "malformed clipd markers") {
+				t.Fatalf("install error did not explain the malformed markers:\n%s", out)
+			}
+
+			got, err := os.ReadFile(rcPath)
+			if err != nil {
+				t.Fatalf("read rc file: %v", err)
+			}
+			if string(got) != original {
+				t.Fatalf("install changed malformed rc file:\ngot:  %q\nwant: %q", got, original)
+			}
+			if _, err := os.Stat(rcPath + ".clipd-backup"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("install created a backup before validation: %v", err)
+			}
+		})
 	}
 }
 
@@ -251,6 +621,98 @@ func TestInstallSSHConfigPreservesAndBacksUp(t *testing.T) {
 	}
 	if string(backup) != existing {
 		t.Errorf("backup = %q, want the original file", backup)
+	}
+}
+
+func TestInstallSSHConfigPreservesConfigSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sshDir := filepath.Join(home, ".ssh")
+	dotfilesDir := filepath.Join(home, "dotfiles")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatalf("create ssh directory: %v", err)
+	}
+	if err := os.MkdirAll(dotfilesDir, 0o700); err != nil {
+		t.Fatalf("create dotfiles directory: %v", err)
+	}
+	existing := "Host work\n  User me\n"
+	target := filepath.Join(dotfilesDir, "ssh-config")
+	if err := os.WriteFile(target, []byte(existing), 0o600); err != nil {
+		t.Fatalf("seed symlink target: %v", err)
+	}
+	configPath := filepath.Join(sshDir, "config")
+	relativeTarget := filepath.Join("..", "dotfiles", "ssh-config")
+	if err := os.Symlink(relativeTarget, configPath); err != nil {
+		t.Fatalf("create config symlink: %v", err)
+	}
+
+	start, end := sshMarkers("debian")
+	block := start + "\nHost debian\n" + end + "\n"
+	path, changed, err := installSSHConfig(t.Context(), "debian", block)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if !changed {
+		t.Fatal("install reported no change")
+	}
+	if path != configPath {
+		t.Fatalf("reported path = %q, want logical config path %q", path, configPath)
+	}
+
+	info, err := os.Lstat(configPath)
+	if err != nil {
+		t.Fatalf("lstat config: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("install replaced ~/.ssh/config symlink with a regular file")
+	}
+	if got, err := os.Readlink(configPath); err != nil || got != relativeTarget {
+		t.Fatalf("config symlink = %q, %v; want %q", got, err, relativeTarget)
+	}
+	updated, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read symlink target: %v", err)
+	}
+	if !strings.Contains(string(updated), "Host work") || !strings.Contains(string(updated), start) {
+		t.Fatalf("target was not updated while preserving existing content:\n%s", updated)
+	}
+	backup, err := os.ReadFile(configPath + ".clipd-backup")
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(backup) != existing {
+		t.Fatalf("backup = %q, want original target contents %q", backup, existing)
+	}
+}
+
+func TestInstallSSHConfigRefusesDanglingConfigSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatalf("create ssh directory: %v", err)
+	}
+	configPath := filepath.Join(sshDir, "config")
+	target := filepath.Join("..", "missing", "ssh-config")
+	if err := os.Symlink(target, configPath); err != nil {
+		t.Fatalf("create dangling symlink: %v", err)
+	}
+
+	start, end := sshMarkers("debian")
+	if _, _, err := installSSHConfig(t.Context(), "debian", start+"\nHost debian\n"+end+"\n"); err == nil {
+		t.Fatal("install accepted a dangling ~/.ssh/config symlink")
+	}
+	info, err := os.Lstat(configPath)
+	if err != nil {
+		t.Fatalf("lstat config: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("install replaced the dangling symlink")
+	}
+	if got, err := os.Readlink(configPath); err != nil || got != target {
+		t.Fatalf("config symlink = %q, %v; want %q", got, err, target)
 	}
 }
 
@@ -435,7 +897,7 @@ func TestLegacyUnhostedBlockIsReplaced(t *testing.T) {
 func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true, true)
 
 	if strings.Contains(block, "[ -t 0 ]") {
 		t.Errorf("the function still infers the drop form from the terminal:\n%s", block)
@@ -461,7 +923,7 @@ func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 func TestShellFunctionSurvivesNounset(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true, true)
 	if strings.Contains(block, `"$1"`) {
 		t.Errorf("the function expands $1 unguarded:\n%s", block)
 	}
@@ -470,20 +932,23 @@ func TestShellFunctionSurvivesNounset(t *testing.T) {
 	}
 }
 
-// TestShellFunctionReportsFailureAsExitStatus: the daemon's reply is the only
-// thing that knows whether a drop was accepted, and a pipeline reports only
-// netcat's status. Without this, `clipd drop x && rm x` deleted files the
-// daemon had refused.
+// TestShellFunctionReportsFailureAsExitStatus: both the daemon and tar have to
+// succeed before `clipd drop x && rm x` is allowed to delete the source.
 func TestShellFunctionReportsFailureAsExitStatus(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true, true)
 	if !strings.Contains(block, "'clipd: ok: '*) return 0 ;;") {
 		t.Errorf("the function does not turn the daemon's reply into an exit status:\n%s", block)
 	}
-	// tar's own status is lost in the pipeline unless it is carried out of it.
-	if !strings.Contains(block, "_clipd_tar") {
-		t.Errorf("the function does not recover tar's exit status:\n%s", block)
+	if !strings.Contains(block, "if ! COPYFILE_DISABLE=1 tar") {
+		t.Errorf("the function does not test tar's exit status:\n%s", block)
+	}
+	if !strings.Contains(block, `< "$_clipd_payload"`) {
+		t.Errorf("the function does not send the completed payload by redirection:\n%s", block)
+	}
+	if strings.Contains(block, "_clipd_tar") || strings.Contains(block, "_clipd_rc") {
+		t.Errorf("the function retains obsolete pipeline-status bookkeeping:\n%s", block)
 	}
 }
 
@@ -492,7 +957,7 @@ func TestShellFunctionReportsFailureAsExitStatus(t *testing.T) {
 func TestShellFunctionDoesNotLeakVariables(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true, true)
 	for _, bare := range []string{"\n  sock=", "\n      name=", "\n      esc="} {
 		if strings.Contains(block, bare) {
 			t.Errorf("the function assigns an unprefixed variable %q:\n%s", bare, block)

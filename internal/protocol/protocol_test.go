@@ -78,12 +78,15 @@ func TestReadRequestRejectsBadFrames(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]string{
-		"empty":            "\n",
-		"not json":         "drop\n",
-		"no type":          "{}\n",
-		"unknown field":    `{"type":"drop","evil":"x"}` + "\n",
-		"truncated json":   `{"type":` + "\n",
-		"array not object": `["drop"]` + "\n",
+		"empty":                 "\n",
+		"not json":              "drop\n",
+		"no type":               "{}\n",
+		"unknown field":         `{"type":"drop","evil":"x"}` + "\n",
+		"truncated json":        `{"type":` + "\n",
+		"array not object":      `["drop"]` + "\n",
+		"second object":         `{"type":"drop"}{"type":"ping"}` + "\n",
+		"extra closing brace":   `{"type":"drop"}}` + "\n",
+		"extra closing bracket": `{"type":"drop"}]` + "\n",
 	}
 	for name, give := range tests {
 		t.Run(name, func(t *testing.T) {

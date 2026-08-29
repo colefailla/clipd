@@ -569,7 +569,9 @@ func (s *Server) handleDrop(conn net.Conn, idle *idleReader, r io.Reader, name s
 		drainRejected(idle, r)
 		return
 	}
-	s.log.Info("files dropped", "count", len(res.Names), "bytes", res.Bytes, "dir", s.dropDir)
+	// Routine success is acknowledged to the sender. Keeping it at Debug avoids
+	// growing launchd's unrotated log by one line for every ordinary drop.
+	s.log.Debug("files dropped", "count", len(res.Names), "bytes", res.Bytes, "dir", s.dropDir)
 	s.respondOK(conn, fmt.Sprintf("dropped %s (%d bytes) into %s",
 		strings.Join(res.Names, ", "), res.Bytes, s.dropDir))
 }

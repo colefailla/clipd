@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -138,6 +139,12 @@ func Default() Config {
 // variable.
 func DefaultPath() (string, error) {
 	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		// XDG_CONFIG_HOME is defined as an absolute path. A relative value is
+		// especially unsafe here because an interactive install and launchd use
+		// different working directories and would silently read different files.
+		if !filepath.IsAbs(dir) {
+			return "", fmt.Errorf("XDG_CONFIG_HOME must be an absolute path, got %q", dir)
+		}
 		return filepath.Join(dir, AppName, FileName), nil
 	}
 	home, err := os.UserHomeDir()
@@ -215,9 +222,14 @@ func Load(path string) (Config, error) {
 	if err := dec.Decode(&file); err != nil {
 		return cfg, fmt.Errorf("parse %s: %w", path, err)
 	}
-	// A config file holds one object. Decoding once and stopping would accept a
-	// second one silently, leaving the user editing settings nothing reads.
-	if dec.More() {
+	// A config file holds one object. Decoder.More is only meaningful while
+	// traversing an array or object; at the top level it can overlook an
+	// unmatched closing delimiter. A second decode must reach EOF.
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return cfg, fmt.Errorf("parse %s: trailing data after the configuration object: %w", path, err)
+		}
 		return cfg, fmt.Errorf("parse %s: trailing data after the configuration object", path)
 	}
 
@@ -283,28 +295,21 @@ func checkV2(path string, data []byte) error {
 		path, strings.Join(found, ", "), path, path)
 }
 
-// Save writes the config, creating the directory if needed.
+// Save atomically writes the config, creating its directory if needed.
 func (c Config) Save(path string) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
 	dir := filepath.Dir(path)
-	// Whether the directory is clipd's own is what decides whether its mode is
-	// this function's to set.
-	//
-	// MkdirAll leaves an existing directory's mode alone, so a clipd directory
-	// that something else created loosely still has to be tightened explicitly
-	// — that is why the Chmod is here at all. But the previous version applied
-	// it to whatever the parent happened to be, and `-config ./config.json`
-	// makes that the current working directory: saving a config took an
-	// ordinary 0755 directory to 0700 as a side effect. Owning the name is the
-	// line between the two.
-	_, statErr := os.Stat(dir)
-	owned := filepath.Base(dir) == AppName || errors.Is(statErr, fs.ErrNotExist)
-	if err := os.MkdirAll(dir, DirPerm); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
+	created, err := ensureDir(dir)
+	if err != nil {
+		return err
 	}
-	if owned {
+	// Saving through -config must not change an arbitrary parent directory's
+	// mode merely because its basename happens to be "clipd". We own a
+	// directory we just created and the resolved default application directory;
+	// nothing else.
+	if created || isDefaultDir(dir) {
 		// The mode passed to MkdirAll is masked by umask, so the intended mode
 		// is set explicitly.
 		if err := os.Chmod(dir, DirPerm); err != nil {
@@ -317,13 +322,151 @@ func (c Config) Save(path string) error {
 		return fmt.Errorf("encode config: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, FilePerm); err != nil {
+	writePath, err := resolveWritePath(path)
+	if err != nil {
+		return err
+	}
+	if err := writeAtomic(writePath, data); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-	if err := os.Chmod(path, FilePerm); err != nil {
-		return fmt.Errorf("restrict %s: %w", path, err)
-	}
 	return nil
+}
+
+// ensureDir creates only the final directory itself after making any missing
+// parents. Using Mkdir for the last component tells the caller whether this
+// invocation actually created the directory, so a creation race cannot make
+// Save chmod a directory owned by somebody else.
+func ensureDir(dir string) (bool, error) {
+	info, err := os.Stat(dir)
+	if err == nil {
+		if !info.IsDir() {
+			return false, fmt.Errorf("create %s: path exists and is not a directory", dir)
+		}
+		return false, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return false, fmt.Errorf("inspect %s: %w", dir, err)
+	}
+
+	parent := filepath.Dir(dir)
+	if parent != dir {
+		if err := os.MkdirAll(parent, DirPerm); err != nil {
+			return false, fmt.Errorf("create %s: %w", parent, err)
+		}
+	}
+	if err := os.Mkdir(dir, DirPerm); err == nil {
+		return true, nil
+	} else if !errors.Is(err, fs.ErrExist) {
+		return false, fmt.Errorf("create %s: %w", dir, err)
+	}
+
+	// Another process won the race. Verify that it created a directory, but do
+	// not claim ownership of it or change its mode.
+	info, err = os.Stat(dir)
+	if err != nil {
+		return false, fmt.Errorf("inspect %s after concurrent creation: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("create %s: path exists and is not a directory", dir)
+	}
+	return false, nil
+}
+
+// isDefaultDir compares directory identity rather than spelling so an XDG
+// path reached through a symlink is still recognised, while an unrelated
+// custom directory named "clipd" is not.
+func isDefaultDir(dir string) bool {
+	defaultPath, err := DefaultPath()
+	if err != nil {
+		return false
+	}
+	got, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	want, err := os.Stat(filepath.Dir(defaultPath))
+	return err == nil && os.SameFile(got, want)
+}
+
+// resolveWritePath preserves an existing config symlink by atomically
+// replacing its target. Replacing the link itself would quietly break a
+// dotfiles-managed setup. A dangling link has no safe target and is refused.
+func resolveWritePath(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return path, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("write %s: path is not a regular file", path)
+		}
+		return path, nil
+	}
+
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve config symlink %s: %w", path, err)
+	}
+	target, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("inspect config symlink target %s: %w", resolved, err)
+	}
+	if !target.Mode().IsRegular() {
+		return "", fmt.Errorf("write %s: config symlink target is not a regular file", path)
+	}
+	return resolved, nil
+}
+
+// writeAtomic builds a complete, restricted file beside its destination and
+// renames it into place. Syncing both the file and its directory means a crash
+// cannot expose a truncated config or lose a successful rename on filesystems
+// that honour directory fsync.
+func writeAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+		_ = os.Remove(tmp)
+	}()
+
+	if err := f.Chmod(FilePerm); err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// Windows does not permit opening a directory for Sync through os.Open.
+	// The file itself is already synced and atomically renamed there.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // Validate rejects a configuration the daemon could not honour.

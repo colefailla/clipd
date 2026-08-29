@@ -5,6 +5,7 @@ package launchagent
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // These tests drive the real Install/Uninstall/Status code paths against a
@@ -147,15 +149,14 @@ func TestInstallCallsLaunchctlInOrder(t *testing.T) {
 	}
 
 	uid := currentUID(t)
-	// bootout first: bootstrap fails outright on an already-loaded label, so
-	// without this `clipd install` would be a one-shot command that breaks on
-	// every upgrade.
-	if want := "bootout gui/" + uid + "/" + Label; got[0] != want {
+	// Enable first: if enabling is refused, the currently running agent has not
+	// yet been booted out and remains available.
+	if want := "enable gui/" + uid + "/" + Label; got[0] != want {
 		t.Errorf("call 1 = %q, want %q", got[0], want)
 	}
-	// enable next: a service the user once disabled stays disabled through
-	// bootstrap, and the failure mode is invisible.
-	if want := "enable gui/" + uid + "/" + Label; got[1] != want {
+	// bootout next: bootstrap fails outright on an already-loaded label, so
+	// without this `clipd install` would break on every upgrade.
+	if want := "bootout gui/" + uid + "/" + Label; got[1] != want {
 		t.Errorf("call 2 = %q, want %q", got[1], want)
 	}
 	if !strings.HasPrefix(got[2], "bootstrap gui/"+uid+" ") {
@@ -201,7 +202,7 @@ exit 0`)
 }
 
 func TestInstallGivesUpAndReportsWhy(t *testing.T) {
-	fakeHome(t)
+	home := fakeHome(t)
 	dir := fakeLaunchctl(t, `
 if [ "$1" = "bootstrap" ]; then
 	echo "Load failed: 5: Input/output error" >&2
@@ -227,6 +228,212 @@ exit 0`)
 	}
 	if bootstraps != 5 {
 		t.Errorf("bootstrap attempted %d times, want it to stop after 5", bootstraps)
+	}
+
+	// This was a first install, so rollback must remove the failed candidate
+	// rather than leave launchd a plist it never accepted.
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", Label+".plist")
+	if _, statErr := os.Stat(plistPath); !os.IsNotExist(statErr) {
+		t.Errorf("failed candidate still exists after rollback: %v", statErr)
+	}
+}
+
+func TestInstallRejectsUnreadablePreviousPlist(t *testing.T) {
+	home := fakeHome(t)
+	dir := fakeLaunchctl(t, "exit 0")
+
+	// A directory at the plist path reliably makes ReadFile fail even when the
+	// tests run under an account that can bypass ordinary permission bits.
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", Label+".plist")
+	if err := os.MkdirAll(plistPath, 0o755); err != nil {
+		t.Fatalf("create unreadable plist stand-in: %v", err)
+	}
+
+	if _, err := Install(context.Background(), Options{ExecutablePath: fakeExecutable(t)}); err == nil {
+		t.Fatal("Install treated an unreadable existing plist as absent")
+	}
+	if got := calls(t, dir); len(got) != 0 {
+		t.Errorf("launchctl was called after preflight failed: %v", got)
+	}
+	info, err := os.Stat(plistPath)
+	if err != nil || !info.IsDir() {
+		t.Errorf("existing path was changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestInstallEnableFailureLeavesPreviousAgentUntouched(t *testing.T) {
+	home := fakeHome(t)
+	dir := fakeLaunchctl(t, `
+if [ "$1" = "enable" ]; then
+	echo "Operation not permitted" >&2
+	exit 1
+fi
+exit 0`)
+
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", Label+".plist")
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	previous := []byte("previous plist\n")
+	if err := os.WriteFile(plistPath, previous, 0o600); err != nil {
+		t.Fatalf("write previous plist: %v", err)
+	}
+
+	_, err := Install(context.Background(), Options{ExecutablePath: fakeExecutable(t)})
+	if err == nil || !strings.Contains(err.Error(), "enable LaunchAgent") {
+		t.Fatalf("Install error = %v, want an enable failure", err)
+	}
+	if got := calls(t, dir); len(got) != 1 || !strings.HasPrefix(got[0], "enable ") {
+		t.Errorf("launchctl calls = %v, want only enable", got)
+	}
+	got, err := os.ReadFile(plistPath)
+	if err != nil {
+		t.Fatalf("read previous plist: %v", err)
+	}
+	if string(got) != string(previous) {
+		t.Errorf("previous plist changed after enable failure: %q", got)
+	}
+}
+
+func TestInstallBootoutFailureLeavesPreviousPlistUntouched(t *testing.T) {
+	home := fakeHome(t)
+	dir := fakeLaunchctl(t, `
+if [ "$1" = "bootout" ]; then
+	echo "Boot-out failed: 1: Operation not permitted" >&2
+	exit 1
+fi
+exit 0`)
+
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", Label+".plist")
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	previous := []byte("previous plist\n")
+	if err := os.WriteFile(plistPath, previous, 0o600); err != nil {
+		t.Fatalf("write previous plist: %v", err)
+	}
+
+	_, err := Install(context.Background(), Options{ExecutablePath: fakeExecutable(t)})
+	if err == nil || !strings.Contains(err.Error(), "unload existing LaunchAgent") {
+		t.Fatalf("Install error = %v, want a bootout failure", err)
+	}
+	gotCalls := calls(t, dir)
+	if len(gotCalls) != 2 || !strings.HasPrefix(gotCalls[0], "enable ") || !strings.HasPrefix(gotCalls[1], "bootout ") {
+		t.Errorf("launchctl calls = %v, want enable then bootout", gotCalls)
+	}
+	got, err := os.ReadFile(plistPath)
+	if err != nil {
+		t.Fatalf("read previous plist: %v", err)
+	}
+	if string(got) != string(previous) {
+		t.Errorf("previous plist changed after bootout failure: %q", got)
+	}
+}
+
+func TestInstallRestoresPreviousAgentAfterBootstrapFailure(t *testing.T) {
+	home := fakeHome(t)
+	dir := fakeLaunchctl(t, `
+if [ "$1" = "bootstrap" ]; then
+	if grep -q "previous plist" "$3"; then
+		exit 0
+	fi
+	echo "Load failed: 5: Input/output error" >&2
+	exit 5
+fi
+exit 0`)
+
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", Label+".plist")
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	previous := []byte("previous plist\n")
+	if err := os.WriteFile(plistPath, previous, 0o600); err != nil {
+		t.Fatalf("write previous plist: %v", err)
+	}
+
+	_, err := Install(context.Background(), Options{ExecutablePath: fakeExecutable(t)})
+	if err == nil {
+		t.Fatal("Install reported success despite rejecting the replacement")
+	}
+	if !strings.Contains(err.Error(), "previous LaunchAgent was restored") {
+		t.Errorf("error = %v, want it to report the successful rollback", err)
+	}
+
+	got, readErr := os.ReadFile(plistPath)
+	if readErr != nil {
+		t.Fatalf("read restored plist: %v", readErr)
+	}
+	if string(got) != string(previous) {
+		t.Errorf("restored plist = %q, want %q", got, previous)
+	}
+	if info, statErr := os.Stat(plistPath); statErr != nil {
+		t.Fatalf("stat restored plist: %v", statErr)
+	} else if gotMode := info.Mode().Perm(); gotMode != 0o600 {
+		t.Errorf("restored mode = %04o, want 0600", gotMode)
+	}
+
+	var bootstraps int
+	for _, call := range calls(t, dir) {
+		if strings.HasPrefix(call, "bootstrap ") {
+			bootstraps++
+		}
+	}
+	if bootstraps != 6 {
+		t.Errorf("bootstrap calls = %d, want five replacement attempts and one restore", bootstraps)
+	}
+	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(plistPath), "."+filepath.Base(plistPath)+".tmp-*"))
+	if globErr != nil {
+		t.Fatalf("glob temporary plists: %v", globErr)
+	}
+	if len(matches) != 0 {
+		t.Errorf("atomic writes left temporary files behind: %v", matches)
+	}
+}
+
+func TestInstallCancellationStillRestoresPreviousAgent(t *testing.T) {
+	home := fakeHome(t)
+	dir := fakeLaunchctl(t, `
+if [ "$1" = "bootstrap" ]; then
+	if grep -q "previous plist" "$3"; then
+		exit 0
+	fi
+	# Keep the shell itself busy so CommandContext can kill it without leaving
+	# a child process holding CombinedOutput's pipes open.
+	while :; do :; done
+fi
+exit 0`)
+
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", Label+".plist")
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	previous := []byte("previous plist\n")
+	if err := os.WriteFile(plistPath, previous, 0o600); err != nil {
+		t.Fatalf("write previous plist: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := Install(ctx, Options{ExecutablePath: fakeExecutable(t)})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Install error = %v, want context deadline exceeded", err)
+	}
+
+	got, readErr := os.ReadFile(plistPath)
+	if readErr != nil {
+		t.Fatalf("read restored plist: %v", readErr)
+	}
+	if string(got) != string(previous) {
+		t.Errorf("restored plist = %q, want %q", got, previous)
+	}
+
+	gotCalls := calls(t, dir)
+	if len(gotCalls) < 5 {
+		t.Fatalf("launchctl calls = %v, want rollback after canceled bootstrap", gotCalls)
+	}
+	last := gotCalls[len(gotCalls)-1]
+	if !strings.HasPrefix(last, "bootstrap ") {
+		t.Errorf("last call = %q, want previous agent re-bootstrap", last)
 	}
 }
 

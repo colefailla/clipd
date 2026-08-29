@@ -90,6 +90,28 @@ func TestUnknownKeysAreRejected(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsTrailingData(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"second object":         `{"address":"~/.first.sock"} {"address":"~/.second.sock"}`,
+		"extra closing brace":   `{"address":"~/.clipd.sock"}}`,
+		"extra closing bracket": `{"address":"~/.clipd.sock"}]`,
+	}
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load accepted %q", data)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsBadValues(t *testing.T) {
 	t.Parallel()
 
@@ -138,20 +160,26 @@ func TestSavePermissions(t *testing.T) {
 	}
 }
 
-// TestSaveTightensAnExistingDirectory: MkdirAll leaves an existing directory's
-// mode alone, so a directory created loosely by something else is not fixed by
-// creation and has to be chmod-ed explicitly.
-func TestSaveTightensAnExistingDirectory(t *testing.T) {
-	t.Parallel()
+// TestSaveTightensTheExistingDefaultDirectory: the default app directory is
+// clipd's to restrict even when another invocation created it first.
+func TestSaveTightensTheExistingDefaultDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix permission bits are not meaningful on Windows")
 	}
 
-	dir := filepath.Join(t.TempDir(), "clipd")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path, err := DefaultPath()
+	if err != nil {
+		t.Fatalf("DefaultPath: %v", err)
+	}
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := Default().Save(filepath.Join(dir, "config.json")); err != nil {
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if err := Default().Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	info, err := os.Stat(dir)
@@ -160,6 +188,111 @@ func TestSaveTightensAnExistingDirectory(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != DirPerm {
 		t.Errorf("directory mode = %04o, want %04o", perm, DirPerm)
+	}
+}
+
+func TestSaveLeavesCustomClipdDirectoryModeAlone(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not meaningful on Windows")
+	}
+
+	dir := filepath.Join(t.TempDir(), "shared", AppName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if err := Default().Save(filepath.Join(dir, FileName)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("custom directory mode = %04o, want 0755", perm)
+	}
+}
+
+func TestSavePreservesConfigSymlink(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks may require elevated privileges on Windows")
+	}
+
+	root := t.TempDir()
+	target := filepath.Join(root, "dotfiles", "clipd.json")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("old\n"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	linkDir := filepath.Join(root, "config")
+	if err := os.Mkdir(linkDir, 0o755); err != nil {
+		t.Fatalf("mkdir link directory: %v", err)
+	}
+	link := filepath.Join(linkDir, FileName)
+	linkTarget, err := filepath.Rel(linkDir, target)
+	if err != nil {
+		t.Fatalf("relative target: %v", err)
+	}
+	if err := os.Symlink(linkTarget, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	want := Default()
+	want.DropDir = "~/FromDotfiles"
+	if err := want.Save(link); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat link: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("Save replaced the config symlink")
+	}
+	got, err := Load(target)
+	if err != nil {
+		t.Fatalf("Load target: %v", err)
+	}
+	if got != want {
+		t.Errorf("target config = %+v, want %+v", got, want)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(target)
+		if err != nil {
+			t.Fatalf("stat target: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != FilePerm {
+			t.Errorf("target mode = %04o, want %04o", perm, FilePerm)
+		}
+	}
+}
+
+func TestSaveRefusesDanglingConfigSymlink(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks may require elevated privileges on Windows")
+	}
+
+	dir := t.TempDir()
+	link := filepath.Join(dir, FileName)
+	if err := os.Symlink(filepath.Join(dir, "missing.json"), link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := Default().Save(link); err == nil {
+		t.Fatal("Save accepted a dangling config symlink")
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat dangling symlink: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("dangling symlink was replaced: mode=%v", info.Mode())
 	}
 }
 
@@ -278,6 +411,13 @@ func TestXDGConfigHomeWins(t *testing.T) {
 	want := filepath.Join("/somewhere/else", AppName, FileName)
 	if path != want {
 		t.Errorf("DefaultPath = %q, want %q", path, want)
+	}
+}
+
+func TestRelativeXDGConfigHomeIsRejected(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "relative/config")
+	if _, err := DefaultPath(); err == nil {
+		t.Fatal("DefaultPath accepted a relative XDG_CONFIG_HOME")
 	}
 }
 

@@ -2,14 +2,55 @@ package server
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/colefailla/clipd/internal/clipboard"
+	"github.com/colefailla/clipd/internal/protocol"
 )
+
+func TestExchangePingRequiresTheExactPong(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		reply string
+		ok    bool
+	}{
+		{name: "exact", reply: protocol.StatusOK + protocol.Pong + "\n", ok: true},
+		{name: "suffix", reply: protocol.StatusOK + protocol.Pong + "-not-clipd\n"},
+		{name: "missing newline", reply: protocol.StatusOK + protocol.Pong},
+		{name: "error status", reply: protocol.StatusError + protocol.Pong + "\n"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			client, peer := net.Pipe()
+			defer client.Close()
+			go func() {
+				defer peer.Close()
+				request := make([]byte, len(protocol.Ping))
+				if _, err := io.ReadFull(peer, request); err == nil {
+					_, _ = io.WriteString(peer, tc.reply)
+				}
+			}()
+
+			err := exchangePing(client)
+			if tc.ok && err != nil {
+				t.Fatalf("exchangePing: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("exchangePing accepted an inexact response")
+			}
+		})
+	}
+}
 
 // TestListenRemovesAStaleSocket pins the recovery that makes the daemon
 // restartable.
@@ -150,6 +191,31 @@ func TestListenRestrictsSocketPermissions(t *testing.T) {
 	// clipboard through the forwarded socket.
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
 		t.Errorf("socket mode = %04o, want no group or other access", perm)
+	}
+}
+
+func TestListenRefusesWritableSocketDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix directory permission bits are not meaningful on Windows")
+	}
+
+	dir := filepath.Join(shortTempDir(t), "shared")
+	if err := os.Mkdir(dir, 0o777); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// The process umask may have narrowed Mkdir's requested mode.
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	path := filepath.Join(dir, "clipd.sock")
+	if ln, err := Listen(path); err == nil {
+		ln.Close()
+		t.Fatal("Listen accepted a socket path another account can pre-bind")
+	} else if !strings.Contains(err.Error(), "writable by another account") {
+		t.Fatalf("Listen error = %v, want an unsafe-directory explanation", err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("Listen created a socket before rejecting its parent: %v", err)
 	}
 }
 

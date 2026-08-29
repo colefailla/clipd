@@ -67,7 +67,7 @@ func exchangePing(conn net.Conn) error {
 	if err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
-	if !strings.HasPrefix(line, protocol.StatusOK+protocol.Pong) {
+	if line != protocol.StatusOK+protocol.Pong+"\n" {
 		return fmt.Errorf("unexpected reply %q", line)
 	}
 	return nil
@@ -118,11 +118,15 @@ func Listen(address string) (net.Listener, error) {
 		return nil, fmt.Errorf("socket path %s is %d bytes, over the %d-byte limit this platform allows; choose a shorter path",
 			path, len(path), maxSocketPath)
 	}
-	if err := prepareSocketPath(path); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("create %s: %w", dir, err)
+	}
+	if err := requirePrivateSocketDir(dir); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	if err := prepareSocketPath(path); err != nil {
+		return nil, err
 	}
 
 	ln, err := net.Listen("unix", path)
@@ -136,6 +140,27 @@ func Listen(address string) (net.Listener, error) {
 		return nil, fmt.Errorf("restrict %s: %w", path, err)
 	}
 	return ln, nil
+}
+
+// requirePrivateSocketDir prevents pathname impersonation on custom sockets.
+//
+// The socket's 0600 mode controls who may connect while it exists. It cannot
+// stop another account with write access to the parent from planting its own
+// listener at the configured path while clipd is stopped, then receiving the
+// next forwarded copy. The default parent is the user's home directory; custom
+// paths must provide the same no-write guarantee.
+func requirePrivateSocketDir(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("inspect socket directory %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("socket parent %s is not a directory", dir)
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("socket directory %s has mode %04o and is writable by another account; use a private directory (0700 or 0755 without group/other write)", dir, perm)
+	}
+	return nil
 }
 
 // prepareSocketPath clears a socket file left behind by a previous run.

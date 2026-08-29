@@ -24,11 +24,11 @@ Linux                                      macOS
   tail -50 error.log
      │ stdout
      ▼
-  clipd ──▶ ~/.clipd.sock ══ ssh -R ══▶ ~/.clipd.sock ──▶ clipd serve
-  (a shell function)                                            │
-                                                                ▼
-                                                        pbcopy ──▶ clipboard
-                                                        tar    ──▶ ~/Drop
+  clipd ──▶ ~/.clipd/socket ══ ssh -R ══▶ ~/.clipd.sock ──▶ clipd serve
+  (a shell function)                                              │
+                                                                  ▼
+                                                          pbcopy ──▶ clipboard
+                                                          tar    ──▶ ~/Drop
 ```
 
 SSH's `RemoteForward` makes the Mac's socket appear on the remote host. Anything
@@ -148,6 +148,52 @@ SSH config markers name the host — `# >>> clipd: debian >>>` — so setting up
 several hosts leaves each one's forward intact. Your SSH config is backed up
 before the first edit.
 
+### Hosts that cannot forward a socket
+
+`clipd setup` only knows how to forward a socket, and refuses to run when the
+daemon is set to a TCP address. Almost nothing needs the alternative: OpenSSH
+has forwarded UNIX sockets since 6.7, released in 2014, so every current Linux
+and macOS host is covered. The exceptions are Windows OpenSSH, which still
+cannot, and systems old enough to predate 6.7.
+
+Those are configured by hand. **Read the cost at the end before you do.**
+
+1. While the daemon is still on a socket, print the function `setup` would
+   install, to start from:
+
+   ```bash
+   clipd setup -print <host>
+   ```
+
+2. Point the daemon at a loopback port and restart it:
+
+   ```json
+   { "address": "127.0.0.1:8199" }
+   ```
+
+   ```bash
+   clipd restart
+   ```
+
+3. Forward the port instead of the socket, in `~/.ssh/config`:
+
+   ```text
+   Host oldbox
+     RemoteForward 8199 127.0.0.1:8199
+   ```
+
+4. Paste the function into the remote's rc file with two edits: replace every
+   `nc -U "$_clipd_sock"` with `nc -N 127.0.0.1 8199` — drop the `-N` if the
+   remote is macOS — and delete the `[ ! -S "$_clipd_sock" ]` check, which has
+   no meaning for a port.
+
+**The cost.** A socket is protected by its `0600` mode inside a `0700`
+directory, so only you can write to it. A loopback port has no permissions at
+all: every account on that host can reach port 8199 and put things on your
+clipboard or drop files on your Mac. sshd binds remote forwards to loopback, so
+it is not exposed to the network — but it is exposed to everyone logged into
+that machine. Use it only where you would trust all of them.
+
 ## Usage
 
 On the remote host:
@@ -160,7 +206,7 @@ cat ~/.ssh/id_ed25519.pub | clipd   # grab a public key
 clipd drop report.pdf                        # send a file to ~/Drop
 clipd drop src/*.go                          # send several
 pg_dump mydb | clipd drop --name db.sql      # send output as a file
-journalctl -u nginx | clipd drop --name n.log
+journalctl -u nginx | clipd drop --name nginx.log
 ```
 
 `--name` matters when the thing you want has no file on disk. With arguments,
@@ -169,7 +215,16 @@ one. The flag is required rather than guessed from whether stdin is a terminal,
 so a drop from a script or a cron job sends the file rather than an empty one.
 
 The exit status is the daemon's answer, which makes `clipd drop x && rm x` safe:
-a rejected drop, or one whose `tar` failed partway, exits non-zero.
+a rejected drop exits non-zero, and one whose `tar` fails sends nothing at all.
+
+That last guarantee costs something worth knowing about. Dropping files builds
+the archive into a temporary file on the remote host before sending it, so the
+host needs free temporary space about the size of what you are sending, and it
+needs `mktemp` — `clipd setup` reports it if the host has neither. Streaming
+straight into the socket would be cheaper, but a `tar` that failed halfway would
+already have sent a valid archive of the files it managed to read, and the
+daemon would accept it. `clipd drop --name` still streams, because there is a
+single file's bytes and nothing to go half-right.
 
 Content is sent byte for byte — newlines, tabs and the trailing newline are
 preserved. Input over `max_payload_bytes` (10 MiB by default) is rejected rather
@@ -189,6 +244,11 @@ The socket reaches another machine only when you forward it over SSH. By then
 SSH has encrypted the channel, verified the host key against `known_hosts`, and
 authenticated you; the socket's `0600` permissions decide who on that machine
 may write to it.
+
+On the remote host that socket lives in `~/.clipd/`, a `0700` directory, and
+`clipd setup` pins the bind mask that creates it `0600`. Two layers rather than
+one because OpenSSH documents that not every operating system honours the mode
+on a socket file — every one of them honours the mode on a directory.
 
 clipd has no token and no TLS of its own because SSH has already done both
 jobs. A token would also be worse: it would live as a file on the remote host,
@@ -214,9 +274,15 @@ Two things limit what it can do:
 - **Dropped files** are flattened to basenames so an archive cannot write
   outside the drop directory, are never overwritten, and are never made
   executable. Symlinks, hard links and device nodes in an archive are skipped,
-  as are entries of any other type that declare a body. Completed files are
-  published under their real name only once fully written, so an interrupted
-  transfer cannot be mistaken for a finished one.
+  as are entries of any other type that declare a body.
+- **A drop is all or nothing.** Files are written into a private staging
+  directory and take their real names only once the whole archive has arrived,
+  so a transfer that fails partway leaves nothing behind rather than a subset
+  that looks complete. The sending side matches: `clipd drop` builds the whole
+  archive before it opens the socket, so a `tar` that fails sends no bytes at
+  all. One gap remains: a connection cut at exactly an archive-entry boundary
+  looks the same as a short archive, so the remote's non-zero exit status is
+  what tells you to check.
 - **Quarantine** is applied where it can be: files get macOS's quarantine
   attribute so Gatekeeper treats them like downloads. It is best effort — a drop
   that landed safely is not reported as failed because the label could not be
@@ -284,19 +350,24 @@ Run `clipd help config` or `clipd help security` for detail.
 clipd status
 ```
 
-It dials the socket rather than just checking the file exists, because a daemon
-killed with `SIGKILL` leaves the socket behind and a stale one looks identical
-in a directory listing. Exit code 0 means the daemon answered.
+It asks the daemon to identify itself rather than just checking the file
+exists, because a daemon killed with `SIGKILL` leaves the socket behind and a
+stale one looks identical in a directory listing. Exit code 0 means a clipd
+daemon answered — not merely that something is listening.
 
-**`clipd: ~/.clipd.sock is missing`** on the remote — the forward isn't up.
+**`clipd: ~/.clipd/socket is missing`** on the remote — the forward isn't up.
 Reconnect. If you use `ControlMaster`, kill the old master first with
 `ssh -O exit <host>`; otherwise you reuse a connection that predates the
 forward.
 
 **`remote port forwarding failed`** — a stale socket on the remote from an
-unclean disconnect. `ssh <host> rm .clipd.sock`, or set
-`StreamLocalBindUnlink yes` in the remote's `/etc/ssh/sshd_config` to stop it
-recurring.
+unclean disconnect. `ssh <host> rm .clipd/socket` clears it.
+
+`clipd setup` writes `StreamLocalBindUnlink yes` into your `~/.ssh/config` to
+stop it recurring. If it keeps happening anyway, the socket on a remote forward
+is bound by the remote's `sshd`, so the setting that governs it is the same one
+in that host's `/etc/ssh/sshd_config` — which only its administrator can
+change.
 
 ## Exit codes
 
@@ -345,9 +416,12 @@ received, so it is left for you to look through.
 | Path | What it is |
 |---|---|
 | `~/.bashrc`, `~/.zshrc` or `~/.profile` | the `clipd` function, between `# >>> clipd >>>` markers |
-| `~/.clipd.sock` | created by sshd while you are connected, removed when you disconnect |
+| `~/.bashrc.clipd-backup` (or the matching rc file) | a copy of that file from before the first edit |
+| `~/.clipd/` | a `0700` directory, created by `clipd setup`, holding the socket |
+| `~/.clipd/socket` | created by sshd while you are connected, removed when you disconnect |
 
-Delete the marked block and the socket is gone on its own.
+Delete the marked block and the socket is gone on its own; `rm -rf ~/.clipd`
+removes the directory it lived in.
 
 ## License
 
