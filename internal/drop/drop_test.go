@@ -725,6 +725,37 @@ func TestSafeNameRejectsControlCharacters(t *testing.T) {
 	}
 }
 
+// TestSafeNameRejectsInvalidUTF8 closes the byte-level counterpart to the C1
+// control check above. strings.IndexFunc decodes malformed bytes as RuneError,
+// so validation must reject them before a raw 0x9b can reach an acknowledgement
+// printed by the sender's terminal.
+func TestSafeNameRejectsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{
+		"csi\x9b2J.txt",
+		"bad\xff.txt",
+		"truncated\xc3.txt",
+	} {
+		if got, err := safeName(name); err == nil {
+			t.Errorf("safeName(%q) = %q, want an error", name, got)
+		}
+	}
+}
+
+func TestExtractRejectsInvalidUTF8Name(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "drop")
+	_, err := Extract(archiveOf(t,
+		entry{name: "csi\x9b2J.txt", body: "x"},
+	), Options{Dir: dir})
+	if err == nil {
+		t.Fatal("Extract accepted an invalid UTF-8 filename")
+	}
+	assertDirEmpty(t, dir)
+}
+
 // TestSafeNameKeepsAwkwardButLegitimateNames: refusing control characters must
 // not also refuse the merely unusual. A leading dash matters because these
 // names reach os.OpenFile, never a shell.

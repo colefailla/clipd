@@ -335,6 +335,32 @@ func TestMalformedFrameDoesNotFallBackToTheClipboard(t *testing.T) {
 	}
 }
 
+// TestInvalidUTF8FrameIsRejected exercises the protocol check through a real
+// daemon connection. The JSON decoder must not repair a malformed named drop
+// and publish it under a replacement-character filename.
+func TestInvalidUTF8FrameIsRejected(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	request := append([]byte(protocol.Magic+`{"type":"drop","name":"report`), 0xff)
+	request = append(request, []byte(".txt\"}\ncontents")...)
+	reply := h.send(request)
+
+	if !strings.Contains(reply, "valid UTF-8") {
+		t.Errorf("reply = %q, want an invalid UTF-8 explanation", reply)
+	}
+	if h.clip.WriteCount() != 0 {
+		t.Error("an invalid structured frame reached the clipboard")
+	}
+	if entries, err := os.ReadDir(h.dropDir); err == nil {
+		if len(entries) != 0 {
+			t.Errorf("invalid structured frame published %d drop entries", len(entries))
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("inspect drop directory: %v", err)
+	}
+}
+
 func TestClipboardFailureIsReported(t *testing.T) {
 	t.Parallel()
 

@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // filePerm is the mode every extracted file gets.
@@ -552,6 +553,14 @@ func safeName(raw string) (string, error) {
 	switch name {
 	case "", ".", "..", string(filepath.Separator):
 		return "", fmt.Errorf("drop: archive entry %q has no usable filename", shortName(raw))
+	}
+	// IndexFunc below validates Unicode control characters rune by rune. Invalid
+	// UTF-8 would be decoded as RuneError instead, allowing a raw C1 byte such as
+	// 0x9b to reach the terminal acknowledgement unchecked. Reject malformed
+	// names before that conversion rather than letting the filesystem and
+	// terminal disagree about what arrived.
+	if !utf8.ValidString(name) {
+		return "", fmt.Errorf("drop: archive entry %q has a filename that is not valid UTF-8", shortName(raw))
 	}
 	if strings.ContainsRune(name, filepath.Separator) {
 		// Unreachable after Base, and checked anyway: this is the invariant

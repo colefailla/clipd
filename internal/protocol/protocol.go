@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 )
 
 // Magic introduces a structured request.
@@ -135,6 +136,15 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 	}
 	if len(line) == 0 {
 		return Request{}, errors.New("protocol: empty request frame")
+	}
+	// encoding/json accepts malformed UTF-8 inside a string and replaces each
+	// bad byte with U+FFFD. That is unsafe for a filename: the daemon could
+	// acknowledge and publish a different name from the one the sender supplied.
+	// Reject the frame before decoding so malformed wire bytes are not normalized
+	// silently. Raw clipboard streams do not pass through ReadRequest and remain
+	// byte-for-byte data.
+	if !utf8.Valid(line) {
+		return Request{}, errors.New("protocol: request frame is not valid UTF-8")
 	}
 
 	// DisallowUnknownFields so a typo in a field name fails loudly instead of

@@ -174,7 +174,7 @@ func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 	}
 	// The -- is load-bearing: without it a file named
 	// "--use-compress-program=curl" is read by tar as an option and executed.
-	if !strings.Contains(block, `COPYFILE_DISABLE=1 tar cf - -- "$@"`) {
+	if !strings.Contains(block, `COPYFILE_DISABLE=1 command tar cf - -- "$@"`) {
 		t.Errorf("the drop path does not pipe a tar stream with -- :\n%s", block)
 	}
 	// The socket check has to come first: without it, a session opened before
@@ -329,6 +329,138 @@ printf '%s|%s|%s' "$_clipd_sock" "$_clipd_reply" "$_clipd_client"
 	}
 	if got := string(out); got != "mine|mine|73" {
 		t.Fatalf("interactive variables changed to %q", got)
+	}
+}
+
+// TestShellFunctionIgnoresAliasesAndFunctions sources and executes the complete
+// generated block in each supported shell shape. An alias named clipd used to
+// turn the following `clipd() (` into a syntax error, while aliases or functions
+// named after data-path utilities could silently change bytes or bypass cleanup.
+func TestShellFunctionIgnoresAliasesAndFunctions(t *testing.T) {
+	t.Parallel()
+
+	dir, err := os.MkdirTemp("", "clipd-aliases-")
+	if err != nil {
+		t.Fatalf("create short test directory: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "socket")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("create test socket: %v", err)
+	}
+	defer listener.Close()
+
+	transportPath := filepath.Join(dir, "clipd_test_transport")
+	transport := `#!/bin/sh
+cat > "$CLIPD_TEST_CAPTURE" || exit 1
+printf 'clipd: ok: received\n'
+`
+	if err := os.WriteFile(transportPath, []byte(transport), 0o700); err != nil {
+		t.Fatalf("write fake transport: %v", err)
+	}
+	blockPath := filepath.Join(dir, "clipd-block.sh")
+	block := shellFunction("clipd_test_transport", socket, dir, true)
+	if err := os.WriteFile(blockPath, []byte(block), 0o600); err != nil {
+		t.Fatalf("write generated block: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "source.txt"), []byte("archive contents"), 0o600); err != nil {
+		t.Fatalf("write archive source: %v", err)
+	}
+
+	shells := []struct {
+		name    string
+		command string
+		prelude string
+	}{
+		{name: "POSIX sh", command: "sh"},
+		{name: "Dash", command: "dash"},
+		{name: "Bash", command: "bash", prelude: "shopt -s expand_aliases\n"},
+		{name: "Zsh", command: "zsh"},
+	}
+	for _, shell := range shells {
+		shell := shell
+		t.Run(shell.name, func(t *testing.T) {
+			shellPath, err := exec.LookPath(shell.command)
+			if err != nil {
+				t.Skipf("%s is unavailable", shell.command)
+			}
+
+			namedCapture := filepath.Join(dir, shell.command+"-named")
+			archiveCapture := filepath.Join(dir, shell.command+"-archive")
+			script := shell.prelude + `printf() { return 91; }
+grep() { return 91; }
+sed() { return 91; }
+cat() { return 91; }
+rm() { return 91; }
+tar() { return 91; }
+clipd_test_transport() { return 91; }
+alias clipd='false'
+alias printf='false'
+alias grep='false'
+alias sed='false'
+alias cat='false'
+alias rm='false'
+alias tar='false'
+alias clipd_test_transport='false'
+. "$CLIPD_TEST_BLOCK" || exit 92
+CLIPD_TEST_CAPTURE="$CLIPD_TEST_NAMED"; export CLIPD_TEST_CAPTURE
+command printf payload | clipd drop --name 'quote"and\backslash.txt' || exit 93
+CLIPD_TEST_CAPTURE="$CLIPD_TEST_ARCHIVE"; export CLIPD_TEST_CAPTURE
+clipd drop source.txt || exit 94
+`
+			cmd := exec.Command(shellPath, "-c", script)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(),
+				"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"CLIPD_TEST_BLOCK="+blockPath,
+				"CLIPD_TEST_NAMED="+namedCapture,
+				"CLIPD_TEST_ARCHIVE="+archiveCapture,
+			)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("source and execute generated block: %v\n%s", err, out)
+			}
+
+			named, err := os.ReadFile(namedCapture)
+			if err != nil {
+				t.Fatalf("read named request: %v", err)
+			}
+			r := bufio.NewReader(bytes.NewReader(named))
+			structured, err := protocol.Sniff(r)
+			if err != nil || !structured {
+				t.Fatalf("Sniff named request = %v, %v; want structured", structured, err)
+			}
+			req, err := protocol.ReadRequest(r)
+			if err != nil {
+				t.Fatalf("read named request: %v", err)
+			}
+			if req.Name != `quote"and\backslash.txt` {
+				t.Fatalf("named request = %q, want exact unaliased name", req.Name)
+			}
+			if body, err := io.ReadAll(r); err != nil || string(body) != "payload" {
+				t.Fatalf("named body = %q, %v; want payload", body, err)
+			}
+
+			archive, err := os.ReadFile(archiveCapture)
+			if err != nil {
+				t.Fatalf("read archive request: %v", err)
+			}
+			frame := []byte("clipd:magic:v1\n{\"type\":\"drop\"}\n")
+			if !bytes.HasPrefix(archive, frame) {
+				t.Fatalf("archive request has no frame: %q", archive)
+			}
+			tr := tar.NewReader(bytes.NewReader(archive[len(frame):]))
+			hdr, err := tr.Next()
+			if err != nil || hdr.Name != "source.txt" {
+				t.Fatalf("archive entry = %v, %v; want source.txt", hdr, err)
+			}
+			if body, err := io.ReadAll(tr); err != nil || string(body) != "archive contents" {
+				t.Fatalf("archive body = %q, %v", body, err)
+			}
+			if leftovers, err := filepath.Glob(filepath.Join(dir, "drop.*")); err != nil || len(leftovers) != 0 {
+				t.Fatalf("staging cleanup = %v, %v; want no files", leftovers, err)
+			}
+		})
 	}
 }
 
@@ -791,6 +923,54 @@ func TestSSHBlockScopesToTheUser(t *testing.T) {
 	}
 }
 
+func TestSSHBlockResetsScopeBeforeFollowingDirectives(t *testing.T) {
+	t.Parallel()
+
+	ssh, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skip("ssh is unavailable")
+	}
+	tests := []struct {
+		name        string
+		destination string
+	}{
+		{name: "bare Host block", destination: "server"},
+		{name: "account Match block", destination: "alice@server"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			block, err := sshBlockFor(tc.destination, "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
+			if err != nil {
+				t.Fatalf("sshBlockFor: %v", err)
+			}
+			configPath := filepath.Join(t.TempDir(), "config")
+			// This is a global directive the user appended after setup's marker.
+			// Without a real Host/Match reset, it remains captured by clipd's stanza
+			// and does not apply to an unrelated destination.
+			if err := os.WriteFile(configPath, []byte(block+"Port 2222\n"), 0o600); err != nil {
+				t.Fatalf("write candidate config: %v", err)
+			}
+			cmd := exec.Command(ssh, "-G", "-F", configPath, "unrelated.invalid")
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("ssh -G: %v", err)
+			}
+			var port string
+			for _, line := range strings.Split(string(out), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) == 2 && fields[0] == "port" {
+					port = fields[1]
+					break
+				}
+			}
+			if port != "2222" {
+				t.Fatalf("directive after managed block resolved to port %q, want 2222\n%s", port, block)
+			}
+		})
+	}
+}
+
 // TestSSHBlockMatchesTheNameAsTyped guards a failure with no symptom.
 //
 // `Match host` is evaluated after HostName substitution, so against an alias
@@ -934,7 +1114,7 @@ func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 	if !strings.Contains(block, `if [ "${1:-}" = "--name" ]`) {
 		t.Errorf("the function does not branch on an explicit --name:\n%s", block)
 	}
-	if !strings.Contains(block, `COPYFILE_DISABLE=1 tar cf - -- "$@"`) {
+	if !strings.Contains(block, `COPYFILE_DISABLE=1 command tar cf - -- "$@"`) {
 		t.Errorf("the file form does not tar its arguments:\n%s", block)
 	}
 	if !strings.Contains(block, `"name":"%s"`) {
@@ -970,7 +1150,7 @@ func TestShellFunctionReportsFailureAsExitStatus(t *testing.T) {
 	if !strings.Contains(block, "'clipd: ok: '*) return 0 ;;") {
 		t.Errorf("the function does not turn the daemon's reply into an exit status:\n%s", block)
 	}
-	if !strings.Contains(block, "if ! COPYFILE_DISABLE=1 tar") {
+	if !strings.Contains(block, "if ! COPYFILE_DISABLE=1 command tar") {
 		t.Errorf("the function does not test tar's exit status:\n%s", block)
 	}
 	if !strings.Contains(block, `< "$_clipd_payload"`) {

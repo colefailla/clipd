@@ -425,13 +425,27 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 	fmt.Fprintf(&b, "%s\n", blockStart)
 	fmt.Fprintf(&b, "# Sends to the clipd daemon on the Mac, through the socket SSH forwards.\n")
 	fmt.Fprintf(&b, "# Managed by 'clipd setup'; edits between these markers are overwritten.\n")
+	// A shell expands aliases while it parses a function definition. If the
+	// user already has an alias named clipd, `clipd() (` is parsed as the alias
+	// expansion followed by `()`, which is a syntax error in Bash, Dash and Zsh
+	// — and a syntax error here breaks every new shell on the host.
+	//
+	// The backslash is what makes this work everywhere. `command unalias` looks
+	// right, and passes in sh and bash, but zsh resolves `command` to an
+	// external program and there is no external unalias: the guard silently
+	// does nothing and the definition below dies. Escaping any character of the
+	// word suppresses alias expansion on `unalias` itself while still finding
+	// the builtin, so it also survives a user who has aliased that too.
+	//
+	// `|| :` keeps this from aborting an rc file whose owner enabled errexit.
+	fmt.Fprintf(&b, "\\unalias clipd 2>/dev/null || :\n")
 	fmt.Fprintf(&b, "clipd() (\n")
 	fmt.Fprintf(&b, "  _clipd_sock=%s\n", shellQuote(socket))
 	fmt.Fprintf(&b, "  _clipd_dir=%s\n", shellQuote(dir))
 	fmt.Fprintf(&b, "  _clipd_reply=\n")
 	fmt.Fprintf(&b, "  _clipd_client=0\n")
 	fmt.Fprintf(&b, "  if [ ! -S \"$_clipd_sock\" ]; then\n")
-	fmt.Fprintf(&b, "    printf 'clipd: %%s is missing; reconnect with the socket forward\\n' \"$_clipd_sock\" >&2\n")
+	fmt.Fprintf(&b, "    command printf 'clipd: %%s is missing; reconnect with the socket forward\\n' \"$_clipd_sock\" >&2\n")
 	fmt.Fprintf(&b, "    return 1\n")
 	fmt.Fprintf(&b, "  fi\n")
 	// ${1:-} rather than $1, so that a shell running under `set -u` does not
@@ -449,7 +463,7 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 		fmt.Fprintf(&b, "    if [ \"${1:-}\" = \"--name\" ]; then\n")
 		fmt.Fprintf(&b, "      shift\n")
 		fmt.Fprintf(&b, "      if [ \"$#\" -ne 1 ] || [ -z \"${1:-}\" ]; then\n")
-		fmt.Fprintf(&b, "        printf 'clipd drop: --name needs exactly one filename\\n' >&2\n")
+		fmt.Fprintf(&b, "        command printf 'clipd drop: --name needs exactly one filename\\n' >&2\n")
 		fmt.Fprintf(&b, "        return 64\n")
 		fmt.Fprintf(&b, "      fi\n")
 		fmt.Fprintf(&b, "      _clipd_name=$1\n")
@@ -457,19 +471,19 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 		// daemon refuses them in filenames anyway. Reject them before framing so a
 		// newline cannot turn one request envelope into several lines.
 		fmt.Fprintf(&b, "      case $_clipd_name in *'\n'*)\n")
-		fmt.Fprintf(&b, "        printf 'clipd drop: the filename contains a control character\\n' >&2; return 64 ;;\n")
+		fmt.Fprintf(&b, "        command printf 'clipd drop: the filename contains a control character\\n' >&2; return 64 ;;\n")
 		fmt.Fprintf(&b, "      esac\n")
-		fmt.Fprintf(&b, "      if printf '%%s' \"$_clipd_name\" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then\n")
-		fmt.Fprintf(&b, "        printf 'clipd drop: the filename contains a control character\\n' >&2\n")
+		fmt.Fprintf(&b, "      if command printf '%%s' \"$_clipd_name\" | LC_ALL=C command grep '[[:cntrl:]]' >/dev/null 2>&1; then\n")
+		fmt.Fprintf(&b, "        command printf 'clipd drop: the filename contains a control character\\n' >&2\n")
 		fmt.Fprintf(&b, "        return 64\n")
 		fmt.Fprintf(&b, "      fi\n")
 		// The name lands inside a JSON string, so the two characters JSON
 		// escapes have to be escaped here. Everything else the daemon rejects.
-		fmt.Fprintf(&b, "      _clipd_esc=$(printf '%%s' \"$_clipd_name\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g') || return 1\n")
-		fmt.Fprintf(&b, "      if _clipd_reply=$( { printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\"}\\n' \"$_clipd_esc\"; cat; } | %s ); then :; else _clipd_client=$?; fi\n", client)
+		fmt.Fprintf(&b, "      _clipd_esc=$(command printf '%%s' \"$_clipd_name\" | command sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g') || return 1\n")
+		fmt.Fprintf(&b, "      if _clipd_reply=$( { command printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\"}\\n' \"$_clipd_esc\"; command cat; } | command %s ); then :; else _clipd_client=$?; fi\n", client)
 		fmt.Fprintf(&b, "    else\n")
 		fmt.Fprintf(&b, "      if [ $# -eq 0 ]; then\n")
-		fmt.Fprintf(&b, "        printf 'clipd drop: no files given (use --name to send stdin)\\n' >&2\n")
+		fmt.Fprintf(&b, "        command printf 'clipd drop: no files given (use --name to send stdin)\\n' >&2\n")
 		fmt.Fprintf(&b, "        return 64\n")
 		fmt.Fprintf(&b, "      fi\n")
 		{
@@ -498,41 +512,41 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 			fmt.Fprintf(&b, "          (umask 077; set -C; : > \"$_clipd_payload\") 2>/dev/null && break\n")
 			fmt.Fprintf(&b, "          _clipd_seq=$((_clipd_seq + 1))\n")
 			fmt.Fprintf(&b, "          if [ \"$_clipd_seq\" -ge 64 ]; then\n")
-			fmt.Fprintf(&b, "            printf 'clipd drop: no free staging name in %%s; nothing was sent\\n' \"$_clipd_dir\" >&2\n")
+			fmt.Fprintf(&b, "            command printf 'clipd drop: no free staging name in %%s; nothing was sent\\n' \"$_clipd_dir\" >&2\n")
 			fmt.Fprintf(&b, "            exit 1\n")
 			fmt.Fprintf(&b, "          fi\n")
 			fmt.Fprintf(&b, "        done\n")
-			fmt.Fprintf(&b, "        trap 'rm -f \"$_clipd_payload\"' 0\n")
+			fmt.Fprintf(&b, "        trap 'command rm -f \"$_clipd_payload\"' 0\n")
 			fmt.Fprintf(&b, "        trap 'exit 1' 1 2 15\n")
-			fmt.Fprintf(&b, "        printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n' > \"$_clipd_payload\" || exit 1\n")
+			fmt.Fprintf(&b, "        command printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n' > \"$_clipd_payload\" || exit 1\n")
 			// The -- is what keeps a file called
 			// "--use-compress-program=curl" from being read by tar as an option
 			// and executed.
-			fmt.Fprintf(&b, "        if ! COPYFILE_DISABLE=1 tar cf - -- \"$@\" >> \"$_clipd_payload\"; then\n")
-			fmt.Fprintf(&b, "          printf 'clipd drop: tar failed; nothing was sent\\n' >&2\n")
+			fmt.Fprintf(&b, "        if ! COPYFILE_DISABLE=1 command tar cf - -- \"$@\" >> \"$_clipd_payload\"; then\n")
+			fmt.Fprintf(&b, "          command printf 'clipd drop: tar failed; nothing was sent\\n' >&2\n")
 			fmt.Fprintf(&b, "          exit 1\n")
 			fmt.Fprintf(&b, "        fi\n")
-			fmt.Fprintf(&b, "        %s < \"$_clipd_payload\"\n", client)
+			fmt.Fprintf(&b, "        command %s < \"$_clipd_payload\"\n", client)
 			fmt.Fprintf(&b, "      ); then\n")
-			fmt.Fprintf(&b, "        if [ -n \"${_clipd_reply:-}\" ]; then printf '%%s\\n' \"$_clipd_reply\"; fi\n")
+			fmt.Fprintf(&b, "        if [ -n \"${_clipd_reply:-}\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
 			fmt.Fprintf(&b, "        return 1\n")
 			fmt.Fprintf(&b, "      fi\n")
 		}
 		fmt.Fprintf(&b, "    fi\n")
 	} else {
-		fmt.Fprintf(&b, "    printf 'clipd drop: this host has no tar\\n' >&2; return 1\n")
+		fmt.Fprintf(&b, "    command printf 'clipd drop: this host has no tar\\n' >&2; return 1\n")
 	}
 	fmt.Fprintf(&b, "  else\n")
-	fmt.Fprintf(&b, "    if _clipd_reply=$(%s); then :; else _clipd_client=$?; fi\n", client)
+	fmt.Fprintf(&b, "    if _clipd_reply=$(command %s); then :; else _clipd_client=$?; fi\n", client)
 	fmt.Fprintf(&b, "  fi\n")
 	// The daemon's reply is the whole user interface for the result, so it is
 	// printed whatever it says; the status prefix on it is what turns the
 	// result into an exit code.
-	fmt.Fprintf(&b, "  if [ -n \"$_clipd_reply\" ]; then printf '%%s\\n' \"$_clipd_reply\"; fi\n")
+	fmt.Fprintf(&b, "  if [ -n \"$_clipd_reply\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
 	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ]; then return 1; fi\n")
 	fmt.Fprintf(&b, "  case $_clipd_reply in\n")
 	fmt.Fprintf(&b, "    'clipd: ok: '*) return 0 ;;\n")
-	fmt.Fprintf(&b, "    '') printf 'clipd: no reply from the daemon\\n' >&2; return 1 ;;\n")
+	fmt.Fprintf(&b, "    '') command printf 'clipd: no reply from the daemon\\n' >&2; return 1 ;;\n")
 	fmt.Fprintf(&b, "    *) return 1 ;;\n")
 	fmt.Fprintf(&b, "  esac\n")
 	fmt.Fprintf(&b, ")\n")
@@ -729,6 +743,11 @@ func sshBlockFor(destination, remoteSocket, localSocket string) (string, error) 
 	// every later forward fail — and the failure is reported only in the remote
 	// sshd's log, so from this side clipd just stops working with nothing said.
 	fmt.Fprintf(&b, "  StreamLocalBindUnlink yes\n")
+	// Host and Match sections continue until the next Host or Match directive;
+	// the end marker is only a comment. Reset to an all-host section so a user
+	// who later appends a global option does not silently scope it to clipd's
+	// destination (or, for Match, to one destination/account pair).
+	fmt.Fprintf(&b, "Host *\n")
 	fmt.Fprintf(&b, "%s\n", end)
 	return b.String(), nil
 }

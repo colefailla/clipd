@@ -98,6 +98,33 @@ func TestReadRequestRejectsBadFrames(t *testing.T) {
 	}
 }
 
+// TestReadRequestRejectsInvalidUTF8 pins a surprising encoding/json behavior:
+// malformed bytes in a JSON string are otherwise replaced with U+FFFD. For a
+// named drop that would publish a silently changed filename.
+func TestReadRequestRejectsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	give := "{\"type\":\"drop\",\"name\":\"report\xff.txt\"}\n"
+	if _, err := ReadRequest(readerOf(give)); err == nil {
+		t.Fatal("ReadRequest accepted invalid UTF-8 in a filename")
+	} else if !strings.Contains(err.Error(), "valid UTF-8") {
+		t.Fatalf("ReadRequest error = %q, want an invalid UTF-8 explanation", err)
+	}
+}
+
+func TestReadRequestAcceptsUnicode(t *testing.T) {
+	t.Parallel()
+
+	const name = "résumé-日本語.txt"
+	req, err := ReadRequest(readerOf(`{"type":"drop","name":"` + name + `"}` + "\n"))
+	if err != nil {
+		t.Fatalf("ReadRequest: %v", err)
+	}
+	if req.Name != name {
+		t.Fatalf("Name = %q, want %q", req.Name, name)
+	}
+}
+
 // TestReadRequestBoundsTheFrame stops a peer from making the daemon buffer an
 // unbounded "envelope" that never ends.
 func TestReadRequestBoundsTheFrame(t *testing.T) {
