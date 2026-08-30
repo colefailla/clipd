@@ -916,7 +916,13 @@ func TestSSHBlockScopesToTheUser(t *testing.T) {
 		t.Errorf("a bare destination did not produce a Host block:\n%s", bare)
 	}
 	// Both halves of the socket's protection on a shared remote host.
-	for _, want := range []string{"StreamLocalBindMask 0177", "StreamLocalBindUnlink yes"} {
+	// StreamLocalBindUnlink is deliberately not emitted: for a remote forward the
+	// socket is bound by the remote's sshd, so only its sshd_config governs. The
+	// client-side option was measured against a real host and had no effect.
+	if strings.Contains(bare, "StreamLocalBindUnlink") {
+		t.Errorf("the block emits StreamLocalBindUnlink, which does nothing for a remote forward:\n%s", bare)
+	}
+	for _, want := range []string{"StreamLocalBindMask 0177"} {
 		if !strings.Contains(bare, want) {
 			t.Errorf("the block is missing %q:\n%s", want, bare)
 		}

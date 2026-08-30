@@ -212,7 +212,15 @@ journalctl -u nginx | clipd drop --name nginx.log
 `--name` matters when the thing you want has no file on disk. With arguments,
 `tar` carries the names; in a pipeline there is nothing to name, so you supply
 one. The flag is required rather than guessed from whether stdin is a terminal,
-so a drop from a script or a cron job sends the file rather than an empty one.
+so a drop with a pipe or a redirect on stdin sends the file rather than an empty
+one.
+
+One caveat about non-interactive use: Debian and its derivatives ship a
+`.bashrc` that returns early for non-interactive shells, and `clipd setup`
+appends below that line. So `ssh <host> 'clipd drop file'` reports
+`clipd: command not found` on those hosts — the function is never defined. Use
+`ssh -t <host> 'clipd drop file'`, which allocates a terminal and makes the shell
+interactive, or move the clipd block above that early return.
 
 The exit status is the daemon's answer, which makes `clipd drop x && rm x` safe:
 a rejected drop exits non-zero, and one whose `tar` fails sends nothing at all.
@@ -364,14 +372,29 @@ Reconnect. If you use `ControlMaster`, kill the old master first with
 `ssh -O exit <host>`; otherwise you reuse a connection that predates the
 forward.
 
-**`remote port forwarding failed`** — a stale socket on the remote from an
-unclean disconnect. `ssh <host> rm .clipd/socket` clears it.
+**`remote port forwarding failed`** means sshd could not bind the socket. Two
+different things produce that identical warning:
 
-`clipd setup` writes `StreamLocalBindUnlink yes` into your `~/.ssh/config` to
-stop it recurring. If it keeps happening anyway, the socket on a remote forward
-is bound by the remote's `sshd`, so the setting that governs it is the same one
-in that host's `/etc/ssh/sshd_config` — which only its administrator can
-change.
+- **You already have a session open to that host.** Two sessions cannot bind the
+  same path, so the second one loses its forward. Harmless — the first session
+  still works.
+- **A socket is left over** from a session that ended badly. Every later
+  connection now fails the same way. Clear it:
+
+  ```bash
+  ssh <host> 'rm -f ~/.clipd/socket'
+  ```
+
+`clipd` tells you which one you are looking at: when the socket exists but
+nothing answers, it says so and gives you that `rm` line rather than a bare
+transport error.
+
+To stop the leftover case recurring, the remote needs `StreamLocalBindUnlink yes`
+in its `/etc/ssh/sshd_config`, which takes root on that host. The same setting in
+your own `~/.ssh/config` does **not** help: a remote forward is bound by the
+remote's `sshd`, and the request the client sends carries only a path, with no
+way to ask for an unlink. That was measured against a real host — the option
+active in `ssh -G`, a stale socket in place, and the forward still refused.
 
 ## Exit codes
 

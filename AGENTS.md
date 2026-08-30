@@ -161,8 +161,12 @@ cross-machine transaction:
 - `ssh -G` proves client-side parsing, matching, and expansion only. It does not
   prove remote sshd policy, socket creation/permissions, or successful
   forwarding. Those claims require a disposable integration host.
-- `StreamLocalBindUnlink` exists in client and server configuration; do not infer
-  remote behavior from `ssh -G` alone. Account-scoped blocks use
+- `StreamLocalBindUnlink` exists in client and server configuration, and for a
+  remote forward only the server's copy has any effect. Measured against a real
+  host: the client option active in `ssh -G`, a stale socket in place, and the
+  forward still refused. The generated block therefore does not emit it; do not
+  add it back. This is also the example of why `ssh -G` proves parsing and
+  matching but never remote behavior. Account-scoped blocks use
   `Match originalhost` because `Match host` sees the post-`HostName` value.
 
 Tests must use temporary homes/configs and fake clients/listeners. Ordinary tests

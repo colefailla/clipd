@@ -55,8 +55,12 @@ directories survive the trip.
 
 A pipeline has no file and so no name, and --name supplies one. The flag is
 required rather than inferred: the two forms used to be told apart by whether
-stdin was a terminal, which meant that running a drop from a script, a cron job
-or 'ssh host clipd drop report.pdf' sent no file at all and reported success.
+stdin was a terminal, which meant that any drop with a pipe or a redirect on
+stdin sent no file at all and reported success.
+
+Note that on Debian and derivatives the stock .bashrc returns early for
+non-interactive shells, so 'ssh host clipd drop file' will not find the function
+at all. 'ssh -t' allocates a terminal and works.
 
 The exit status is the daemon's answer, so 'clipd drop x && rm x' is safe: a
 drop the daemon rejected, or one whose tar failed partway, exits non-zero.

@@ -505,7 +505,7 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 			// backgrounded drops from one shell would collide on the first
 			// name; the sequence is what lets the second pick another, and it
 			// steps over a file a killed drop left behind.
-			fmt.Fprintf(&b, "      if ! _clipd_reply=$(\n")
+			fmt.Fprintf(&b, "      _clipd_reply=$(\n")
 			fmt.Fprintf(&b, "        _clipd_seq=0\n")
 			fmt.Fprintf(&b, "        while :; do\n")
 			fmt.Fprintf(&b, "          _clipd_payload=\"$_clipd_dir/drop.$$.$_clipd_seq\"\n")
@@ -513,24 +513,26 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 			fmt.Fprintf(&b, "          _clipd_seq=$((_clipd_seq + 1))\n")
 			fmt.Fprintf(&b, "          if [ \"$_clipd_seq\" -ge 64 ]; then\n")
 			fmt.Fprintf(&b, "            command printf 'clipd drop: no free staging name in %%s; nothing was sent\\n' \"$_clipd_dir\" >&2\n")
-			fmt.Fprintf(&b, "            exit 1\n")
+			fmt.Fprintf(&b, "            exit 3\n")
 			fmt.Fprintf(&b, "          fi\n")
 			fmt.Fprintf(&b, "        done\n")
 			fmt.Fprintf(&b, "        trap 'command rm -f \"$_clipd_payload\"' 0\n")
 			fmt.Fprintf(&b, "        trap 'exit 1' 1 2 15\n")
-			fmt.Fprintf(&b, "        command printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n' > \"$_clipd_payload\" || exit 1\n")
+			fmt.Fprintf(&b, "        command printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n' > \"$_clipd_payload\" || exit 3\n")
 			// The -- is what keeps a file called
 			// "--use-compress-program=curl" from being read by tar as an option
 			// and executed.
 			fmt.Fprintf(&b, "        if ! COPYFILE_DISABLE=1 command tar cf - -- \"$@\" >> \"$_clipd_payload\"; then\n")
 			fmt.Fprintf(&b, "          command printf 'clipd drop: tar failed; nothing was sent\\n' >&2\n")
-			fmt.Fprintf(&b, "          exit 1\n")
+			fmt.Fprintf(&b, "          exit 3\n")
 			fmt.Fprintf(&b, "        fi\n")
 			fmt.Fprintf(&b, "        command %s < \"$_clipd_payload\"\n", client)
-			fmt.Fprintf(&b, "      ); then\n")
-			fmt.Fprintf(&b, "        if [ -n \"${_clipd_reply:-}\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
-			fmt.Fprintf(&b, "        return 1\n")
-			fmt.Fprintf(&b, "      fi\n")
+			// Failure falls through to the shared handler below rather than
+			// reporting here, so a stale socket is diagnosed the same way
+			// whichever path hit it. `|| _clipd_client=$?` rather than
+			// `if ! ...`, because `!` collapses the status to 1 and the exact
+			// code is what says whether the socket was ever opened.
+			fmt.Fprintf(&b, "      ) || _clipd_client=$?\n")
 		}
 		fmt.Fprintf(&b, "    fi\n")
 	} else {
@@ -543,10 +545,31 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 	// printed whatever it says; the status prefix on it is what turns the
 	// result into an exit code.
 	fmt.Fprintf(&b, "  if [ -n \"$_clipd_reply\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
-	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ]; then return 1; fi\n")
+	// A session that ends badly leaves its socket file behind, so the -S test at
+	// the top still passes and the only symptom is a bare transport error. sshd
+	// will not rebind a path that already exists, so every later connection
+	// fails the same way until someone removes the corpse — and the warning ssh
+	// prints for that is identical to the one it prints when another session
+	// simply holds the forward, which makes it useless for telling them apart.
+	//
+	// Asking is what distinguishes them. A ping costs one connection and only
+	// happens on a path that has already failed. It also keeps this quiet when
+	// the failure was something else: a tar that could not read a file leaves
+	// the socket perfectly healthy, the ping succeeds, and the message tar
+	// already printed stands on its own.
+	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ] || [ -z \"$_clipd_reply\" ]; then\n")
+	// Status 3 is a failure that happened before the socket was opened at all —
+	// no staging name, no header, tar could not read a file. Those have already
+	// explained themselves, and probing a socket they never touched would be
+	// both misleading and a wasted connection.
+	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ] && ! command printf 'clipd:magic:v1\\n{\"type\":\"ping\"}\\n' | command %s 2>/dev/null | command grep -q '^clipd: ok: pong'; then\n", client)
+	fmt.Fprintf(&b, "      command printf 'clipd: nothing is listening on %%s; the socket is stale.\\n' \"$_clipd_sock\" >&2\n")
+	fmt.Fprintf(&b, "      command printf 'clipd: clear it and reconnect:  rm -f %%s\\n' \"$_clipd_sock\" >&2\n")
+	fmt.Fprintf(&b, "    fi\n")
+	fmt.Fprintf(&b, "    return 1\n")
+	fmt.Fprintf(&b, "  fi\n")
 	fmt.Fprintf(&b, "  case $_clipd_reply in\n")
 	fmt.Fprintf(&b, "    'clipd: ok: '*) return 0 ;;\n")
-	fmt.Fprintf(&b, "    '') command printf 'clipd: no reply from the daemon\\n' >&2; return 1 ;;\n")
 	fmt.Fprintf(&b, "    *) return 1 ;;\n")
 	fmt.Fprintf(&b, "  esac\n")
 	fmt.Fprintf(&b, ")\n")
@@ -739,10 +762,14 @@ func sshBlockFor(destination, remoteSocket, localSocket string) (string, error) 
 	// StreamLocalBindMask the user set elsewhere in this file would apply here
 	// too, and 0000 there publishes the socket to every account on the host.
 	fmt.Fprintf(&b, "  StreamLocalBindMask 0177\n")
-	// Without this, a socket left behind by a session that died uncleanly makes
-	// every later forward fail — and the failure is reported only in the remote
-	// sshd's log, so from this side clipd just stops working with nothing said.
-	fmt.Fprintf(&b, "  StreamLocalBindUnlink yes\n")
+	// StreamLocalBindUnlink is deliberately absent, and should not be added back.
+	// It reads like the fix for a socket left behind by a session that died
+	// uncleanly, and it is — for a socket the ssh client binds, which is local
+	// forwarding. A remote forward is bound by the remote's sshd, and the
+	// streamlocal-forward request carries only a path, so the client has no way
+	// to ask for an unlink. Measured against a real host: the option present and
+	// active in `ssh -G`, a stale socket in place, and the forward still failed.
+	// The setting that governs this lives in the remote's sshd_config.
 	// Host and Match sections continue until the next Host or Match directive;
 	// the end marker is only a comment. Reset to an all-host section so a user
 	// who later appends a global option does not silently scope it to clipd's
