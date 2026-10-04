@@ -188,11 +188,10 @@ func failf(e *env, code int, format string, args ...any) int {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `clipd — send text and files to your Mac's clipboard over SSH
+	fmt.Fprint(w, `clipd — send text to your Mac's clipboard and files to its Drop directory over SSH
 
-The daemon runs on the Mac. Nothing is installed on the machines you copy
-from: 'clipd setup <host>' forwards the socket and drops a shell function
-there, and from then on:
+The daemon runs on the Mac. 'clipd setup <host>' edits your SSH config and
+remote shell startup file; it installs no remote binary or service:
 
   ls -l | clipd            copy output to the Mac's clipboard
   clipd drop report.pdf    send files to the Mac's ~/Drop
@@ -209,12 +208,14 @@ Commands:
 
 Global options:
   -config <path>     use an alternate config file
-  -verbose, -v       report progress on stderr
+  -verbose, -v       enable daemon diagnostic logs
 
 Environment:
   CLIPD_CONFIG       path to the config file
 
-Run 'clipd help config' for the config file format, or
+Config: ~/.config/clipd/config.json (or $XDG_CONFIG_HOME/clipd/config.json).
+After editing settings, run 'clipd restart'. 'clipd install' writes all defaults.
+Run 'clipd help setup' for files setup edits, 'clipd help config' for limits, or
 'clipd help security' for what protects the socket.
 `)
 }

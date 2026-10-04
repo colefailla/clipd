@@ -118,7 +118,7 @@ func TestShellFunctionIsValidShell(t *testing.T) {
 	clients := []string{`nc -N -U "$_clipd_sock"`, `nc -U "$_clipd_sock"`, `socat - UNIX-CLIENT:"$_clipd_sock"`}
 	for _, client := range clients {
 		for _, hasTar := range []bool{true, false} {
-			block := shellFunction(client, "/home/cole/.clipd/socket", "/home/cole/.clipd", hasTar)
+			block := shellFunction(client, "/home/cole/.clipd/socket", hasTar)
 
 			cmd := exec.Command(sh, "-n")
 			cmd.Stdin = strings.NewReader(block)
@@ -139,7 +139,7 @@ func TestShellFunctionQuotesSocketAsLiteralShellData(t *testing.T) {
 	}
 
 	socket := "/home/$USER/`printf injected`/it's a \"socket\""
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, socket, "/home/cole/.clipd", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, socket, true)
 	var assignment string
 	for _, line := range strings.Split(block, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "_clipd_sock=") {
@@ -167,14 +167,14 @@ func TestShellFunctionQuotesSocketAsLiteralShellData(t *testing.T) {
 func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", "/home/cole/.clipd", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
 
-	if !strings.Contains(block, `clipd:magic:v1\n{"type":"drop"}\n`) {
+	if !strings.Contains(block, `clipd:magic:v1\n{"type":"drop-stream-v2","progress":%s}\n`) {
 		t.Errorf("the drop path does not emit the magic frame:\n%s", block)
 	}
 	// The -- is load-bearing: without it a file named
 	// "--use-compress-program=curl" is read by tar as an option and executed.
-	if !strings.Contains(block, `COPYFILE_DISABLE=1 command tar cf - -- "$@"`) {
+	if !strings.Contains(block, `COPYFILE_DISABLE=1 command tar cf - "$@"`) {
 		t.Errorf("the drop path does not pipe a tar stream with -- :\n%s", block)
 	}
 	// The socket check has to come first: without it, a session opened before
@@ -190,7 +190,7 @@ func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 func TestShellFunctionRefusesDropWithoutTar(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", "/home/cole/.clipd", false)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", false)
 	if strings.Contains(block, "tar cf") {
 		t.Errorf("the function uses tar on a host that has none:\n%s", block)
 	}
@@ -206,14 +206,14 @@ func TestShellFunctionRefusesDropWithoutTar(t *testing.T) {
 func TestShellFunctionNeedsNoMktemp(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", "/home/cole/.clipd", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
 	if strings.Contains(block, "mktemp") {
 		t.Errorf("the function still depends on mktemp:\n%s", block)
 	}
 	// The three pieces that make a hand-made staging name safe: 0600 through
 	// umask, noclobber so an existing file is refused rather than followed, and
 	// clipd's own private directory rather than a shared /tmp.
-	for _, want := range []string{"umask 077", "set -C", `_clipd_dir='/home/cole/.clipd'`} {
+	for _, want := range []string{`"./$_clipd_base"`, "clipd:complete:v2"} {
 		if !strings.Contains(block, want) {
 			t.Errorf("staging is missing %q:\n%s", want, block)
 		}
@@ -247,7 +247,7 @@ func TestShellFunctionValidatesAndEscapesNamedDrops(t *testing.T) {
 	if err := os.WriteFile(clientPath, []byte(clientScript), 0o600); err != nil {
 		t.Fatalf("write fake client: %v", err)
 	}
-	block := shellFunction("sh "+shellQuote(clientPath), socket, dir, true)
+	block := shellFunction("sh "+shellQuote(clientPath), socket, true)
 
 	for _, tc := range []struct {
 		name string
@@ -317,7 +317,7 @@ func TestShellFunctionDoesNotChangeInteractiveVariables(t *testing.T) {
 	}
 	defer listener.Close()
 
-	block := shellFunction(`printf 'clipd: ok: copied\n'`, socket, dir, true)
+	block := shellFunction(`printf 'clipd: ok: copied\n'`, socket, true)
 	script := `_clipd_sock=mine; _clipd_reply=mine; _clipd_client=73
 ` + block + `
 clipd </dev/null >/dev/null || exit
@@ -360,7 +360,7 @@ printf 'clipd: ok: received\n'
 		t.Fatalf("write fake transport: %v", err)
 	}
 	blockPath := filepath.Join(dir, "clipd-block.sh")
-	block := shellFunction("clipd_test_transport", socket, dir, true)
+	block := shellFunction("clipd_test_transport", socket, true)
 	if err := os.WriteFile(blockPath, []byte(block), 0o600); err != nil {
 		t.Fatalf("write generated block: %v", err)
 	}
@@ -445,13 +445,13 @@ clipd drop source.txt || exit 94
 			if err != nil {
 				t.Fatalf("read archive request: %v", err)
 			}
-			frame := []byte("clipd:magic:v1\n{\"type\":\"drop\"}\n")
+			frame := []byte("clipd:magic:v1\n{\"type\":\"drop-stream-v2\",\"progress\":false}\n")
 			if !bytes.HasPrefix(archive, frame) {
 				t.Fatalf("archive request has no frame: %q", archive)
 			}
 			tr := tar.NewReader(bytes.NewReader(archive[len(frame):]))
 			hdr, err := tr.Next()
-			if err != nil || hdr.Name != "source.txt" {
+			if err != nil || strings.TrimPrefix(hdr.Name, "./") != "source.txt" {
 				t.Fatalf("archive entry = %v, %v; want source.txt", hdr, err)
 			}
 			if body, err := io.ReadAll(tr); err != nil || string(body) != "archive contents" {
@@ -466,7 +466,7 @@ clipd drop source.txt || exit 94
 
 // TestShellFunctionOnlySendsCompleteArchives covers the failure shape that is
 // easy to miss: tar can write a valid archive prefix and then exit non-zero.
-// The client must not be invoked at all until that exit status is known.
+// Failed producers may send a prefix but must never send the completion marker.
 func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
 	sh, err := exec.LookPath("sh")
 	if err != nil {
@@ -480,7 +480,7 @@ func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
 		wantStatus string
 	}{
 		{name: "complete archive", arguments: "source.txt", wantSent: true},
-		{name: "tar fails after one file", arguments: "source.txt missing.txt", wantStatus: "nothing was sent"},
+		{name: "tar fails after one file", arguments: "source.txt missing.txt", wantStatus: "not completed"},
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -506,14 +506,14 @@ func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
 			clientScript := "#!/bin/sh\n" +
 				`: > "$CLIPD_TEST_CALLED" || exit 1` + "\n" +
 				`cat > "$CLIPD_TEST_CAPTURE" || exit 1` + "\n" +
-				`printf 'clipd: ok: dropped\n'` + "\n"
+				`if [ "$(tail -c 18 "$CLIPD_TEST_CAPTURE")" = "clipd:complete:v2" ]; then printf 'clipd: ok: dropped\n'; else printf 'clipd: error: incomplete archive\n'; exit 1; fi` + "\n"
 			if err := os.WriteFile(clientPath, []byte(clientScript), 0o600); err != nil {
 				t.Fatalf("write fake client: %v", err)
 			}
 
 			calledPath := filepath.Join(dir, "client-called")
 			capturePath := filepath.Join(dir, "request")
-			block := shellFunction("sh "+shellQuote(clientPath), socket, dir, true)
+			block := shellFunction("sh "+shellQuote(clientPath), socket, true)
 			script := block + "\nclipd drop " + tc.arguments + "\n"
 			cmd := exec.Command(sh, "-c", script)
 			cmd.Dir = dir
@@ -540,8 +540,12 @@ func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
 				if !strings.Contains(string(out), tc.wantStatus) {
 					t.Fatalf("failure output = %q, want %q", out, tc.wantStatus)
 				}
-				if _, err := os.Stat(calledPath); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("client ran after tar failed: %v", err)
+				payload, err := os.ReadFile(capturePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.HasSuffix(payload, []byte("clipd:complete:v2\n")) {
+					t.Fatal("failed producer sent a completion marker")
 				}
 				return
 			}
@@ -553,7 +557,7 @@ func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read captured request: %v", err)
 			}
-			frame := []byte("clipd:magic:v1\n{\"type\":\"drop\"}\n")
+			frame := []byte("clipd:magic:v1\n{\"type\":\"drop-stream-v2\",\"progress\":false}\n")
 			if !bytes.HasPrefix(payload, frame) {
 				t.Fatalf("request has no complete protocol frame: %q", payload)
 			}
@@ -562,7 +566,7 @@ func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read captured tar header: %v", err)
 			}
-			if hdr.Name != "source.txt" {
+			if strings.TrimPrefix(hdr.Name, "./") != "source.txt" {
 				t.Fatalf("tar entry = %q, want source.txt", hdr.Name)
 			}
 			contents, err := io.ReadAll(tr)
@@ -1112,7 +1116,7 @@ func TestLegacyUnhostedBlockIsReplaced(t *testing.T) {
 func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", "/home/cole/.clipd", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
 
 	if strings.Contains(block, "[ -t 0 ]") {
 		t.Errorf("the function still infers the drop form from the terminal:\n%s", block)
@@ -1120,7 +1124,7 @@ func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 	if !strings.Contains(block, `if [ "${1:-}" = "--name" ]`) {
 		t.Errorf("the function does not branch on an explicit --name:\n%s", block)
 	}
-	if !strings.Contains(block, `COPYFILE_DISABLE=1 command tar cf - -- "$@"`) {
+	if !strings.Contains(block, `COPYFILE_DISABLE=1 command tar cf - "$@"`) {
 		t.Errorf("the file form does not tar its arguments:\n%s", block)
 	}
 	if !strings.Contains(block, `"name":"%s"`) {
@@ -1138,8 +1142,8 @@ func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 func TestShellFunctionSurvivesNounset(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", "/home/cole/.clipd", true)
-	if strings.Contains(block, `"$1"`) {
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	if strings.Contains(block, "_clipd_name=\"$1\"") {
 		t.Errorf("the function expands $1 unguarded:\n%s", block)
 	}
 	if !strings.Contains(block, `"${1:-}"`) {
@@ -1152,15 +1156,15 @@ func TestShellFunctionSurvivesNounset(t *testing.T) {
 func TestShellFunctionReportsFailureAsExitStatus(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", "/home/cole/.clipd", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
 	if !strings.Contains(block, "'clipd: ok: '*) return 0 ;;") {
 		t.Errorf("the function does not turn the daemon's reply into an exit status:\n%s", block)
 	}
-	if !strings.Contains(block, "if ! COPYFILE_DISABLE=1 command tar") {
+	if !strings.Contains(block, "if COPYFILE_DISABLE=1 command tar") {
 		t.Errorf("the function does not test tar's exit status:\n%s", block)
 	}
-	if !strings.Contains(block, `< "$_clipd_payload"`) {
-		t.Errorf("the function does not send the completed payload by redirection:\n%s", block)
+	if strings.Contains(block, "_clipd_payload") || !strings.Contains(block, "clipd:complete:v2") {
+		t.Error("archive must stream with a completion marker and no payload spool")
 	}
 	if strings.Contains(block, "_clipd_tar") || strings.Contains(block, "_clipd_rc") {
 		t.Errorf("the function retains obsolete pipeline-status bookkeeping:\n%s", block)
@@ -1172,7 +1176,7 @@ func TestShellFunctionReportsFailureAsExitStatus(t *testing.T) {
 func TestShellFunctionDoesNotLeakVariables(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", "/home/cole/.clipd", true)
+	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
 	for _, bare := range []string{"\n  sock=", "\n      name=", "\n      esc="} {
 		if strings.Contains(block, bare) {
 			t.Errorf("the function assigns an unprefixed variable %q:\n%s", bare, block)

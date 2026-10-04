@@ -3,10 +3,12 @@ package drop
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -884,4 +886,29 @@ func TestSaveAppliesTheSameGuaranteesAsExtract(t *testing.T) {
 			t.Errorf("wrote %q, want notes-1.txt", res.Names[0])
 		}
 	})
+}
+
+func TestQuarantineHelperHonorsDeadline(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("quarantine is macOS-only")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "xattr"), []byte("#!/bin/sh\nexec /bin/sleep 10\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	quarantine(ctx, filepath.Join(dir, "file"))
+	if time.Since(start) > time.Second {
+		t.Fatal("quarantine outlived its request deadline")
+	}
+}
+
+func TestZeroByteFileAtExactSizeLimit(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Extract(archiveOf(t, entry{name: "a", body: "123"}, entry{name: "empty"}), Options{Dir: dir, MaxBytes: 3}); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -131,7 +131,8 @@ can break every new shell on the remote host.
   validate filenames before building JSON, escape JSON quotes/backslashes, and
   reject terminal/control characters. Test Unicode, newlines, invalid bytes,
   spaces, quotes, backslashes, and leading dashes.
-- Put `--` before user-controlled tar operands. Preserve the daemon reply and
+- Use `--` before user-controlled tar operands, or normalize each operand to
+  `./basename` when generated positional `-C` options require it. Preserve the daemon reply and
   report failure if tar, transport, or daemon publication fails, so
   `clipd drop file && rm file` is safe. Upstream status in
   `producer | clipd drop --name file` remains the invoking shell's responsibility.
@@ -175,7 +176,8 @@ must not mutate the developer's live environment.
 ### Drops, protocol, and server
 
 - Treat every tar header, name, type, size, and body as attacker-controlled.
-  Flatten paths to basenames; reject or safely handle absolute paths, `..`, both
+  Legacy drops flatten paths to basenames. Streaming drops preserve validated
+  relative trees beneath newly reserved top-level names. Reject or safely handle absolute paths, `..`, both
   separator styles, symlink/hardlink/device/FIFO entries, unsupported bodies,
   long/control/bidirectional names, collisions, and leading dashes.
 - Accept only regular-file payloads, keep received files mode `0600`, preserve
@@ -196,13 +198,13 @@ must not mutate the developer's live environment.
 - Keep literal loopback acceptance and empty/non-loopback refusal covered for
   IPv4 and IPv6.
 
-Current tar-integrity limitation: Go's tar reader accepts EOF at an entry
-boundary without proving that end-of-archive blocks arrived. The receiver can
-therefore publish a valid prefix after an exact-boundary transport cut; a normal
-generated client is expected to report transport failure, but a malicious sender
-need not. Keep this as an accepted limitation until the repository owner approves
-a compatible framing/end-marker design. Do not claim an end marker would provide
-no protection; any proposal must address compatibility and resource bounds.
+Legacy tar-integrity limitation: Go's tar reader accepts EOF at an entry
+boundary without proving end-of-archive blocks arrived. Legacy `drop` requests
+retain this behavior for compatibility. New `drop-stream-v2` requests require
+zero padding followed by the completion marker and EOF before publication;
+generated clients send that marker only after tar succeeds. The v1 envelope
+and raw/legacy body semantics remain unchanged. New clients talking to old
+daemons receive a structured-request rejection, never raw clipboard fallback.
 
 ### Config and LaunchAgent
 
@@ -221,23 +223,8 @@ no protection; any proposal must address compatibility and resource bounds.
 These are not protections to preserve or assume. Address them only when they are
 in scope, add regression coverage, and remove/update this list when fixed:
 
-- A pre-existing interactive alias named `clipd` makes the generated function
-  definition fail to parse in Bash and Zsh; no regression test covers it.
-- Generated shell invokes important utilities directly, so interactive aliases
-  or same-named functions can alter `tar`, `grep`, `sed`, `cat`, `rm`, and the
-  selected transport command.
-- Generated SSH blocks end with a comment rather than a real `Host *` (or
-  equivalent) scope reset. A directive appended after the last managed block can
-  therefore remain scoped to clipd's preceding `Host` or `Match` stanza.
-- A named-drop frame can contain invalid UTF-8. Go's JSON decoder replaces those
-  bytes with U+FFFD, so the receiver may publish a silently renamed file instead
-  of rejecting the request.
-- The `hasTar` branch disables named stdin drops even though only archive-form
-  drops inherently require tar.
-- Remote archive pre-spooling is outside daemon limits, can fill remote disk, and
-  can leave private staging data after `SIGKILL` or power loss.
-- Quarantine invokes `xattr` without a context/deadline, so not every helper is
-  currently time-bounded.
+- Legacy generated clients still pre-spool archives on remote disk and may
+  leave private payloads after SIGKILL or power loss; new clients stream instead.
 - Hard-link publication and quarantine use path-based operations because
   `os.Root` lacks those APIs; opened-root confinement is therefore not absolute.
 - Backup-path errors are not fully classified, and LaunchAgent rollback restores

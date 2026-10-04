@@ -1,22 +1,11 @@
-// Package drop receives files sent over the clipd socket and writes them into
-// a single directory.
-//
-// The transport is a tar stream, because tar is on every Unix machine and so
-// the sending side needs nothing installed: `tar cf - notes.txt | nc ...` is
-// the whole client. tar also carries the one thing a raw byte stream loses,
-// which is what the file was called.
-//
-// Everything here exists because that stream is attacker-controlled. A tar
-// archive can name a file "../../.ssh/authorized_keys", declare it a symlink
-// pointing anywhere on the filesystem, claim to be a device node, or expand
-// to more bytes than the disk holds. `tar -x` has to cope with all of that
-// because it is a general-purpose restore tool. This is not: the entire
-// requirement is "the files land in one directory under their own names", and
-// narrowing the requirement is what makes it safe to implement.
+// Package drop receives legacy flat drops and versioned streaming directory
+// drops. Payloads are privately staged, bounded and validated before publication.
+// Files never overwrite existing names or inherit executable permissions.
 package drop
 
 import (
 	"archive/tar"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -92,7 +81,11 @@ const maxNameInError = 80
 // conservative defaults when unset.
 type Options struct {
 	// Dir is the directory files are written into. It is created if missing.
-	Dir string
+	Dir             string
+	Context         context.Context
+	Stream          bool
+	Progress        func(string, int64, int64)
+	PublishProgress func(int, int)
 
 	// MaxBytes caps the total written across the whole archive, not per file.
 	// A thousand small files are as capable of filling a disk as one large one.
@@ -104,8 +97,7 @@ type Options struct {
 
 // Result describes what a successful extraction produced.
 type Result struct {
-	// Names are the basenames actually written, after any collision renaming,
-	// in the order they arrived.
+	// Names are the published top-level names after collision renaming.
 	Names []string
 
 	// Bytes is the total written.
@@ -244,7 +236,7 @@ func rollback(root *os.Root, stageDir string, published []publishedFile, cause e
 		// its name before a later publish failed. Compare inode identity with the
 		// still-staged hard link so rollback never deletes that replacement.
 		stagedInfo, stagedErr := root.Stat(file.staged)
-		finalInfo, finalErr := root.Stat(file.name)
+		finalInfo, finalErr := root.Lstat(file.name)
 		if errors.Is(finalErr, os.ErrNotExist) {
 			continue
 		}
@@ -278,6 +270,9 @@ func rollback(root *os.Root, stageDir string, published []publishedFile, cause e
 // are removed, so a rejected drop leaves nothing behind to be mistaken for a
 // complete one.
 func Extract(r io.Reader, opts Options) (Result, error) {
+	if opts.Stream {
+		return extractStream(r, opts)
+	}
 	if opts.Dir == "" {
 		return Result{}, errors.New("drop: no destination directory")
 	}
@@ -391,7 +386,16 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 	for _, file := range txn.files {
 		// Marked before it is published, so the attribute is already on the
 		// inode by the time the file has a name a user could open.
-		quarantine(filepath.Join(opts.Dir, file.path))
+		if err := requestContext(opts).Err(); err != nil {
+			return fail(err)
+		}
+		if err := verifyRootPath(root); err != nil {
+			return fail(err)
+		}
+		quarantine(requestContext(opts), filepath.Join(opts.Dir, file.path))
+		if err := requestContext(opts).Err(); err != nil {
+			return fail(err)
+		}
 		name, err := publish(root, file.path, file.name)
 		if err != nil {
 			return fail(err)
@@ -452,7 +456,7 @@ func readError(err error, budget int64) error {
 // clipd's exact ownership marker, and be older than any server connection can
 // remain alive. This deliberately leaves legacy .clipd-part-* files alone:
 // those names were not reserved, so an old one may be a user's real file.
-func CleanStale(dir string) int {
+func CleanStale(dir string, minimumAge ...time.Duration) int {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return 0
@@ -468,7 +472,11 @@ func CleanStale(dir string) int {
 		return 0
 	}
 
-	cutoff := time.Now().Add(-StaleCleanupInterval)
+	age := StaleCleanupInterval
+	if len(minimumAge) > 0 && minimumAge[0] > age {
+		age = minimumAge[0]
+	}
+	cutoff := time.Now().Add(-age)
 	removed := 0
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), stageDirPrefix) {
@@ -521,11 +529,27 @@ func Save(r io.Reader, name string, opts Options) (Result, error) {
 		return Result{}, err
 	}
 
-	staged, n, err := stage(r, root, txn.dir, 0, maxBytes)
+	source := r
+	if opts.Progress != nil {
+		source = &fileProgress{r: r, name: safe, size: -1, report: opts.Progress}
+	}
+	staged, n, err := stage(source, root, txn.dir, 0, maxBytes)
 	if err != nil {
 		return Result{}, rollback(root, txn.dir, nil, err)
 	}
-	quarantine(filepath.Join(opts.Dir, staged))
+	if err := requestContext(opts).Err(); err != nil {
+		return Result{}, rollback(root, txn.dir, nil, err)
+	}
+	if opts.PublishProgress != nil {
+		opts.PublishProgress(0, 1)
+	}
+	if err := verifyRootPath(root); err != nil {
+		return Result{}, rollback(root, txn.dir, nil, err)
+	}
+	quarantine(requestContext(opts), filepath.Join(opts.Dir, staged))
+	if err := requestContext(opts).Err(); err != nil {
+		return Result{}, rollback(root, txn.dir, nil, err)
+	}
 	finalName, err := publish(root, staged, safe)
 	if err != nil {
 		return Result{}, rollback(root, txn.dir, nil, err)
@@ -624,7 +648,7 @@ func isControl(r rune) bool {
 // name. os.Root confines the create beneath the already-open drop directory,
 // including if a directory entry is replaced with a symlink on a shared path.
 func stage(r io.Reader, root *os.Root, txnDir string, index int, remaining int64) (path string, n int64, err error) {
-	if remaining <= 0 {
+	if remaining < 0 {
 		return "", 0, errors.New("drop: archive exceeds the size limit")
 	}
 
@@ -661,6 +685,23 @@ func stage(r io.Reader, root *os.Root, txnDir string, index int, remaining int64
 	return path, n, nil
 }
 
+// verifyRootPath catches root replacement before APIs that cannot use os.Root.
+// This is a check, not an atomic guarantee against concurrent pathname changes.
+func verifyRootPath(root *os.Root) error {
+	opened, err := root.Stat(".")
+	if err != nil {
+		return err
+	}
+	named, err := os.Stat(root.Name())
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(opened, named) {
+		return errors.New("drop: destination root changed during transfer")
+	}
+	return nil
+}
+
 // publish gives a completed transaction file its real name, adding a numeric
 // suffix if that name is taken.
 //
@@ -674,6 +715,9 @@ func stage(r io.Reader, root *os.Root, txnDir string, index int, remaining int64
 // Bounded rather than open-ended so that a sender cannot make the daemon walk
 // an unbounded sequence by repeatedly dropping the same name.
 func publish(root *os.Root, staged, name string) (string, error) {
+	if err := verifyRootPath(root); err != nil {
+		return "", err
+	}
 	stem, ext := splitName(name)
 	for attempt := 0; attempt < maxCollisionAttempts; attempt++ {
 		candidate := name
@@ -719,7 +763,14 @@ func splitName(name string) (stem, ext string) {
 // extraction rules above, not a substitute for them, and a drop that landed
 // safely should not be reported as failed because an optional label could not
 // be applied.
-func quarantine(path string) {
+func requestContext(opts Options) context.Context {
+	if opts.Context != nil {
+		return opts.Context
+	}
+	return context.Background()
+}
+
+func quarantine(ctx context.Context, path string) {
 	if runtime.GOOS != "darwin" {
 		return
 	}
@@ -731,5 +782,9 @@ func quarantine(path string) {
 	// it, and a UUID slot this does not populate. 0081 means "quarantined,
 	// not yet approved by the user".
 	value := fmt.Sprintf("0081;%x;clipd;", time.Now().Unix())
-	_ = exec.Command(xattr, "-w", "com.apple.quarantine", value, path).Run()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, xattr, "-w", "com.apple.quarantine", value, path)
+	cmd.WaitDelay = time.Second
+	_ = cmd.Run()
 }

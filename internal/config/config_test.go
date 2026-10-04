@@ -33,12 +33,13 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "clipd", "config.json")
 	want := Config{
-		Address:         "~/.custom.sock",
-		DropDir:         "~/Inbox",
-		MaxPayloadBytes: 5 << 20,
-		MaxDropBytes:    32 << 20,
-		MaxDropFiles:    12,
-		MaxConcurrent:   4,
+		Address:            "~/.custom.sock",
+		DropDir:            "~/Inbox",
+		MaxPayloadBytes:    5 << 20,
+		MaxDropBytes:       32 << 20,
+		MaxDropFiles:       12,
+		MaxConcurrent:      4,
+		MaxTransferSeconds: 3600,
 	}
 	if err := want.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -429,5 +430,35 @@ func TestResolvePathDoesNotFailOverALegacyConfig(t *testing.T) {
 
 	if _, err := ResolvePath(""); err != nil {
 		t.Errorf("ResolvePath: %v", err)
+	}
+}
+
+func TestTransferLifetimeAndLargeDropConfiguration(t *testing.T) {
+	for _, seconds := range []int{-1, 86401} {
+		cfg := Default()
+		cfg.MaxTransferSeconds = seconds
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("accepted lifetime %d", seconds)
+		}
+	}
+	cfg := Default()
+	cfg.MaxDropBytes = 100 << 30
+	cfg.MaxTransferSeconds = 3600
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil || got != cfg {
+		t.Fatalf("roundtrip %+v, %v", got, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"max_transfer_seconds", "max_concurrent", "max_drop_bytes"} {
+		if !strings.Contains(string(data), field) {
+			t.Fatalf("missing generated setting %s", field)
+		}
 	}
 }

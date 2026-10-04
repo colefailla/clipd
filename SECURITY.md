@@ -15,8 +15,8 @@ rather than being backported.
 
 ## Out of scope
 
-clipd has no authentication of its own. The daemon listens on a UNIX socket,
-and SSH decides who reaches it. So the following are the intended grant rather
+clipd has no authentication or encryption of its own. The default listener is
+a private UNIX socket, and SSH protects forwarded traffic. So the following are the intended grant rather
 than escalations:
 
 - Anything running as you on a host you have forwarded the socket to can write
@@ -24,12 +24,19 @@ than escalations:
   because the socket is mode 0600, but your own processes can.
 - Anyone with a shell as your user on either machine. The socket and the config
   are protected by filesystem permissions and nothing more.
-- Reaching a daemon deliberately configured to listen on a TCP address. Nothing
-  authenticates behind it, which is why the socket is the supported
-  configuration and the daemon warns at startup when it is not used.
+- Reaching a daemon deliberately configured to listen on loopback TCP. Other
+  local accounts can reach it; no protocol authentication protects it. Empty
+  hosts and non-loopback bindings are refused.
 
 What *is* in scope: anything that writes outside the drop directory, escapes
 the socket's permissions, or lets a peer consume unbounded daemon resources.
 
 See the README's security section, or `clipd help security`, for the full
 model.
+
+Streaming drops validate relative paths, file types and resource limits before
+publication, and require a successful-producer completion marker. Legacy drops
+retain basename flattening and the documented entry-boundary truncation gap.
+Publication is not crash-atomic. Hard-link publication and quarantine use path
+APIs; opened-root confinement does not cover those operations absolutely.
+Custom socket validation checks only the immediate parent's mode bits.

@@ -225,32 +225,43 @@ interactive, or move the clipd block above that early return.
 The exit status is the daemon's answer, which makes `clipd drop x && rm x` safe:
 a rejected drop exits non-zero, and one whose `tar` fails sends nothing at all.
 
-That last guarantee costs something worth knowing about. Dropping files builds
-the archive into a staging file under `~/.clipd/` on the remote host before
-sending it, so that host needs free space there about the size of what you are
-sending. Streaming straight into the socket would be cheaper, but a `tar` that
-failed halfway would already have sent a valid archive of the files it managed
-to read, and the daemon would accept it. `clipd drop --name` still streams,
-because there is a single file's bytes and nothing to go half-right.
+Newly generated clients stream archives directly, without a second copy on the
+remote disk. They send a completion marker only after `tar` succeeds. The Mac
+requires that marker and the end of the connection before publication. Failed
+transfers clean up their private received staging files; remote originals remain. If the final reply is
+lost after publication, files may already be present despite the client reporting
+failure; check Drop before retrying.
 
-The staging file is made with the shell alone — a name from its process id,
-`0600` through `umask`, and `set -C` so an existing file is refused rather than
-followed. Not `mktemp`, which is not in POSIX: what clipd asks of a remote host
-is a POSIX shell, `tar`, and one of `nc` or `socat`.
+Interactive drops show received bytes, percentage for the current file, average
+speed, elapsed time and estimated time remaining. Percentage is per file, not
+for the whole request. A publishing status follows receipt. Only the final `clipd: ok:` confirms publication. Stdin
+drops show bytes and elapsed time because their total size is unknown. Progress
+goes to stderr and is disabled when stderr is not a terminal; use
+`clipd drop --no-progress file` to hide it in a terminal too.
+
+After upgrading the Mac binary, rerun `clipd setup <host>` to update the remote
+function. Existing functions remain supported: their archive drops still use
+remote disk staging and flatten filenames. New functions require a new daemon;
+an older daemon rejects the structured request instead of copying it as text.
+Setup replaces its managed SSH block, so retain or reapply manual alias changes.
 
 Content is sent byte for byte — newlines, tabs and the trailing newline are
 preserved. Input over `max_payload_bytes` (10 MiB by default) is rejected rather
 than truncated.
 
-Dropped files are **flattened**: everything lands directly in `~/Drop` under its
-own basename, with no subdirectories recreated. Files are never overwritten; a
-second `report.pdf` arrives as `report-1.pdf`.
+Files and directories land beneath the configured directory, normally `~/Drop`.
+`clipd drop author/book` creates `~/Drop/book/`, retaining its tree.
+`clipd drop author/book/*` sends the children expanded by your shell, normally
+excluding hidden files, placing them directly beneath `~/Drop`. Existing trees
+are never merged or overwritten: a second `book` becomes `book-1`, and a second
+`report.pdf` becomes `report-1.pdf`. Conflicting paths within one request are
+rejected. Streaming archives accept only regular files and directories.
 
 ## Security
 
-**Nothing listens on the network.** The daemon binds a UNIX socket in your home
-directory. There is no port to scan, and nothing on your local network can reach
-it — on public wifi or anywhere else.
+**The default listener is a private UNIX socket.** SSH forwarding supplies
+remote access. The manual TCP fallback binds loopback only; other local
+accounts can reach that port. Directly reachable network listeners are refused.
 
 The socket reaches another machine only when you forward it over SSH. By then
 SSH has encrypted the channel, verified the host key against `known_hosts`, and
@@ -265,7 +276,8 @@ on a socket file — every one of them honours the mode on a directory.
 clipd has no token and no TLS of its own because SSH has already done both
 jobs. A token would also be worse: it would live as a file on the remote host,
 and anyone who copied it could use it from anywhere until you rotated it. The
-socket cannot be copied, and it disappears when the session ends.
+forwarded capability ends with the connection, but its socket pathname can
+remain afterward and block a later forward. It is not a portable credential.
 
 **What this means:** anything running as you on the remote host can write to
 your clipboard and send you files, including a build script or a package
@@ -283,18 +295,18 @@ Two things limit what it can do:
   the accident, not a security boundary: it is the terminal's behaviour rather
   than clipd's, and anything that can write to the socket can still put whatever
   it likes on the clipboard.
-- **Dropped files** are flattened to basenames so an archive cannot write
-  outside the drop directory, are never overwritten, and are never made
-  executable. Symlinks, hard links and device nodes in an archive are skipped,
-  as are entries of any other type that declare a body.
-- **A drop is all or nothing.** Files are written into a private staging
-  directory and take their real names only once the whole archive has arrived,
-  so a transfer that fails partway leaves nothing behind rather than a subset
-  that looks complete. The sending side matches: `clipd drop` builds the whole
-  archive before it opens the socket, so a `tar` that fails sends no bytes at
-  all. One gap remains: a connection cut at exactly an archive-entry boundary
-  looks the same as a short archive, so the remote's non-zero exit status is
-  what tells you to check.
+- **Dropped files** use validated relative paths, private staging, collision
+  handling and mode `0600`; directories are `0700`. Streaming requests reject
+  traversal, absolute paths, control characters and special entries. Legacy
+  archive requests retain basename flattening.
+- **Validation precedes publication.** Streaming archives require the sender's
+  completion marker. Ordinary transfer failures leave no published subset.
+  Publishing multiple names is not crash-atomic; cleanup failures are reported.
+  Legacy requests retain the entry-boundary truncation limitation.
+- **Filesystem confinement has exceptions.** Hard-link publication and
+  quarantine use pathname APIs, so protection against replacement of the drop
+  root is not absolute. Custom socket validation checks the immediate parent's
+  mode bits, not all ancestors, ownership or macOS ACLs.
 - **Quarantine** is applied where it can be: files get macOS's quarantine
   attribute so Gatekeeper treats them like downloads. It is best effort — a drop
   that landed safely is not reported as failed because the label could not be
@@ -320,7 +332,8 @@ daemon with no config file is a working daemon.
   "max_payload_bytes": 10485760,
   "max_drop_bytes": 268435456,
   "max_drop_files": 256,
-  "max_concurrent": 8
+  "max_concurrent": 8,
+  "max_transfer_seconds": 1800
 }
 ```
 
@@ -346,10 +359,40 @@ clipd restart
 under a running daemon, so a forgotten restart shows up rather than looking like
 a setting that did nothing.
 
-`max_payload_bytes` is capped at 1 GB, because clipboard content is held in
-memory, and it is also checked against `max_concurrent`: the daemon buffers a
-payload per message in flight, so it is the product that has to fit. The drop
-limits stream to disk and are capped far higher.
+### Limits and large transfers
+
+Defaults work without a config file. `clipd install` writes all supported keys,
+retaining configured values. Running or setting up clipd does not create a
+daemon config file.
+
+| Key | Default | Meaning and range |
+|---|---|---|
+| `address` | `~/.clipd.sock` | UNIX socket, or manual loopback TCP address |
+| `drop_dir` | `~/Drop` | Destination for published files and directories |
+| `max_payload_bytes` | 10485760 (10 MiB) | Clipboard bytes; 1 byte to 1 GiB |
+| `max_drop_bytes` | 268435456 (256 MiB) | Total file bytes per drop; up to 1 TiB |
+| `max_drop_files` | 256 | Regular files per drop; up to 65536 |
+| `max_concurrent` | 8 | Simultaneous work; up to 64 |
+| `max_transfer_seconds` | 1800 (30 minutes) | Connection lifetime, including receipt and publication; 1 to 86400 (24 hours) |
+
+10 GiB is `10737418240` bytes; 100 GiB is `107374182400`. One hour is `3600`
+seconds. Edit the config and run `clipd restart`. Older installed binaries do
+not understand the new lifetime key. Omitted keys retain defaults; zero means
+default for numeric limits and transfer lifetime, rather than unlimited.
+
+Each active drop can stage up to its byte limit on the Mac, so simultaneous
+drops multiply disk demand. Increasing a limit does not reserve disk space.
+Clipboard size times concurrency must fit within a 2 GiB budget; buffer growth
+can transiently exceed it. Published files belong to you and are never cleaned up.
+
+Connections also have a fixed 30-second read-idle timeout and a 64-connection
+limit. Archive entries, depth, framing bytes, collision attempts, replies and
+peer-driven logs are bounded. Increasing lifetime does not disable the idle
+timeout. Generated transports have a separate 24-hour inactivity/wait bound,
+so publication is not cut short by socat's usual half-second EOF wait. The
+daemon's configured lifetime is the stricter bound for a healthy connection.
+Quarantine helpers have a two-second deadline. No automatic retry or
+resume is performed.
 
 Unknown keys are rejected rather than ignored, so a typo fails loudly.
 `CLIPD_CONFIG` is the only environment variable clipd reads.
@@ -385,9 +428,11 @@ different things produce that identical warning:
   ssh <host> 'rm -f ~/.clipd/socket'
   ```
 
-`clipd` tells you which one you are looking at: when the socket exists but
-nothing answers, it says so and gives you that `rm` line rather than a bare
-transport error.
+A failed request does not prove the socket is stale: live listeners and broken
+forwarding paths can also fail to answer. Check `clipd status` on the Mac and
+SSH's warning. Remove a remote socket only after establishing that no active
+session owns it. `ssh -o ExitOnForwardFailure=yes <host>` makes forwarding setup
+failures fatal, including conflicts with another session's working forward.
 
 To stop the leftover case recurring, the remote needs `StreamLocalBindUnlink yes`
 in its `/etc/ssh/sshd_config`, which takes root on that host. The same setting in

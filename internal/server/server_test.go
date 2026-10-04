@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/colefailla/clipd/internal/clipboard"
+	"github.com/colefailla/clipd/internal/drop"
 	"github.com/colefailla/clipd/internal/protocol"
 )
 
@@ -588,5 +591,77 @@ func TestDropRejectionSurvivesAnInFlightArchive(t *testing.T) {
 	}
 	if !strings.Contains(reply, "limit") {
 		t.Errorf("reply = %q, want it to mention the limit", reply)
+	}
+}
+
+func TestClipboardFailuresCannotFloodLogs(t *testing.T) {
+	var logs bytes.Buffer
+	h := newHarness(t, func(o *Options) { o.Logger = slog.New(slog.NewTextHandler(&logs, nil)) })
+	h.clip.Err = errors.New("helper unavailable")
+	for i := 0; i < warnBudget+10; i++ {
+		if reply := h.send([]byte("text")); !strings.HasPrefix(reply, protocol.StatusError) {
+			t.Fatalf("reply %s", reply)
+		}
+	}
+	if n := strings.Count(logs.String(), "clipboard write failed"); n != warnBudget {
+		t.Fatalf("logged %d failures, want %d", n, warnBudget)
+	}
+}
+
+func TestConfiguredLifetimeBoundsSilentConnections(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.MaxTransfer = time.Second })
+	conn, err := net.Dial("unix", h.socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("silent connection was not closed: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("configured lifetime took %s", elapsed)
+	}
+}
+
+func TestStreamingRequestProgressAndCompletion(t *testing.T) {
+	h := newHarness(t)
+	archive := tarOf(t, map[string]string{"book/file": "payload"})
+	frame := []byte(protocol.Magic + `{"type":"drop-stream-v2","progress":true}` + "\n")
+	reply := h.send(append(append(frame, archive...), []byte(drop.Completion)...))
+	if !strings.Contains(reply, "clipd: progress: book/file:") || !strings.Contains(reply, protocol.StatusOK) {
+		t.Fatalf("reply = %q", reply)
+	}
+	if h.clip.WriteCount() != 0 {
+		t.Fatal("streaming request was reinterpreted as clipboard data")
+	}
+}
+
+func TestLifetimeBoundsPeerThatDoesNotReadProgress(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := New(Options{Clipboard: &clipboard.Fake{}, DropDir: dir, MaxPayload: 1024, MaxTransfer: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, sender := net.Pipe()
+	defer sender.Close()
+	done := make(chan struct{})
+	go func() { srv.handle(context.Background(), receiver); close(done) }()
+	payload := append([]byte(protocol.Magic+`{"type":"drop-stream-v2","progress":true}`+"\n"), tarOf(t, map[string]string{"file": "payload"})...)
+	writer := make(chan struct{})
+	go func() { _, _ = sender.Write(payload); close(writer) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("progress write extended lifetime")
+	}
+	<-writer
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("timed out request left entries: %v, %v", entries, err)
 	}
 }

@@ -79,7 +79,7 @@ const (
 	// unbounded, a large enough value in either field overflows int64 and the
 	// resulting negative limit rejects every drop instead of bounding one — a
 	// setting that reads like "allow more" that in fact allows nothing.
-	MaxAllowedDropBytes int64 = 64 << 30
+	MaxAllowedDropBytes int64 = 1 << 40
 	MaxAllowedDropFiles       = 1 << 16
 
 	// MaxAllowedConcurrent matches the daemon's own connection ceiling. Above
@@ -110,6 +110,9 @@ type Config struct {
 	// server's default. Together with MaxPayloadBytes it sets the daemon's
 	// memory ceiling, since a clipboard payload is buffered whole.
 	MaxConcurrent int `json:"max_concurrent"`
+
+	// MaxTransferSeconds bounds one connection, including receipt and publication.
+	MaxTransferSeconds int `json:"max_transfer_seconds"`
 }
 
 // Default returns the built-in configuration. Unlike the previous version
@@ -117,11 +120,13 @@ type Config struct {
 // stand, so a daemon with no config file at all is a working daemon.
 func Default() Config {
 	return Config{
-		Address:         DefaultAddress,
-		DropDir:         DefaultDropDir,
-		MaxPayloadBytes: DefaultMaxPayloadBytes,
-		MaxDropBytes:    DefaultMaxDropBytes,
-		MaxDropFiles:    DefaultMaxDropFiles,
+		Address:            DefaultAddress,
+		DropDir:            DefaultDropDir,
+		MaxPayloadBytes:    DefaultMaxPayloadBytes,
+		MaxDropBytes:       DefaultMaxDropBytes,
+		MaxDropFiles:       DefaultMaxDropFiles,
+		MaxConcurrent:      8,
+		MaxTransferSeconds: 1800,
 	}
 }
 
@@ -250,6 +255,9 @@ func Load(path string) (Config, error) {
 	}
 	if file.MaxConcurrent != 0 {
 		cfg.MaxConcurrent = file.MaxConcurrent
+	}
+	if file.MaxTransferSeconds != 0 {
+		cfg.MaxTransferSeconds = file.MaxTransferSeconds
 	}
 	return cfg, cfg.Validate()
 }
@@ -471,6 +479,9 @@ func writeAtomic(path string, data []byte) error {
 
 // Validate rejects a configuration the daemon could not honour.
 func (c Config) Validate() error {
+	if c.MaxTransferSeconds < 1 || c.MaxTransferSeconds > 86400 {
+		return errors.New("max_transfer_seconds: must be between 1 and 86400 (24 hours)")
+	}
 	if c.Address == "" {
 		return errors.New("address: must not be empty")
 	}
@@ -508,6 +519,8 @@ func (c Config) Validate() error {
 // FormatSize renders a byte count for human consumption.
 func FormatSize(n int64) string {
 	switch {
+	case n >= 1<<40:
+		return fmt.Sprintf("%.3g TiB", float64(n)/float64(1<<40))
 	case n >= 1<<30:
 		return fmt.Sprintf("%.3g GiB", float64(n)/float64(1<<30))
 	case n >= 1<<20:

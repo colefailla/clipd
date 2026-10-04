@@ -72,6 +72,7 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		MaxDropBytes:  cfg.MaxDropBytes,
 		MaxDropFiles:  cfg.MaxDropFiles,
 		MaxConcurrent: cfg.MaxConcurrent,
+		MaxTransfer:   time.Duration(cfg.MaxTransferSeconds) * time.Second,
 		Logger:        logger,
 	})
 	if err != nil {
@@ -91,7 +92,7 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		"max_payload_bytes", cfg.MaxPayloadBytes)
 	// A drop that was interrupted by a crash or a power cut leaves a staging
 	// file behind, and nothing else will ever clear it up.
-	if n := drop.CleanStale(resolvedDrop); n > 0 {
+	if n := drop.CleanStale(resolvedDrop, time.Duration(cfg.MaxTransferSeconds)*time.Second+time.Minute); n > 0 {
 		logger.Info("removed incomplete drops left by a previous run", "count", n)
 	}
 
@@ -120,7 +121,7 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if n := drop.CleanStale(resolvedDrop); n > 0 {
+				if n := drop.CleanStale(resolvedDrop, time.Duration(cfg.MaxTransferSeconds)*time.Second+time.Minute); n > 0 {
 					logger.Info("removed incomplete drops left by an earlier process", "count", n)
 				}
 			}

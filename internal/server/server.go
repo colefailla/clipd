@@ -5,22 +5,9 @@
 // launchd owns backgrounding, log redirection and restart-on-crash, so
 // duplicating any of that here would only add ways to disagree with launchd.
 //
-// # What this package is not responsible for
-//
-// There is no authentication, no encryption and no peer identity, and their
-// absence is the design rather than a gap in it. The daemon listens on a UNIX
-// domain socket in the user's home directory, and that socket reaches other
-// machines only by being forwarded over SSH. By the time bytes arrive here,
-// SSH has already encrypted the channel, verified the host key, and
-// authenticated the user, and the filesystem permissions on the socket have
-// already decided who is allowed to write to it. A token checked at this layer
-// would be a second, weaker copy of a decision that has already been made
-// correctly — and a token stored on the remote machine to satisfy it would be
-// a stealable secret where today there is only an ephemeral capability.
-//
-// What remains here is resource control. Every peer is authorised, but an
-// authorised peer can still be a runaway loop, so connections, concurrency,
-// payload size and time are all bounded.
+// SSH protects forwarded traffic. UNIX socket permissions authorize access;
+// the manual loopback TCP fallback is reachable by other local accounts.
+// Connected peers remain untrusted, so payloads, work and time are bounded.
 package server
 
 import (
@@ -36,6 +23,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/colefailla/clipd/internal/clipboard"
 	"github.com/colefailla/clipd/internal/drop"
@@ -133,6 +121,8 @@ type Options struct {
 	// MaxConcurrent bounds simultaneous work. Zero means defaultMaxConcurrent.
 	MaxConcurrent int
 
+	MaxTransfer time.Duration
+
 	// Logger receives operational logs. Clipboard and file contents are never
 	// logged.
 	Logger *slog.Logger
@@ -145,6 +135,7 @@ type Server struct {
 	maxPayload   int64
 	maxDropBytes int64
 	maxDropFiles int
+	maxTransfer  time.Duration
 	log          *slog.Logger
 
 	// connSem bounds sockets in any state; sem bounds messages actually being
@@ -213,6 +204,12 @@ func New(opts Options) (*Server, error) {
 			"server: a %d byte payload across %d concurrent messages could buffer %d bytes, over the %d byte ceiling; lower max_payload_bytes or max_concurrent",
 			opts.MaxPayload, maxConcurrent, opts.MaxPayload*int64(maxConcurrent), maxClipboardBudget)
 	}
+	if opts.MaxTransfer == 0 {
+		opts.MaxTransfer = maxConnLifetime
+	}
+	if opts.MaxTransfer < time.Second || opts.MaxTransfer > 24*time.Hour {
+		return nil, errors.New("server: transfer lifetime must be between one second and 24 hours")
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -224,6 +221,7 @@ func New(opts Options) (*Server, error) {
 		maxPayload:   opts.MaxPayload,
 		maxDropBytes: opts.MaxDropBytes,
 		maxDropFiles: opts.MaxDropFiles,
+		maxTransfer:  opts.MaxTransfer,
 		log:          logger,
 		sem:          make(chan struct{}, maxConcurrent),
 		// Never below maxConcurrent, or work slots would be unreachable: every
@@ -405,16 +403,21 @@ func (s *Server) isClosed() bool {
 // none of them panic, and none of them log clipboard or file contents.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	hard := time.Now().Add(s.maxTransfer)
+	ctx, cancel := context.WithDeadline(ctx, hard)
+	defer cancel()
+	conn = &lifetimeConn{Conn: conn, hard: hard}
 
 	// An idle deadline from the first byte, refreshed by the reader below on
 	// every successful read. A peer that connects and says nothing cannot hold
 	// a slot open; a peer that is genuinely sending can take as long as the
 	// data takes, up to that reader's absolute cap.
-	if err := conn.SetDeadline(time.Now().Add(idleTimeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(min(idleTimeout, s.maxTransfer))); err != nil {
 		s.warnPeer("set deadline failed", "error", err)
 		return
 	}
 	idle := newIdleReader(conn)
+	idle.hard = hard
 	reader := bufio.NewReader(idle)
 
 	structured, err := protocol.Sniff(reader)
@@ -448,7 +451,11 @@ func (s *Server) acquire(ctx context.Context, conn net.Conn) bool {
 	case s.sem <- struct{}{}:
 		return true
 	case <-ctx.Done():
-		s.respondError(conn, "busy: shutting down")
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			s.respondError(conn, "transfer lifetime exceeded")
+		} else {
+			s.respondError(conn, "busy: shutting down")
+		}
 		return false
 	}
 }
@@ -481,10 +488,10 @@ func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, idle *idleR
 	}
 
 	// Bound the clipboard write so a wedged helper cannot pin this handler.
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), idleTimeout)
+	writeCtx, cancel := context.WithTimeout(ctx, idleTimeout)
 	defer cancel()
 	if err := s.clip.Write(writeCtx, buf.Bytes()); err != nil {
-		s.log.Error("clipboard write failed", "error", err)
+		s.warnPeer("clipboard write failed", "error", err)
 		s.respondError(conn, "clipboard write failed")
 		return
 	}
@@ -526,8 +533,8 @@ func (s *Server) handleStructured(ctx context.Context, conn net.Conn, idle *idle
 	defer func() { <-s.sem }()
 
 	switch req.Type {
-	case protocol.TypeDrop:
-		s.handleDrop(conn, idle, r, req.Name)
+	case protocol.TypeDrop, protocol.TypeStreamDrop:
+		s.handleDrop(ctx, conn, idle, r, req)
 	default:
 		s.warnPeer("unknown request type", "type", req.Type)
 		s.respondError(conn, fmt.Sprintf("unknown request type %q", req.Type))
@@ -536,15 +543,59 @@ func (s *Server) handleStructured(ctx context.Context, conn net.Conn, idle *idle
 
 // handleDrop extracts the tar stream following the envelope into the drop
 // directory.
-func (s *Server) handleDrop(conn net.Conn, idle *idleReader, r io.Reader, name string) {
+func (s *Server) handleDrop(ctx context.Context, conn net.Conn, idle *idleReader, r io.Reader, req protocol.Request) {
 	if s.dropDir == "" {
 		s.respondError(conn, "drop is not configured on this daemon")
 		return
 	}
+	started := time.Now()
 	opts := drop.Options{
 		Dir:      s.dropDir,
+		Context:  ctx,
+		Stream:   req.Type == protocol.TypeStreamDrop,
 		MaxBytes: s.maxDropBytes,
 		MaxFiles: s.maxDropFiles,
+	}
+	if req.Progress {
+		last := time.Time{}
+		publishing := false
+		opts.PublishProgress = func(done, total int) {
+			if publishing && time.Since(last) < time.Second {
+				return
+			}
+			publishing = true
+			last = time.Now()
+			s.respond(conn, fmt.Sprintf("clipd: progress: publishing %d / %d files; elapsed %s", done, total, time.Since(started).Round(time.Second)))
+		}
+		previousName := ""
+		var previous, transferred int64
+		opts.Progress = func(name string, received, total int64) {
+			if name != previousName {
+				previousName = name
+				previous = 0
+			}
+			transferred += received - previous
+			previous = received
+			if time.Since(last) < time.Second {
+				return
+			}
+			last = time.Now()
+			percent := int64(100)
+			if total > 0 {
+				percent = received * 100 / total
+			}
+			elapsed := time.Since(started)
+			rate := float64(transferred) / elapsed.Seconds()
+			eta := time.Duration(0)
+			if rate > 0 {
+				eta = time.Duration(float64(total-received) / rate * float64(time.Second))
+			}
+			if total < 0 {
+				s.respond(conn, fmt.Sprintf("clipd: progress: %s: %d bytes %.1f MiB/s elapsed %s", name, received, rate/(1<<20), elapsed.Round(time.Second)))
+			} else {
+				s.respond(conn, fmt.Sprintf("clipd: progress: %s: %d%% (%d / %d bytes) %.1f MiB/s elapsed %s ETA %s", name, percent, received, total, rate/(1<<20), elapsed.Round(time.Second), eta.Round(time.Second)))
+			}
+		}
 	}
 	// A name means the body is one file's bytes, sent by a pipeline that had
 	// no file to hand to tar. Without one the body is an archive and the names
@@ -554,16 +605,20 @@ func (s *Server) handleDrop(conn net.Conn, idle *idleReader, r io.Reader, name s
 		res drop.Result
 		err error
 	)
-	if name != "" {
-		res, err = drop.Save(r, name, opts)
+	if req.Name != "" {
+		if opts.Stream {
+			s.respondError(conn, "streaming named input is not supported")
+			return
+		}
+		res, err = drop.Save(r, req.Name, opts)
 	} else {
 		res, err = drop.Extract(r, opts)
 	}
 	if err != nil {
 		// Warn rather than Error: every one of these is caused by what a peer
 		// sent, so they are rate-limited like the rest of the peer-driven
-		// lines. The names are safe to log — they have already been reduced
-		// to basenames — but the contents never are, and never appear here.
+		// lines. Error names are validated relative paths or bounded quoted names;
+		// payload contents never appear here.
 		s.warnPeer("drop rejected", "error", err)
 		s.respondError(conn, err.Error())
 		drainRejected(idle, r)
@@ -572,8 +627,16 @@ func (s *Server) handleDrop(conn net.Conn, idle *idleReader, r io.Reader, name s
 	// Routine success is acknowledged to the sender. Keeping it at Debug avoids
 	// growing launchd's unrotated log by one line for every ordinary drop.
 	s.log.Debug("files dropped", "count", len(res.Names), "bytes", res.Bytes, "dir", s.dropDir)
-	s.respondOK(conn, fmt.Sprintf("dropped %s (%d bytes) into %s",
-		strings.Join(res.Names, ", "), res.Bytes, s.dropDir))
+	s.respondOK(conn, fmt.Sprintf("dropped %s (%d bytes) into %s in %s",
+		dropSummary(res.Names), res.Bytes, s.dropDir, time.Since(started).Round(time.Millisecond)))
+}
+
+// dropSummary bounds replies independently of the configured file count.
+func dropSummary(names []string) string {
+	if len(names) <= 8 {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:8], ", "), len(names)-8)
 }
 
 // drainRejected reads and discards what the sender is still transmitting, so
@@ -625,12 +688,38 @@ func (s *Server) respondError(conn net.Conn, message string) {
 // connection appears to hang until the client is told to half-close. Keeping
 // it plain text rather than JSON is what lets an unmodified `nc` display it.
 func (s *Server) respond(conn net.Conn, line string) {
+	if len(line) > protocol.MaxFrameBytes {
+		line = line[:protocol.MaxFrameBytes-4]
+		for !utf8.ValidString(line) {
+			line = line[:len(line)-1]
+		}
+		line += "..."
+	}
 	if err := conn.SetWriteDeadline(time.Now().Add(idleTimeout)); err != nil {
 		return
 	}
 	if _, err := fmt.Fprintf(conn, "%s\n", line); err != nil {
 		s.log.Debug("response write failed", "error", err)
 	}
+}
+
+// lifetimeConn prevents response/progress writes from extending a connection's
+// absolute lifetime when a peer stops reading. Read-idle refreshes obey it too.
+type lifetimeConn struct {
+	net.Conn
+	hard time.Time
+}
+
+func (c *lifetimeConn) clamp(t time.Time) time.Time {
+	if t.IsZero() || t.After(c.hard) {
+		return c.hard
+	}
+	return t
+}
+func (c *lifetimeConn) SetDeadline(t time.Time) error     { return c.Conn.SetDeadline(c.clamp(t)) }
+func (c *lifetimeConn) SetReadDeadline(t time.Time) error { return c.Conn.SetReadDeadline(c.clamp(t)) }
+func (c *lifetimeConn) SetWriteDeadline(t time.Time) error {
+	return c.Conn.SetWriteDeadline(c.clamp(t))
 }
 
 // idleReader refreshes the connection deadline on every successful read, so

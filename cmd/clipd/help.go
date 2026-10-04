@@ -3,8 +3,8 @@ package main
 var helpTopics = map[string]string{
 	"serve": `clipd serve
 
-Runs the daemon in the foreground until SIGINT or SIGTERM. macOS only, since
-writing the clipboard is what the daemon does.
+Runs the daemon in the foreground until SIGINT or SIGTERM. Requires pbcopy on
+macOS, or a supported clipboard helper in a Linux graphical session.
 
 It does not detach: under the LaunchAgent, launchd owns backgrounding,
 restarts and log files.
@@ -13,114 +13,105 @@ Options:
   -address <path>     socket path to listen on (default ~/.clipd.sock)
   -drop-dir <path>    where dropped files land (default ~/Drop)`,
 
-	"setup": `clipd setup <ssh-host>
+	"setup": `clipd setup [options] <ssh-host>
 
-Configures a remote host to talk to this daemon. Run it on the Mac.
+Run on the Mac. Probes a POSIX-shell remote and configures socket forwarding.
+The destination may be an SSH alias, hostname or IP; all use SSH UNIX sockets.
+Only the destination spelling supplied to setup receives the generated block.
 
-It connects to the host, works out what that host actually has, installs a
-'clipd' shell function there, and adds the matching RemoteForward to your
-~/.ssh/config.
+Files created or edited:
+  Mac: ~/.ssh/config gets a managed Host/Match block and RemoteForward.
+       config.clipd-backup preserves the first version before clipd's edits.
+  Remote: ~/.bashrc, ~/.zshrc or ~/.profile gets the generated shell function.
+          Its .clipd-backup preserves the first version before clipd's edits.
+          ~/.clipd is created/restricted to 0700; SSH binds socket inside it.
 
-Nothing is installed on the remote machine. The function is a few lines of
-shell that pipe into netcat (or socat), and the socket it writes to is created
-by SSH when you connect.
-
-The probe exists because netcat is not one program. The OpenBSD build speaks
-UNIX sockets with -U and half-closes with -N; the "traditional" build on some
-Debian systems does neither, and guessing wrong gives you either "invalid
-option" or a copy that hangs with no output. Asking the host removes the
-guess.
+RemoteForward connects the remote socket to the Mac's daemon socket.
+StreamLocalBindMask requests a private socket; Host * resets config scope.
+No remote binary or service is installed. No daemon config file is created.
+Remote rc writes preserve inode/symlink metadata but are not crash-atomic.
+A backup is a recovery aid, not cross-machine rollback. Partial success is
+reported; re-running setup replaces managed blocks and is safe to retry.
 
 Options:
-  -print    show what would change, without changing anything
+  -print    show generated shell and SSH settings without editing those files
 
-Both edits are bracketed by clipd markers, so running setup again replaces the
-block rather than adding a second one, and removing clipd means deleting from
-one marker to the other. Your SSH config is backed up to config.clipd-backup
-before the first edit.`,
+Reconnect afterward. Remove managed blocks to undo setup, retaining unrelated
+content. Backups are first versions, not current snapshots. For stale remote
+sockets and competing sessions, see README Troubleshooting.`,
 
-	"drop": `clipd drop <file>...
+	"drop": `clipd drop [--no-progress] <file-or-directory>...
        <command> | clipd drop --name <filename>
 
-Run on the remote host, not the Mac. Sends files to the Mac's drop directory
-(default ~/Drop).
+Run on the configured remote host. Sends files beneath the Mac's drop directory
+(default ~/Drop). Use clipd -h on the remote for a short command summary.
 
   clipd drop report.pdf
-  clipd drop src/*.go
-  pg_dump mydb | clipd drop --name dump.sql
+  clipd drop author/book
+  clipd drop author/book/*
   journalctl -u nginx | clipd drop --name nginx.log
 
-With files named, they are packed with tar, so names, multiple files and whole
-directories survive the trip.
+Directories retain their structure. Wildcards are expanded by your shell;
+children land directly in Drop, normally excluding hidden files. Existing files
+and directories get numbered alternatives, never overwrites or directory merges.
+Conflicting paths within one request and special archive entries are rejected.
 
-A pipeline has no file and so no name, and --name supplies one. The flag is
-required rather than inferred: the two forms used to be told apart by whether
-stdin was a terminal, which meant that any drop with a pipe or a redirect on
-stdin sent no file at all and reported success.
+Archives stream without remote payload staging. The Mac publishes only after
+validation, a successful-producer completion marker and EOF. A failed transfer
+cleans up its private received files; originals are untouched. No retry or
+resume. Multi-name publication is not crash-atomic; cleanup errors are reported.
+A lost final reply can report failure after files were published; check Drop
+before retrying. The exit status is the daemon's answer, so clipd drop x && rm x
+remains safe.
+Upstream status in producer | clipd drop --name x is your shell's responsibility.
 
-Note that on Debian and derivatives the stock .bashrc returns early for
-non-interactive shells, so 'ssh host clipd drop file' will not find the function
-at all. 'ssh -t' allocates a terminal and works.
+Interactive progress shows percentage for the current file, bytes, speed,
+elapsed time and ETA on stderr. Unknown-size stdin shows bytes and time.
+--no-progress hides it. Only the final clipd: ok: confirms publication.
 
-The exit status is the daemon's answer, so 'clipd drop x && rm x' is safe: a
-drop the daemon rejected, or one whose tar failed partway, exits non-zero.
+Default limits: 256 MiB total, 256 files, 30-minute lifetime, 30-second idle.
+On the Mac, use clipd help config to adjust size/lifetime, then clipd restart.
+Upgrade the Mac binary before rerunning setup to update the remote function.
+Older functions remain supported with their original flattened/staged behavior.
 
-What arrives is deliberately flattened: every file lands
-directly in the drop directory under its own basename, with no subdirectories
-recreated.
-
-That flattening is a security property, not a limitation. An archive can name
-a file "../../.ssh/authorized_keys"; reducing every entry to its basename
-makes that impossible to act on. Symlinks, hard links and device nodes in the
-archive are skipped for the same reason, the executable bit is never
-preserved, and on macOS each file is marked with the quarantine attribute so
-Gatekeeper treats it like a download.
-
-Files are never overwritten. A second report.pdf arrives as report-1.pdf.`,
+On Debian, noninteractive .bashrc commonly returns before the generated block.
+Use an interactive shell or put the block before that return.`,
 
 	"config": `clipd config file
 
-Location, on every platform:
+Location: $XDG_CONFIG_HOME/clipd/config.json, or ~/.config/clipd/config.json.
+Override with -config <path> or CLIPD_CONFIG. Built-in defaults work without a
+file. clipd install writes all supported settings, retaining configured values;
+clipd setup does not create this file. Pre-v3 config files are not migrated.
 
-  $XDG_CONFIG_HOME/clipd/config.json, or ~/.config/clipd/config.json
+Keys (sizes are numeric bytes, times are numeric seconds):
+  address                ~/.clipd.sock; UNIX path or manual loopback TCP address
+  drop_dir               ~/Drop; published files and directories
+  max_payload_bytes      10485760 (10 MiB); clipboard, 1 byte to 1 GiB
+  max_drop_bytes         268435456 (256 MiB); whole drop, maximum 1 TiB
+  max_drop_files         256; regular files per drop, maximum 65536
+  max_concurrent         8; work slots, maximum 64
+  max_transfer_seconds   1800 (30 minutes); lifetime, 1 to 86400 (24 hours)
 
-Releases before v3 kept it under ~/Library/Application Support on macOS.
-Nothing reads that now; a config left there holds only settings v3 removed, so
-an upgrade quietly falls back to defaults rather than failing. 'clipd status'
-points at the orphan if one is present.
+Omitted keys use defaults. Zero means default for numeric limits and lifetime,
+not unlimited. Negative values and unknown keys are rejected.
+Clipboard size times concurrency must fit a 2 GiB budget; buffer allocation may
+transiently exceed it. Each concurrent drop can stage up to its own disk limit.
+The fixed 30-second idle timeout remains active even with a longer lifetime.
 
-Override with -config <path> or CLIPD_CONFIG. Every value has a working
-default, so a daemon with no config file at all is a working daemon.
-
-Keys:
-
-  address             socket path to listen on (default ~/.clipd.sock).
-                      A leading /, ~ or . means a UNIX socket. Anything else
-                      is host:port, and must be loopback: 127.0.0.1, [::1] or
-                      localhost. A reachable address is refused at startup,
-                      because nothing here authenticates. The port form exists
-                      only for hosts whose SSH cannot forward a socket.
-  drop_dir            where dropped files land (default ~/Drop)
-  max_payload_bytes   largest clipboard message (default 10485760)
-  max_drop_bytes      largest drop, in total (default 268435456)
-  max_drop_files      most files in one drop (default 256)
-  max_concurrent      messages handled at once (default 8). Together with
-                      max_payload_bytes this is the daemon's memory ceiling,
-                      since a clipboard message is buffered whole.
-
-Unknown keys are rejected rather than ignored, so a typo fails loudly instead
-of silently leaving a default in place.
-
-CLIPD_CONFIG is the only environment variable clipd reads.`,
+10 GiB = 10737418240; 100 GiB = 107374182400; one hour = 3600 seconds.
+After editing config.json, run clipd restart on the Mac. Settings are read only
+at startup. clipd status shows limits and flags edits since startup.
+Older binaries reject the new lifetime key; upgrade before adding it.`,
 
 	"security": `clipd security model
 
 clipd has no authentication and no encryption of its own, and that is the
 design rather than a gap in it.
 
-The daemon listens on a UNIX domain socket in your home directory. Nothing is
-bound to the network: there is no port to scan and nothing on your local
-network can reach it, on a coffee shop wifi or anywhere else.
+The default listener is a private UNIX socket. The manual TCP fallback binds
+loopback only and is reachable by other local accounts. SSH supplies encrypted
+transport for forwarded traffic; filesystem permissions authorize UNIX access.
 
 The socket reaches another machine only when you forward it over SSH. By the
 time bytes arrive, SSH has encrypted the channel, verified the host key
@@ -148,8 +139,10 @@ Two things reduce what it can do to you:
   Bracketed paste, on by default in modern shells, means pasted text ending in
   a newline is not executed until you press Enter.
 
-  Dropped files are flattened to basenames, never overwrite, are never made
-  executable, and carry macOS's quarantine attribute.
+  Streaming drops validate relative paths and retain directories. Files never
+  overwrite, never arrive executable, and receive best-effort quarantine.
+  Legacy archive drops retain basename flattening. Hard-link publication and
+  quarantine use pathname APIs, so root-path confinement is not absolute.
 
 The 'address' setting also accepts a loopback host:port, for hosts whose SSH
 cannot forward a UNIX socket — OpenSSH gained that ability only in 6.7, and its

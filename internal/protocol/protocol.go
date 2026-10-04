@@ -55,6 +55,9 @@ const (
 	// on the same connection.
 	TypeDrop = "drop"
 
+	// TypeStreamDrop is a versioned body extension; legacy drop bodies stay unchanged.
+	TypeStreamDrop = "drop-stream-v2"
+
 	// TypePing asks the listener to identify itself and does nothing else.
 	//
 	// It exists because the obvious way to ask "is a daemon there" — connect
@@ -100,7 +103,8 @@ type Request struct {
 	// daemon reduces it to a bare filename before it becomes a path.
 	//
 	// Empty means the body is a tar stream and the names come from the archive.
-	Name string `json:"name,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Progress bool   `json:"progress,omitempty"`
 }
 
 // Sniff reports whether r begins with Magic, consuming the prefix when it

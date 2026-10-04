@@ -1,9 +1,8 @@
 // Package clipboard abstracts the host clipboard.
 //
 // The server depends only on the Clipboard interface, which keeps it
-// portable, makes it testable without touching the developer's real
-// clipboard, and leaves room for a Linux or Windows receiver later without
-// disturbing the network layer.
+// portable and makes it testable without touching the developer's real
+// clipboard. macOS and Linux backends share the same network layer.
 package clipboard
 
 import (

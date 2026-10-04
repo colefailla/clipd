@@ -60,6 +60,7 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 	if err != nil {
 		return fail(e, exitConfig, err)
 	}
+	fmt.Fprintf(out, "  transfer cap %s\n", (time.Duration(cfg.MaxTransferSeconds) * time.Second).String())
 	fmt.Fprintf(out, "  drop dir     %s%s\n", dropDir, existsNote(dropDir))
 
 	fmt.Fprintf(out, "\nlistener\n")

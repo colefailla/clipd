@@ -98,7 +98,11 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	flags := newFlagSet(e, g, "setup",
 		"Usage: clipd setup [options] <ssh-host>\n\n"+
 			"Probes the host, installs a 'clipd' shell function there, and adds the\n"+
-			"matching RemoteForward to your local SSH config.")
+			"matching RemoteForward to your local SSH config.\n\n"+
+			"Edits ~/.ssh/config and the remote ~/.bashrc, ~/.zshrc or ~/.profile.\n"+
+			"Creates first-version .clipd-backup files and private remote ~/.clipd.\n"+
+			"No remote binary/service or daemon config file is created.\n"+
+			"Run clipd help setup for settings, recovery and removal details.")
 	printOnly := flags.Bool("print", false, "show what would be changed, without changing anything")
 	if code, ok := flags.parse(args); !ok {
 		return code
@@ -132,7 +136,11 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	// The master outlives this process by ControlPersist seconds; closing it
 	// here keeps a stray authenticated connection from lingering.
 	defer func() {
-		_ = exec.Command("ssh", "-o", "ControlPath="+control, "-O", "exit", destination).Run()
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(closeCtx, "ssh", "-o", "ControlPath="+control, "-O", "exit", destination)
+		cmd.WaitDelay = time.Second
+		_ = cmd.Run()
 	}()
 
 	fmt.Fprintf(e.stdout, "Probing %s (you may be asked for your password)...\n", destination)
@@ -151,7 +159,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	remoteDir := facts.home + "/.clipd"
 	remoteSocket := remoteDir + "/socket"
 	rcFile := rcFileFor(facts)
-	block := shellFunction(client, remoteSocket, remoteDir, facts.hasTar)
+	block := shellFunction(client, remoteSocket, facts.hasTar)
 
 	sshBlock, err := sshBlockFor(destination, remoteSocket, localSocket)
 	if err != nil {
@@ -164,7 +172,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	fmt.Fprintf(e.stdout, "  remote socket  %s\n", remoteSocket)
 	fmt.Fprintf(e.stdout, "  local socket   %s\n", localSocket)
 	if !facts.hasTar {
-		fmt.Fprintf(e.stdout, "\n  note: %s has no tar, so 'clipd drop' is unavailable there.\n", destination)
+		fmt.Fprintf(e.stdout, "\n  note: %s has no tar; named stdin drops work, but file/directory drops require tar.\n", destination)
 	}
 	if unsupportedShell(facts.shell) {
 		fmt.Fprintf(e.stdout, "\n  note: %s does not read %s. The function is POSIX shell, so add\n"+
@@ -377,11 +385,11 @@ func clientCommand(f remoteFacts) (string, error) {
 		// timeout value". This netcat closes the socket on stdin EOF anyway,
 		// so the flag is not needed. Checked ahead of the -N cases because the
 		// flag is present here and means something else.
-		return `nc -U "$_clipd_sock"`, nil
+		return `nc -U -w 86400 "$_clipd_sock"`, nil
 	case f.hasNC && f.ncUnix && f.ncShutdown:
-		return `nc -N -U "$_clipd_sock"`, nil
+		return `nc -N -U -w 86400 "$_clipd_sock"`, nil
 	case f.hasSocat:
-		return `socat - UNIX-CLIENT:"$_clipd_sock"`, nil
+		return `socat -T 86400 -t 86400 - UNIX-CLIENT:"$_clipd_sock"`, nil
 	case f.hasNC && f.ncUnix:
 		// -U but no -N, on something that is not macOS: netcat-openbsd from
 		// before the flag existed. Without a half-close the daemon never sees
@@ -420,7 +428,30 @@ func rcFileFor(f remoteFacts) string {
 // The body is a subshell so none of its scratch variables or signal traps can
 // leak into the user's interactive shell. Names remain prefixed as well, which
 // keeps the generated block easy to audit when read on its own.
-func shellFunction(client, socket, dir string, hasTar bool) string {
+// Progress belongs on stderr; only final status lines are captured for exit status.
+const shellReplyReader = `(
+  _clipd_final=
+  _clipd_invalid=0
+  while IFS= read -r _clipd_line; do
+    case $_clipd_line in
+      ('clipd: progress: '*)
+        if [ -n "$_clipd_final" ]; then _clipd_invalid=1; fi
+        [ "$_clipd_progress" != true ] || command printf '\r%s\033[K' "$_clipd_line" >&2 ;;
+      (*)
+        if [ -n "$_clipd_final" ]; then _clipd_invalid=1; fi
+        _clipd_final=$_clipd_line ;;
+    esac
+  done
+  [ ! -t 2 ] || command printf '\r\033[K' >&2
+  if [ "$_clipd_invalid" = 0 ] && [ -n "$_clipd_final" ]; then
+    command printf '%s\n' "$_clipd_final"
+  else
+    command printf 'clipd: error: invalid or missing daemon reply\n'
+    exit 1
+  fi
+)`
+
+func shellFunction(client, socket string, hasTar bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", blockStart)
 	fmt.Fprintf(&b, "# Sends to the clipd daemon on the Mac, through the socket SSH forwards.\n")
@@ -441,9 +472,16 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 	fmt.Fprintf(&b, "\\unalias clipd 2>/dev/null || :\n")
 	fmt.Fprintf(&b, "clipd() (\n")
 	fmt.Fprintf(&b, "  _clipd_sock=%s\n", shellQuote(socket))
-	fmt.Fprintf(&b, "  _clipd_dir=%s\n", shellQuote(dir))
 	fmt.Fprintf(&b, "  _clipd_reply=\n")
 	fmt.Fprintf(&b, "  _clipd_client=0\n")
+	b.WriteString(`  case ${1:-} in (-h|--help|help)
+    command printf '%s\n' 'Usage: command | clipd' '       clipd drop [--no-progress] file-or-directory ...' '       command | clipd drop --name filename' '' 'Drops go to the Mac configured by clipd setup. Directories retain their structure.' 'Interactive drops show progress; --no-progress hides it.' 'On the Mac: clipd status shows limits; clipd help config explains settings.' 'After editing the Mac config, run clipd restart.'
+    return 0 ;;
+  esac
+  _clipd_progress=false
+  [ ! -t 2 ] || _clipd_progress=true
+`)
+
 	fmt.Fprintf(&b, "  if [ ! -S \"$_clipd_sock\" ]; then\n")
 	fmt.Fprintf(&b, "    command printf 'clipd: %%s is missing; reconnect with the socket forward\\n' \"$_clipd_sock\" >&2\n")
 	fmt.Fprintf(&b, "    return 1\n")
@@ -452,7 +490,9 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 	// abort on a plain `printf x | clipd`, which passes no arguments at all.
 	fmt.Fprintf(&b, "  if [ \"${1:-}\" = \"drop\" ]; then\n")
 	fmt.Fprintf(&b, "    shift\n")
-	if hasTar {
+	b.WriteString(`    if [ "${1:-}" = "--no-progress" ]; then _clipd_progress=false; shift; fi
+`)
+	{
 		// Two ways to drop, told apart by an explicit flag.
 		//
 		// They used to be told apart by whether stdin was a terminal, which
@@ -480,94 +520,67 @@ func shellFunction(client, socket, dir string, hasTar bool) string {
 		// The name lands inside a JSON string, so the two characters JSON
 		// escapes have to be escaped here. Everything else the daemon rejects.
 		fmt.Fprintf(&b, "      _clipd_esc=$(command printf '%%s' \"$_clipd_name\" | command sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g') || return 1\n")
-		fmt.Fprintf(&b, "      if _clipd_reply=$( { command printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\"}\\n' \"$_clipd_esc\"; command cat; } | command %s ); then :; else _clipd_client=$?; fi\n", client)
+		fmt.Fprintf(&b, "      if _clipd_reply=$( { command printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\",\"progress\":%%s}\\n' \"$_clipd_esc\" \"$_clipd_progress\"; command cat; } | command %s | ", client)
+		b.WriteString(shellReplyReader)
+		b.WriteString(" ); then :; else _clipd_client=$?; fi\n")
 		fmt.Fprintf(&b, "    else\n")
 		fmt.Fprintf(&b, "      if [ $# -eq 0 ]; then\n")
 		fmt.Fprintf(&b, "        command printf 'clipd drop: no files given (use --name to send stdin)\\n' >&2\n")
 		fmt.Fprintf(&b, "        return 64\n")
 		fmt.Fprintf(&b, "      fi\n")
-		{
-			// Do not stream tar directly to the daemon. tar can emit a valid
-			// prefix and then fail, which previously let the daemon publish a
-			// partial drop before the shell learned tar's status. Building the
-			// complete framed request first means the socket is never opened on
-			// that failure path. The command substitution is a subshell, so its
-			// signal traps do not replace traps in the user's interactive shell.
-			//
-			// The staging file is made by hand rather than with mktemp, which
-			// is not in POSIX and so is one more thing a host has to have. The
-			// pattern is the one installScript already uses: a name from the
-			// shell's PID, 0600 through umask, and noclobber so an existing
-			// file is refused rather than followed or overwritten. It lives in
-			// clipd's own 0700 directory, which is what makes a predictable
-			// name safe — the same name under a world-writable /tmp would be a
-			// symlink target. $$ does not change inside a subshell, so two
-			// backgrounded drops from one shell would collide on the first
-			// name; the sequence is what lets the second pick another, and it
-			// steps over a file a killed drop left behind.
-			fmt.Fprintf(&b, "      _clipd_reply=$(\n")
-			fmt.Fprintf(&b, "        _clipd_seq=0\n")
-			fmt.Fprintf(&b, "        while :; do\n")
-			fmt.Fprintf(&b, "          _clipd_payload=\"$_clipd_dir/drop.$$.$_clipd_seq\"\n")
-			fmt.Fprintf(&b, "          (umask 077; set -C; : > \"$_clipd_payload\") 2>/dev/null && break\n")
-			fmt.Fprintf(&b, "          _clipd_seq=$((_clipd_seq + 1))\n")
-			fmt.Fprintf(&b, "          if [ \"$_clipd_seq\" -ge 64 ]; then\n")
-			fmt.Fprintf(&b, "            command printf 'clipd drop: no free staging name in %%s; nothing was sent\\n' \"$_clipd_dir\" >&2\n")
-			fmt.Fprintf(&b, "            exit 3\n")
-			fmt.Fprintf(&b, "          fi\n")
-			fmt.Fprintf(&b, "        done\n")
-			fmt.Fprintf(&b, "        trap 'command rm -f \"$_clipd_payload\"' 0\n")
-			fmt.Fprintf(&b, "        trap 'exit 1' 1 2 15\n")
-			fmt.Fprintf(&b, "        command printf 'clipd:magic:v1\\n{\"type\":\"drop\"}\\n' > \"$_clipd_payload\" || exit 3\n")
-			// The -- is what keeps a file called
-			// "--use-compress-program=curl" from being read by tar as an option
-			// and executed.
-			fmt.Fprintf(&b, "        if ! COPYFILE_DISABLE=1 command tar cf - -- \"$@\" >> \"$_clipd_payload\"; then\n")
-			fmt.Fprintf(&b, "          command printf 'clipd drop: tar failed; nothing was sent\\n' >&2\n")
-			fmt.Fprintf(&b, "          exit 3\n")
-			fmt.Fprintf(&b, "        fi\n")
-			fmt.Fprintf(&b, "        command %s < \"$_clipd_payload\"\n", client)
-			// Failure falls through to the shared handler below rather than
-			// reporting here, so a stale socket is diagnosed the same way
-			// whichever path hit it. `|| _clipd_client=$?` rather than
-			// `if ! ...`, because `!` collapses the status to 1 and the exact
-			// code is what says whether the socket was ever opened.
-			fmt.Fprintf(&b, "      ) || _clipd_client=$?\n")
+		if hasTar {
+			// Each operand is reduced to an absolute -C directory and a ./basename.
+			// Prefixing operands prevents option injection while allowing multiple
+			// tar -C directives (a global -- would turn those into filenames).
+			b.WriteString(`      _clipd_reply=$(
+        _clipd_first=1
+        for _clipd_path in "$@"; do
+          case $_clipd_path in (*'
+'*) command printf 'clipd drop: path contains a control character\n' >&2; exit 3 ;; esac
+          if command printf '%s' "$_clipd_path" | LC_ALL=C command grep '[[:cntrl:]]' >/dev/null 2>&1; then
+            command printf 'clipd drop: path contains a control character\n' >&2; exit 3
+          fi
+          while [ "${_clipd_path%/}" != "$_clipd_path" ]; do _clipd_path=${_clipd_path%/}; done
+          _clipd_base=${_clipd_path##*/}
+          case $_clipd_base in (''|.|..) command printf 'clipd drop: give a file or directory name, not a filesystem root\n' >&2; exit 3 ;; esac
+          case $_clipd_path in (*/*) _clipd_parent=${_clipd_path%/*}; [ -n "$_clipd_parent" ] || _clipd_parent=/ ;; (*) _clipd_parent=. ;; esac
+          case $_clipd_parent in (/*|./*|../*|.) ;; (*) _clipd_parent=./$_clipd_parent ;; esac
+          _clipd_parent=$(command -p sh -c 'CDPATH=; command cd "$1" && command pwd -P' sh "$_clipd_parent") || exit 3
+          if [ "$_clipd_first" = 1 ]; then set --; _clipd_first=0; fi
+          set -- "$@" -C "$_clipd_parent" "./$_clipd_base"
+        done
+        {
+          command printf 'clipd:magic:v1\n{"type":"drop-stream-v2","progress":%s}\n' "$_clipd_progress"
+          if COPYFILE_DISABLE=1 command tar cf - "$@"; then
+            command printf 'clipd:complete:v2\n'
+          else
+            command printf 'clipd drop: tar failed; the drop was not completed\n' >&2
+          fi
+        } | `)
+			fmt.Fprintf(&b, "command %s | ", client)
+			b.WriteString(shellReplyReader)
+			b.WriteString("\n      ) || _clipd_client=$?\n")
+		} else {
+			fmt.Fprintf(&b, "      command printf 'clipd drop: this host has no tar\\n' >&2; return 1\n")
 		}
 		fmt.Fprintf(&b, "    fi\n")
-	} else {
-		fmt.Fprintf(&b, "    command printf 'clipd drop: this host has no tar\\n' >&2; return 1\n")
 	}
 	fmt.Fprintf(&b, "  else\n")
-	fmt.Fprintf(&b, "    if _clipd_reply=$(command %s); then :; else _clipd_client=$?; fi\n", client)
+	fmt.Fprintf(&b, "    if _clipd_reply=$(command %s | ", client)
+	b.WriteString(shellReplyReader)
+	b.WriteString(" ); then :; else _clipd_client=$?; fi\n")
 	fmt.Fprintf(&b, "  fi\n")
 	// The daemon's reply is the whole user interface for the result, so it is
 	// printed whatever it says; the status prefix on it is what turns the
 	// result into an exit code.
 	fmt.Fprintf(&b, "  if [ -n \"$_clipd_reply\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
-	// A session that ends badly leaves its socket file behind, so the -S test at
-	// the top still passes and the only symptom is a bare transport error. sshd
-	// will not rebind a path that already exists, so every later connection
-	// fails the same way until someone removes the corpse — and the warning ssh
-	// prints for that is identical to the one it prints when another session
-	// simply holds the forward, which makes it useless for telling them apart.
-	//
-	// Asking is what distinguishes them. A ping costs one connection and only
-	// happens on a path that has already failed. It also keeps this quiet when
-	// the failure was something else: a tar that could not read a file leaves
-	// the socket perfectly healthy, the ping succeeds, and the message tar
-	// already printed stands on its own.
+	// Failure to answer is not proof that a socket is stale. Do not probe with
+	// an unbounded shell transport or recommend deleting an unidentified listener.
 	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ] || [ -z \"$_clipd_reply\" ]; then\n")
-	// Status 3 is a failure that happened before the socket was opened at all —
-	// no staging name, no header, tar could not read a file. Those have already
-	// explained themselves, and probing a socket they never touched would be
-	// both misleading and a wasted connection.
-	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ] && ! command printf 'clipd:magic:v1\\n{\"type\":\"ping\"}\\n' | command %s 2>/dev/null | command grep -q '^clipd: ok: pong'; then\n", client)
-	fmt.Fprintf(&b, "      command printf 'clipd: nothing is listening on %%s; the socket is stale.\\n' \"$_clipd_sock\" >&2\n")
-	fmt.Fprintf(&b, "      command printf 'clipd: clear it and reconnect:  rm -f %%s\\n' \"$_clipd_sock\" >&2\n")
+	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ]; then\n")
+	fmt.Fprintf(&b, "      command printf 'clipd: transfer failed or no reply arrived; check clipd status on the Mac and the SSH forwarding warning.\\n' >&2\n")
 	fmt.Fprintf(&b, "    fi\n")
-	fmt.Fprintf(&b, "    return 1\n")
-	fmt.Fprintf(&b, "  fi\n")
+	fmt.Fprintf(&b, "    return 1\n  fi\n")
 	fmt.Fprintf(&b, "  case $_clipd_reply in\n")
 	fmt.Fprintf(&b, "    'clipd: ok: '*) return 0 ;;\n")
 	fmt.Fprintf(&b, "    *) return 1 ;;\n")
