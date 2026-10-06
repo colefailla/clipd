@@ -56,6 +56,7 @@ type commandFunc func(ctx context.Context, e *env, g *globalOptions, args []stri
 var commands = map[string]commandFunc{
 	"serve":     cmdServe,
 	"setup":     cmdSetup,
+	"reconnect": cmdReconnect,
 	"status":    cmdStatus,
 	"install":   cmdInstall,
 	"restart":   cmdRestart,
@@ -199,6 +200,7 @@ remote shell startup file; it installs no remote binary or service:
 Commands:
   serve       run the daemon in the foreground (macOS)
   setup       configure a remote host to talk to this daemon
+  reconnect   restore the shared SSH forward from the Mac
   status      show the daemon's configuration and state
   install     macOS: install and start the LaunchAgent
   restart     macOS: reload the daemon after editing the config

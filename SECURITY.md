@@ -34,6 +34,19 @@ the socket's permissions, or lets a peer consume unbounded daemon resources.
 See the README's security section, or `clipd help security`, for the full
 model.
 
+`clipd reconnect` and non-print `clipd setup` can remove a stale remote socket
+on request. Recovery requires an
+explicit connection-refused result from an OpenBSD-compatible `nc` protocol ping,
+preserves symlinks and non-socket files, and checks the file identity again
+before removal. Inspection is not an atomic unlink operation; processes running
+as the same remote user can race it, consistent with the user boundary above.
+Reconnect checks the configured forward before mutation and resets only a
+clipd-named shared SSH control connection. Setup uses OpenSSH connection sharing;
+the forward and its granted capability remain available after shell logout
+until the background SSH connection ends. Reconnect restores that connection
+without opening a login shell. The Mac control socket is stored in ~/.ssh as
+clipd-<OpenSSH connection hash>; it is managed and protected by OpenSSH.
+
 Streaming drops validate relative paths, file types and resource limits before
 publication, and require a successful-producer completion marker. Legacy drops
 retain basename flattening and the documented entry-boundary truncation gap.

@@ -94,16 +94,36 @@ clipd setup debian
 That connects to `debian`, works out what it has, installs a `clipd` shell
 function in the right rc file, and adds the socket forward to your
 `~/.ssh/config`. Use `-print` to see what it would do without doing it.
+Setup also safely clears a confirmed stale remote socket so the next SSH
+connection can bind the forward. Active listeners are preserved. If recovery
+cannot be verified, setup reports failure and explains that its config files
+were already updated; it does not silently claim the host is ready.
 
-Reconnect for the forward to take effect:
+Connect normally:
 
 ```bash
-ssh -O exit debian 2>/dev/null; ssh debian
+ssh debian
 ```
+
+Setup configures OpenSSH connection sharing (`ControlMaster auto` and
+`ControlPersist yes`). The SSH connection and forward stay alive on the Mac
+after shell logout. Later logins reuse them. Aliases with the same `HostName`,
+port, user and jump host share the connection; other destinations stay separate.
+No server configuration change or additional service is required.
 
 Run it once per host you use. Both halves — the remote function and the local
 `Host` block — are written together, so hosts you have not re-run it on keep
 working as they were; they just do not get the newer behaviour until you do.
+Destination names are matched as typed. To use both `ssh debian` and
+`ssh debian.local`, run setup for both names; each gets its own forwarding block.
+Different machines also keep separate blocks. SSH aliases, DNS names, literal
+IPv4 and IPv6 addresses, and `user@host` destinations are supported. For example:
+
+```bash
+clipd setup nas.example
+clipd setup 192.0.2.10
+clipd setup cole@2001:db8::10
+```
 
 Setting up two accounts on the same machine works: `alice@server` and
 `bob@server` get separate blocks, scoped with `Match ... user`, rather than the
@@ -410,36 +430,46 @@ exists, because a daemon killed with `SIGKILL` leaves the socket behind and a
 stale one looks identical in a directory listing. Exit code 0 means a clipd
 daemon answered — not merely that something is listening.
 
-**`clipd: ~/.clipd/socket is missing`** on the remote — the forward isn't up.
-Reconnect. If you use `ControlMaster`, kill the old master first with
-`ssh -O exit <host>`; otherwise you reuse a connection that predates the
-forward.
+**A missing socket or `Connection refused`** on the remote means the forward
+is unavailable. From the Mac, restore it:
 
-**`remote port forwarding failed`** means sshd could not bind the socket. Two
-different things produce that identical warning:
+```bash
+clipd reconnect debian
+```
 
-- **You already have a session open to that host.** Two sessions cannot bind the
-  same path, so the second one loses its forward. Harmless — the first session
-  still works.
-- **A socket is left over** from a session that ended badly. Every later
-  connection now fails the same way. Clear it:
+Reconnect checks the Mac daemon and forwarding config, closes this destination's
+clipd-managed shared SSH connection, safely clears a stale remote socket, then
+starts the restored forward in the background using OpenSSH. It returns to the
+Mac prompt. Normal logins remain `ssh debian`; logout does not close the shared
+connection or forward. Resetting a shared connection disconnects shells using
+it, so close those shells before running reconnect.
 
-  ```bash
-  ssh <host> 'rm -f ~/.clipd/socket'
-  ```
+Setup also safely clears stale sockets. Rerun setup once per destination to
+upgrade older SSH blocks to connection sharing. Existing earlier SSH options
+that override the managed sharing settings cause setup/reconnect to report an
+error rather than silently fall back to a connection that dies on shell logout.
 
-A failed request does not prove the socket is stale: live listeners and broken
-forwarding paths can also fail to answer. Check `clipd status` on the Mac and
-SSH's warning. Remove a remote socket only after establishing that no active
-session owns it. `ssh -o ExitOnForwardFailure=yes <host>` makes forwarding setup
-failures fatal, including conflicts with another session's working forward.
+Recovery uses nc. It sends a protocol ping and
+removes a socket only after an explicit connection-refused error and a
+file-identity recheck. Other active listeners, ambiguous errors, symlinks, and
+non-socket files are preserved. A missing socket needs no inspection tool.
+Stale recovery needs an explicit error, as OpenBSD nc provides on Debian.
+Apple nc's generic failure is ambiguous and is preserved rather than deleted.
 
-To stop the leftover case recurring, the remote needs `StreamLocalBindUnlink yes`
-in its `/etc/ssh/sshd_config`, which takes root on that host. The same setting in
-your own `~/.ssh/config` does **not** help: a remote forward is bound by the
-remote's `sshd`, and the request the client sends carries only a path, with no
-way to ask for an unlink. That was measured against a real host — the option
-active in `ssh -G`, a stale socket in place, and the forward still refused.
+A Mac restart, network failure, or terminating the master can still leave a
+remote socket behind; reconnect handles that exceptional state. Normal shell
+logout keeps the shared connection alive. `clipd restart` reloads the local
+clipboard daemon; it does not reset SSH.
+
+`ssh -O exit debian` closes the shared connection and its forward. The forwarded
+capability remains available while that background SSH connection exists.
+OpenSSH keepalives check it every 60 seconds and stop it after three unanswered
+checks. No separate clipd process is installed on the remote.
+
+`StreamLocalBindUnlink yes` in the remote server's `sshd_config` is an optional
+alternative for automatically replacing remote socket pathnames, including
+those of active forwards. Its client-side equivalent cannot control a remote
+forward. Clipd does not modify the server configuration.
 
 ## Exit codes
 
@@ -472,6 +502,7 @@ That unloads and removes the LaunchAgent. Everything else is left in place.
 | `~/Library/Logs/clipd/` | the daemon's output, written by launchd |
 | `~/.ssh/config` | one block per host, between `# >>> clipd: <host> >>>` markers |
 | `~/.ssh/config.clipd-backup` | a copy of the SSH config from before the first edit |
+| `~/.ssh/clipd-<hash>` | private OpenSSH control socket for a shared connection |
 
 To remove the rest:
 
@@ -490,7 +521,7 @@ received, so it is left for you to look through.
 | `~/.bashrc`, `~/.zshrc` or `~/.profile` | the `clipd` function, between `# >>> clipd >>>` markers |
 | `~/.bashrc.clipd-backup` (or the matching rc file) | a copy of that file from before the first edit |
 | `~/.clipd/` | a `0700` directory, created by `clipd setup`, holding the socket |
-| `~/.clipd/socket` | created by sshd while you are connected, removed when you disconnect |
+| `~/.clipd/socket` | created by sshd for the shared forward; can remain stale after the SSH connection ends |
 
 Delete the marked block and the socket is gone on its own; `rm -rf ~/.clipd`
 removes the directory it lived in.
