@@ -1009,7 +1009,7 @@ func TestSSHBlockMatchesTheNameAsTyped(t *testing.T) {
 func TestSSHBlockRefusesAWideningPattern(t *testing.T) {
 	t.Parallel()
 
-	for _, destination := range []string{"*", "web?", "!prod", "a b", "-oProxyCommand=id", "alice@-host", "host:22", "ssh://host"} {
+	for _, destination := range []string{"*", "web?", "!prod", "a b", "-oProxyCommand=id", "alice@-host"} {
 		if _, err := sshBlockFor(destination, "/r/socket", "/l/socket"); err == nil {
 			t.Errorf("sshBlockFor(%q) wrote a block for a pattern, not a host", destination)
 		}
@@ -1068,52 +1068,6 @@ func TestSeveralHostsCoexist(t *testing.T) {
 		if !strings.Contains(string(data), "Host "+h+"\n") {
 			t.Errorf("%s lost its block after later setups:\n%s", h, data)
 		}
-	}
-}
-
-func TestSSHSharingKeepsAliasesTogetherAndAccountsSeparate(t *testing.T) {
-	ssh, err := exec.LookPath("ssh")
-	if err != nil {
-		t.Skip("ssh unavailable")
-	}
-	content := "Host debian debian.local\n  HostName endpoint.example\n  User cole\n"
-	for _, destination := range []string{"debian", "debian.local", "bob@debian", "other.example"} {
-		block, err := sshBlockFor(destination, "/remote/socket", "/local/socket")
-		if err != nil {
-			t.Fatal(err)
-		}
-		content += block
-	}
-	path := filepath.Join(t.TempDir(), "config")
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	controls := make(map[string]string)
-	for _, destination := range []string{"debian", "debian.local", "bob@debian", "other.example"} {
-		out, err := exec.Command(ssh, "-G", "-F", path, destination).Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		values := make(map[string]string)
-		for _, line := range strings.Split(string(out), "\n") {
-			key, value, _ := strings.Cut(line, " ")
-			values[key] = value
-		}
-		for key, want := range map[string]string{"controlmaster": "auto", "controlpersist": "yes", "exitonforwardfailure": "yes", "serveraliveinterval": "60", "serveralivecountmax": "3"} {
-			if values[key] != want {
-				t.Fatalf("%s: %s=%q, want %q", destination, key, values[key], want)
-			}
-		}
-		controls[destination] = values["controlpath"]
-		if strings.Contains(controls[destination], "%C") {
-			t.Fatal("connection hash was escaped instead of expanded")
-		}
-	}
-	if controls["debian"] != controls["debian.local"] {
-		t.Fatal("aliases cannot reuse the shared connection")
-	}
-	if controls["debian"] == controls["bob@debian"] || controls["debian"] == controls["other.example"] {
-		t.Fatal("different accounts or hosts share a control connection")
 	}
 }
 

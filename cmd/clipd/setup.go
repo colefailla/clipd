@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,6 +111,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		return failf(e, exitUsage, "setup needs exactly one ssh host, got %d", flags.NArg())
 	}
 	destination := flags.Arg(0)
+	// Validate before the probe: ssh would read "-oProxyCommand=..." as an option.
 	if _, err := sshBlockFor(destination, "/remote/socket", "/local/socket"); err != nil {
 		return fail(e, exitUsage, err)
 	}
@@ -209,28 +209,11 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	} else {
 		fmt.Fprintf(e.stdout, "The socket forward in %s was already current.\n", sshPath)
 	}
-	if err := verifyReconnectForward(ctx, destination, remoteSocket, localSocket); err != nil {
-		return failf(e, exitFailure, "setup files were updated, but SSH connection sharing is not configured correctly: %v", err)
-	}
-	result, err := runRemote(ctx, destination, control, reconnectScript(remoteSocket))
-	if err != nil {
-		return failf(e, exitFailure, "setup files were updated, but remote socket recovery failed: %v; the socket was preserved", err)
-	}
-	switch strings.TrimSpace(result) {
-	case "removed":
-		fmt.Fprintln(e.stdout, "Removed stale remote socket.")
-	case "missing":
-		fmt.Fprintln(e.stdout, "Remote socket is clear for the next SSH connection.")
-	case "active":
-		fmt.Fprintln(e.stdout, "An existing remote listener is active; left it untouched.")
-	default:
-		return failf(e, exitFailure, "setup files were updated, but socket recovery returned an unexpected response")
-	}
 
 	fmt.Fprintf(e.stdout, `
-Connect normally:
+Reconnect for the forward to take effect:
 
-  ssh %s
+  ssh -O exit %s 2>/dev/null; ssh %s
 
 Then, on %s:
 
@@ -238,10 +221,19 @@ Then, on %s:
   clipd drop notes.txt
   pg_dump db | clipd drop --name dump.sql
 
-SSH keeps the shared connection and forward alive after logout. Aliases for
-the same resolved host and account reuse it. If the connection breaks, run
-'clipd reconnect %s' on the Mac; it returns to the Mac prompt.
-`, destination, destination, destination)
+An existing SSH session will not have the forward. If you multiplex with
+ControlMaster, the old master has to go first, which is what the -O exit above
+is for.
+
+One-time step on %s, if you have not done it already (needs sudo):
+
+  echo 'StreamLocalBindUnlink yes' | sudo tee /etc/ssh/sshd_config.d/clipd.conf
+  sudo systemctl reload ssh    # the service is "sshd" on some distributions
+
+A connection that drops uncleanly (sleep, network change) leaves the remote
+socket behind. Without this setting, sshd refuses every later forward with
+"remote port forwarding failed" until the socket is removed by hand.
+`, destination, destination, destination, destination)
 	return exitOK
 }
 
@@ -336,7 +328,6 @@ func runRemote(ctx context.Context, destination, control, script string) (stdout
 
 	args := append(sshOptions(control), destination, "sh -s")
 	cmd := exec.CommandContext(ctx, "ssh", args...)
-	cmd.WaitDelay = time.Second
 	cmd.Stdin = strings.NewReader(script)
 	out := &capWriter{max: maxProbeOutput}
 	errOut := &capWriter{max: maxProbeOutput}
@@ -743,12 +734,7 @@ func validHostPattern(host string) error {
 	if strings.HasPrefix(host, "-") {
 		return errors.New("the ssh host cannot start with a dash")
 	}
-	if strings.Contains(host, ":") {
-		if _, err := netip.ParseAddr(host); err != nil {
-			return fmt.Errorf("ssh destination %q is not a literal IPv6 address", host)
-		}
-	}
-	if i := strings.IndexAny(host, "*?!/ \t"); i >= 0 {
+	if i := strings.IndexAny(host, "*?!/: \t"); i >= 0 {
 		return fmt.Errorf("ssh destination %q contains %q; setup writes a block for one named host, so give it one",
 			host, string(host[i]))
 	}
@@ -781,14 +767,6 @@ func sshBlockFor(destination, remoteSocket, localSocket string) (string, error) 
 	if err := validSSHValue("local socket path", localSocket); err != nil {
 		return "", err
 	}
-	home, err := os.UserHomeDir()
-	if err != nil || !filepath.IsAbs(home) {
-		return "", errors.New("cannot locate an absolute home directory for SSH connection sharing")
-	}
-	sharedPath := filepath.Join(strings.ReplaceAll(home, "%", "%%"), ".ssh", "clipd-%C")
-	if err := validSSHValue("SSH control path", sharedPath); err != nil {
-		return "", err
-	}
 
 	start, end := sshMarkers(destination)
 	var b strings.Builder
@@ -816,9 +794,6 @@ func sshBlockFor(destination, remoteSocket, localSocket string) (string, error) 
 	// StreamLocalBindMask the user set elsewhere in this file would apply here
 	// too, and 0000 there publishes the socket to every account on the host.
 	fmt.Fprintf(&b, "  StreamLocalBindMask 0177\n")
-	// %C hashes the resolved host, port and user, so aliases for one account
-	// reuse its forward while different hosts/accounts remain independent.
-	fmt.Fprintf(&b, "  ControlMaster auto\n  ControlPath \"%s\"\n  ControlPersist yes\n  ExitOnForwardFailure yes\n  ServerAliveInterval 60\n  ServerAliveCountMax 3\n", sharedPath)
 	// StreamLocalBindUnlink is deliberately absent, and should not be added back.
 	// It reads like the fix for a socket left behind by a session that died
 	// uncleanly, and it is — for a socket the ssh client binds, which is local

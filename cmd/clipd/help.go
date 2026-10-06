@@ -16,9 +16,7 @@ Options:
 	"setup": `clipd setup [options] <ssh-host>
 
 Run on the Mac. Probes a POSIX-shell remote and configures socket forwarding.
-The destination may be an SSH alias, hostname, literal IPv4/IPv6 address, or
-user@host; all use SSH UNIX sockets. Run setup separately for each destination.
-Later setups preserve other destinations' forwarding blocks.
+The destination may be an SSH alias, hostname or IP; all use SSH UNIX sockets.
 Only the destination spelling supplied to setup receives the generated block.
 
 Files created or edited:
@@ -30,26 +28,20 @@ Files created or edited:
 
 RemoteForward connects the remote socket to the Mac's daemon socket.
 StreamLocalBindMask requests a private socket; Host * resets config scope.
-ControlMaster auto and ControlPersist yes keep the SSH forward alive after
-shell logout. ControlPath hashes the resolved host, port, user and jump host.
-Normal connections use ssh <host>; no extra flags are required.
-The shared SSH connection runs in the background on the Mac. The forwarded
-capability remains available until that connection ends.
 No remote binary or service is installed. No daemon config file is created.
 Remote rc writes preserve inode/symlink metadata but are not crash-atomic.
 A backup is a recovery aid, not cross-machine rollback. Partial success is
 reported; re-running setup replaces managed blocks and is safe to retry.
-Setup clears a confirmed stale remote socket and preserves active listeners.
-If recovery fails, it reports that setup files were updated but the socket
-could not be repaired. Existing sockets require OpenBSD-compatible nc for
-safe inspection. -print does not attempt socket recovery.
 
 Options:
   -print    show generated shell and SSH settings without editing those files
 
 Reconnect afterward. Remove managed blocks to undo setup, retaining unrelated
-content. Backups are first versions, not current snapshots. For stale remote
-sockets and competing sessions, see README Troubleshooting.`,
+content. Backups are first versions, not current snapshots.
+
+One-time step on the remote, needs root: add StreamLocalBindUnlink yes to its
+sshd config and reload sshd. Without it, a socket left by a dropped connection
+makes every later forward fail. See README Troubleshooting.`,
 
 	"drop": `clipd drop [--no-progress] <file-or-directory>...
        <command> | clipd drop --name <filename>
@@ -174,22 +166,6 @@ crashes. No root privileges are required.
 Options:
   -exec <path>   binary path to record in the plist (default: this binary)`,
 
-	"reconnect": `clipd reconnect <ssh-host>
-
-Run on the Mac after clipd setup. Checks the daemon and SSH configuration,
-resets this destination's clipd-managed shared connection, safely clears a
-stale remote socket, and restores the SSH forward in the background.
-Returns to your Mac prompt. Normal logins use ssh <ssh-host>.
-
-Resetting the shared connection disconnects shells using it; close them first.
-It opens no login shell, rewrites no setup files, and does not restart the Mac
-clipboard daemon. Use ssh -O exit <host> to close the background connection.
-
-Existing sockets require nc. A protocol ping
-must report an explicit refused connection before deletion. Other active
-listeners, ambiguous errors, symlinks, changed files, and non-socket files are
-preserved. Network failures or terminating the master can still require
-reconnect; normal shell logout leaves the shared forward running.`,
 	"restart": `clipd restart
 
 macOS only. Stops and starts the LaunchAgent.
@@ -227,5 +203,5 @@ toolchain and target platform.`,
 	"help": `clipd help [topic]
 
 With no topic, prints the command list. Topics: serve, setup, drop, config,
-security, install, restart, reconnect, uninstall, status, version.`,
+security, install, restart, uninstall, status, version.`,
 }
