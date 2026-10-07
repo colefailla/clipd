@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,9 +14,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/colefailla/clipd/internal/protocol"
 )
+
+// fakeTransport uses one command for both transfers and the stale-socket check.
+func fakeTransport(command string) transport {
+	return transport{send: command, probe: command}
+}
 
 func TestCapWriterReportsDiscardedBytesAsAccepted(t *testing.T) {
 	t.Parallel()
@@ -36,17 +43,19 @@ func TestClientCommandPicksWhatTheHostHas(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
-		facts remoteFacts
-		want  string
+		name   string
+		facts  remoteFacts
+		want   string
+		probe  string
+		silent bool
 	}{
-		{"linux, modern netcat", remoteFacts{os: "Linux", hasNC: true, ncUnix: true, ncShutdown: true}, "nc -N -U"},
-		{"socat fallback", remoteFacts{os: "Linux", hasSocat: true}, "socat"},
-		{"traditional netcat with socat", remoteFacts{os: "Linux", hasNC: true, hasSocat: true}, "socat"},
+		{"linux, modern netcat", remoteFacts{os: "Linux", hasNC: true, ncUnix: true, ncShutdown: true}, "nc -N -U -w 86400", "nc -N -U -w 5", false},
+		{"socat fallback", remoteFacts{os: "Linux", hasSocat: true}, "socat -T 86400 -t 86400", "socat -T 5 -t 5", false},
+		{"traditional netcat with socat", remoteFacts{os: "Linux", hasNC: true, hasSocat: true}, "socat -T 86400", "socat -T 5", false},
 		// macOS netcat has -N, but there it takes a probe count for a write
 		// timeout rather than half-closing. Passing it OpenBSD-style fails
 		// outright, and this netcat needs no flag to close on stdin EOF.
-		{"macos remote", remoteFacts{os: "Darwin", hasNC: true, ncUnix: true, ncShutdown: true}, "nc -U"},
+		{"macos remote", remoteFacts{os: "Darwin", hasNC: true, ncUnix: true, ncShutdown: true}, "nc -U -w 86400", "nc -U -w 5", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,8 +64,8 @@ func TestClientCommandPicksWhatTheHostHas(t *testing.T) {
 			if err != nil {
 				t.Fatalf("clientCommand: %v", err)
 			}
-			if !strings.HasPrefix(got, tc.want) {
-				t.Errorf("clientCommand = %q, want it to start with %q", got, tc.want)
+			if !strings.HasPrefix(got.send, tc.want) || !strings.HasPrefix(got.probe, tc.probe) || got.silentRefusal != tc.silent {
+				t.Errorf("clientCommand = %+v, want send %q, probe %q, silentRefusal %v", got, tc.want, tc.probe, tc.silent)
 			}
 		})
 	}
@@ -115,15 +124,22 @@ func TestShellFunctionIsValidShell(t *testing.T) {
 		t.Skip("no sh available")
 	}
 
-	clients := []string{`nc -N -U "$_clipd_sock"`, `nc -U "$_clipd_sock"`, `socat - UNIX-CLIENT:"$_clipd_sock"`}
-	for _, client := range clients {
+	for _, facts := range []remoteFacts{
+		{os: "Linux", hasNC: true, ncUnix: true, ncShutdown: true},
+		{os: "Darwin", hasNC: true, ncUnix: true},
+		{os: "Linux", hasSocat: true},
+	} {
+		client, err := clientCommand(facts)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for _, hasTar := range []bool{true, false} {
 			block := shellFunction(client, "/home/cole/.clipd/socket", hasTar)
 
 			cmd := exec.Command(sh, "-n")
 			cmd.Stdin = strings.NewReader(block)
 			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Errorf("generated shell is invalid (client=%q tar=%v): %v\n%s\n%s",
+				t.Errorf("generated shell is invalid (client=%+v tar=%v): %v\n%s\n%s",
 					client, hasTar, err, out, block)
 			}
 		}
@@ -139,7 +155,7 @@ func TestShellFunctionQuotesSocketAsLiteralShellData(t *testing.T) {
 	}
 
 	socket := "/home/$USER/`printf injected`/it's a \"socket\""
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, socket, true)
+	block := shellFunction(fakeTransport(`nc -N -U "$_clipd_sock"`), socket, true)
 	var assignment string
 	for _, line := range strings.Split(block, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "_clipd_sock=") {
@@ -167,7 +183,7 @@ func TestShellFunctionQuotesSocketAsLiteralShellData(t *testing.T) {
 func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(fakeTransport(`nc -N -U "$_clipd_sock"`), "/home/cole/.clipd/socket", true)
 
 	if !strings.Contains(block, `clipd:magic:v1\n{"type":"drop-stream-v2","progress":%s}\n`) {
 		t.Errorf("the drop path does not emit the magic frame:\n%s", block)
@@ -190,7 +206,7 @@ func TestShellFunctionSendsTheRightFrame(t *testing.T) {
 func TestShellFunctionRefusesDropWithoutTar(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", false)
+	block := shellFunction(fakeTransport(`nc -N -U "$_clipd_sock"`), "/home/cole/.clipd/socket", false)
 	if strings.Contains(block, "tar cf") {
 		t.Errorf("the function uses tar on a host that has none:\n%s", block)
 	}
@@ -206,7 +222,7 @@ func TestShellFunctionRefusesDropWithoutTar(t *testing.T) {
 func TestShellFunctionNeedsNoMktemp(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(fakeTransport(`nc -N -U "$_clipd_sock"`), "/home/cole/.clipd/socket", true)
 	if strings.Contains(block, "mktemp") {
 		t.Errorf("the function still depends on mktemp:\n%s", block)
 	}
@@ -247,7 +263,7 @@ func TestShellFunctionValidatesAndEscapesNamedDrops(t *testing.T) {
 	if err := os.WriteFile(clientPath, []byte(clientScript), 0o600); err != nil {
 		t.Fatalf("write fake client: %v", err)
 	}
-	block := shellFunction("sh "+shellQuote(clientPath), socket, true)
+	block := shellFunction(fakeTransport("sh "+shellQuote(clientPath)), socket, true)
 
 	for _, tc := range []struct {
 		name string
@@ -317,7 +333,7 @@ func TestShellFunctionDoesNotChangeInteractiveVariables(t *testing.T) {
 	}
 	defer listener.Close()
 
-	block := shellFunction(`printf 'clipd: ok: copied\n'`, socket, true)
+	block := shellFunction(fakeTransport(`printf 'clipd: ok: copied\n'`), socket, true)
 	script := `_clipd_sock=mine; _clipd_reply=mine; _clipd_client=73
 ` + block + `
 clipd </dev/null >/dev/null || exit
@@ -360,7 +376,7 @@ printf 'clipd: ok: received\n'
 		t.Fatalf("write fake transport: %v", err)
 	}
 	blockPath := filepath.Join(dir, "clipd-block.sh")
-	block := shellFunction("clipd_test_transport", socket, true)
+	block := shellFunction(fakeTransport("clipd_test_transport"), socket, true)
 	if err := os.WriteFile(blockPath, []byte(block), 0o600); err != nil {
 		t.Fatalf("write generated block: %v", err)
 	}
@@ -513,7 +529,7 @@ func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
 
 			calledPath := filepath.Join(dir, "client-called")
 			capturePath := filepath.Join(dir, "request")
-			block := shellFunction("sh "+shellQuote(clientPath), socket, true)
+			block := shellFunction(fakeTransport("sh "+shellQuote(clientPath)), socket, true)
 			script := block + "\nclipd drop " + tc.arguments + "\n"
 			cmd := exec.Command(sh, "-c", script)
 			cmd.Dir = dir
@@ -665,7 +681,7 @@ func TestInstallScriptRejectsMalformedMarkersBeforeWriting(t *testing.T) {
 				t.Fatalf("seed rc file: %v", err)
 			}
 			newBlock := blockStart + "\nclipd() { :; }\n" + blockEnd
-			script := fmt.Sprintf(installScript, "$HOME/.profile", staleSocketScript(`nc -U "$_clipd_sock"`), newBlock)
+			script := fmt.Sprintf(installScript, "$HOME/.profile", staleSocketScript(fakeTransport(`nc -U "$_clipd_sock"`)), newBlock)
 			cmd := exec.Command(sh, "-c", script)
 			cmd.Env = append(os.Environ(), "HOME="+home)
 			out, err := cmd.CombinedOutput()
@@ -691,12 +707,30 @@ func TestInstallScriptRejectsMalformedMarkersBeforeWriting(t *testing.T) {
 }
 
 // TestInstallScriptRemovesOnlyAStaleSocket covers re-running setup as the fix
-// for a socket an earlier session left behind.
+// for a socket an earlier session left behind. A socket that accepts and never
+// answers, as one held by an unreachable earlier session does, must neither be
+// removed nor stall setup until its command timeout prevents the install.
 func TestInstallScriptRemovesOnlyAStaleSocket(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("nc"); err != nil {
 		t.Skip("nc unavailable")
 	}
-	for _, live := range []bool{false, true} {
+	for _, shell := range []string{"sh", "dash"} {
+		binary, err := exec.LookPath(shell)
+		if err != nil {
+			continue
+		}
+		for _, state := range []string{"stale", "closes", "silent"} {
+			testInstallScriptSocket(t, shell, binary, state)
+		}
+	}
+}
+
+// testInstallScriptSocket runs setup's remote install script, under set -e, as
+// shell against a socket in the given state.
+func testInstallScriptSocket(t *testing.T, shell, binary, state string) {
+	t.Run(shell+"/"+state, func(t *testing.T) {
+		t.Parallel()
 		home, err := os.MkdirTemp("", "cdh")
 		if err != nil {
 			t.Fatal(err)
@@ -706,40 +740,32 @@ func TestInstallScriptRemovesOnlyAStaleSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 		socket := filepath.Join(home, ".clipd", "socket")
-		if live {
-			ln, err := net.Listen("unix", socket)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ln.Close()
-			go func() {
-				for {
-					conn, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					conn.Close()
-				}
-			}()
-		} else {
+		if state == "stale" {
 			staleSocket(t, socket)
+		} else {
+			listenUnix(t, socket, state == "silent")
 		}
-		script := fmt.Sprintf(installScript, "$HOME/.profile", staleSocketScript(`nc -U "$_clipd_sock"`), blockStart+"\nclipd() { :; }\n"+blockEnd)
-		cmd := exec.Command("sh", "-c", script)
+		script := fmt.Sprintf(installScript, "$HOME/.profile", staleSocketScript(localTransport(t)), blockStart+"\nclipd() { :; }\n"+blockEnd)
+		ctx, cancel := context.WithTimeout(context.Background(), (probeSeconds+5)*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, binary, "-c", script)
 		cmd.Env = append(os.Environ(), "HOME="+home)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("live=%v: install failed: %v\n%s", live, err, out)
+			t.Fatalf("install failed or stalled: %v\n%s", err, out)
+		}
+		if rc, err := os.ReadFile(filepath.Join(home, ".profile")); err != nil || !strings.Contains(string(rc), blockStart) {
+			t.Fatalf("function was not installed: %v", err)
 		}
 		_, statErr := os.Lstat(socket)
 		removed := strings.Contains(string(out), "clipd-removed-stale-socket")
-		if live && (removed || statErr != nil) {
+		if state != "stale" && (removed || statErr != nil) {
 			t.Fatalf("install removed a live socket: %s", out)
 		}
-		if !live && (!removed || !os.IsNotExist(statErr)) {
+		if state == "stale" && (!removed || !os.IsNotExist(statErr)) {
 			t.Fatalf("install kept a stale socket: %s, %v", out, statErr)
 		}
-	}
+	})
 }
 
 // TestInstallSSHConfigIsIdempotent cannot be parallel: it points HOME at a
@@ -1168,7 +1194,7 @@ func TestLegacyUnhostedBlockIsReplaced(t *testing.T) {
 func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(fakeTransport(`nc -N -U "$_clipd_sock"`), "/home/cole/.clipd/socket", true)
 
 	if strings.Contains(block, "[ -t 0 ]") {
 		t.Errorf("the function still infers the drop form from the terminal:\n%s", block)
@@ -1194,7 +1220,7 @@ func TestShellFunctionHandlesBothDropForms(t *testing.T) {
 func TestShellFunctionSurvivesNounset(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(fakeTransport(`nc -N -U "$_clipd_sock"`), "/home/cole/.clipd/socket", true)
 	if strings.Contains(block, "_clipd_name=\"$1\"") {
 		t.Errorf("the function expands $1 unguarded:\n%s", block)
 	}
@@ -1208,7 +1234,7 @@ func TestShellFunctionSurvivesNounset(t *testing.T) {
 func TestShellFunctionReportsFailureAsExitStatus(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(fakeTransport(`nc -N -U "$_clipd_sock"`), "/home/cole/.clipd/socket", true)
 	if !strings.Contains(block, "'clipd: ok: '*) return 0 ;;") {
 		t.Errorf("the function does not turn the daemon's reply into an exit status:\n%s", block)
 	}
@@ -1228,7 +1254,7 @@ func TestShellFunctionReportsFailureAsExitStatus(t *testing.T) {
 func TestShellFunctionDoesNotLeakVariables(t *testing.T) {
 	t.Parallel()
 
-	block := shellFunction(`nc -N -U "$_clipd_sock"`, "/home/cole/.clipd/socket", true)
+	block := shellFunction(fakeTransport(`nc -N -U "$_clipd_sock"`), "/home/cole/.clipd/socket", true)
 	for _, bare := range []string{"\n  sock=", "\n      name=", "\n      esc="} {
 		if strings.Contains(block, bare) {
 			t.Errorf("the function assigns an unprefixed variable %q:\n%s", bare, block)
@@ -1251,11 +1277,13 @@ func TestMacOSRemoteDoesNotGetTheOpenBSDFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clientCommand: %v", err)
 	}
-	if strings.Contains(got, "-N") {
-		t.Errorf("clientCommand = %q, want no -N on a macOS remote", got)
-	}
-	if !strings.Contains(got, "-U") {
-		t.Errorf("clientCommand = %q, want it to still use the socket", got)
+	for _, command := range []string{got.send, got.probe} {
+		if strings.Contains(command, "-N") {
+			t.Errorf("command = %q, want no -N on a macOS remote", command)
+		}
+		if !strings.Contains(command, "-U") {
+			t.Errorf("command = %q, want it to still use the socket", command)
+		}
 	}
 }
 

@@ -62,8 +62,8 @@ Default limits: 256 MiB and 256 files per drop, 30 minutes per transfer. An
 error names the limit you hit; see clipd help config on the Mac to raise it.
 
 After updating clipd on the Mac, rerun clipd setup to update this function.
-On Debian, ssh host 'clipd ...' needs ssh -t: its .bashrc skips non-interactive
-shells before reaching the function.`,
+Over ssh, ask for an interactive shell: ssh host 'bash -ic "clipd drop x"'
+(zsh -ic on zsh hosts). ssh -t alone does not make the shell interactive.`,
 
 	"config": `clipd config file
 

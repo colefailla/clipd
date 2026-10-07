@@ -198,12 +198,30 @@ cannot, and systems old enough to predate 6.7.
 
 Those are configured by hand. **Read the cost at the end before you do.**
 
-1. While the daemon is still on a socket, print the function `setup` would
-   install, to start from:
+1. While the daemon is still on a socket, generate a TCP version of the
+   function `setup` would install. Replace `oldbox` with the host:
 
    ```bash
-   clipd setup -print <host>
+   clipd setup -print oldbox > clipd-print.txt &&
+     sed -n '/^# >>> clipd >>>$/,/^# <<< clipd <<<$/p' clipd-print.txt | sed \
+       -e '/# >>> clipd socket check/,/# <<< clipd socket check/d' \
+       -e '/^  _clipd_sock=/d' \
+       -e 's|UNIX-CLIENT:"$_clipd_sock"|TCP4:127.0.0.1:8199|' \
+       -e '/command nc /s| -U | |' \
+       -e 's|"$_clipd_sock"|127.0.0.1 8199|' > clipd-tcp.sh &&
+     grep -q '^# <<< clipd <<<$' clipd-tcp.sh &&
+     ! grep -q '_clipd_sock' clipd-tcp.sh &&
+     sh -n clipd-tcp.sh &&
+     echo 'clipd-tcp.sh is ready.' ||
+     { echo 'Could not generate clipd-tcp.sh; see any error above.' >&2; rm -f clipd-tcp.sh; }
+   rm -f clipd-print.txt
    ```
+
+   The first `sed` keeps only the function. The second deletes the parts
+   marked `clipd socket check`, which only make sense for a socket file, and
+   points the three transfer commands at the port, keeping all their flags.
+   The checks after it stop if `setup` failed or the result is incomplete, so
+   use `clipd-tcp.sh` only after it says it is ready.
 
 2. Point the daemon at a loopback port and restart it:
 
@@ -222,10 +240,8 @@ Those are configured by hand. **Read the cost at the end before you do.**
      RemoteForward 8199 127.0.0.1:8199
    ```
 
-4. Paste the function into the remote's rc file with two edits: replace every
-   `nc -U "$_clipd_sock"` with `nc -N 127.0.0.1 8199` — drop the `-N` if the
-   remote is macOS — and delete the `[ ! -S "$_clipd_sock" ]` check, which has
-   no meaning for a port.
+4. Put the contents of `clipd-tcp.sh` into the remote's rc file, replacing
+   the block between the `# >>> clipd >>>` markers if setup had added one.
 
 **The cost.** A socket is protected by its `0600` mode inside a `0700`
 directory, so only you can write to it. A loopback port has no permissions at
@@ -328,12 +344,40 @@ as a file instead.
 
 ### Non-interactive commands
 
-Debian and its derivatives ship a `.bashrc` that returns early for
-non-interactive shells, and `clipd setup` appends below that line. So
-`ssh <host> 'clipd drop file'` reports `clipd: command not found` on those
-hosts, because the function is never defined. Use `ssh -t <host> 'clipd drop
-file'`, which allocates a terminal and makes the shell interactive, or move the
-clipd block above that early return.
+`ssh <host> 'clipd drop file'` runs your shell with `-c`, which is never
+interactive, even with `ssh -t`. Bash reads `.bashrc` for commands sent over
+SSH, but Debian's `.bashrc` returns early for non-interactive shells, and
+`clipd setup` appends below that line. So on Debian the function is never
+defined and you get `clipd: command not found`. zsh reads `.zshrc` only when
+interactive, so a zsh host behaves the same way.
+
+Ask for an interactive shell explicitly:
+
+```bash
+ssh debian 'bash -ic "clipd drop report.pdf"'
+ssh zsh-host 'zsh -ic "clipd drop report.pdf"'
+```
+
+A file name with spaces needs one more layer of quoting:
+
+```bash
+ssh debian "bash -ic 'clipd drop \"report final.pdf\"'"
+```
+
+What `-i` costs:
+
+- Without a terminal, bash prints `bash: no job control in this shell`. It is
+  harmless; add `ssh -t` if you would rather not see it.
+- Your whole interactive startup file runs, so anything it prints, waits for or
+  starts (a tmux session, another shell) happens first.
+- The command may be saved to your shell history, depending on your settings.
+- The zsh form assumes `$ZDOTDIR` is unset, since setup writes `~/.zshrc`.
+
+Use `ssh -t` only for commands you would type. It turns the remote stdin into a
+terminal, which can corrupt binary data piped through `ssh`.
+
+Alternatively, move the clipd block above the early return in `.bashrc`; then
+plain `ssh <host> 'clipd drop file'` works.
 
 ### After upgrading
 

@@ -65,8 +65,20 @@ published files are not bounded.
 **Sockets.** The Mac socket is mode `0600`. A custom socket path is checked for
 the immediate parent directory's mode bits only, not every ancestor, ownership
 or macOS ACLs. On the remote, the generated shell function removes
-`~/.clipd/socket` only after a ping to it fails with a refused connection (or
-fails silently, as macOS `nc` does) and returns no reply, and only if the file
-is still the same socket by inode. Re-running `clipd setup` applies the same
-check. Another session binding a new socket in that instant is a race within
-the user's own account, accepted under the boundary above.
+`~/.clipd/socket` only when a ping to it returns no reply and the client exits
+with status 1, and only if the file is still the same socket by inode. For
+OpenBSD `nc` and `socat` a diagnostic line must also end in `: Connection
+refused`; a path that merely contains "refused" does not count. macOS `nc`
+prints nothing, and exits 1 silently for some other failures before connecting
+too, so on a macOS remote a silent exit 1 is a heuristic for a stale socket
+rather than proof; a wrong guess removes a live forward and costs a reconnect. A
+timeout, a connection closed without a reply, or a signal never removes the
+socket. These exit statuses and messages were measured for macOS `nc`. For
+OpenBSD `nc` and `socat` they come from their source and documentation; the test
+suite exercises OpenBSD `nc` only when it runs on Linux with netcat-openbsd
+installed, and does not exercise `socat` unless it is installed. The ping's
+transport flags (`nc -w 5`, `socat -T 5 -t 5`) are five-second inactivity
+timeouts, not an absolute deadline: they end a connection that stays silent, not
+a connect that blocks or a peer that keeps sending. Re-running `clipd setup`
+applies the same check. Another session binding a new socket in that instant is
+a race within the user's own account, accepted under the boundary above.

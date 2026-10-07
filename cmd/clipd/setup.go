@@ -171,7 +171,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	}
 
 	fmt.Fprintf(e.stdout, "\n  remote shell   %s\n", facts.shell)
-	fmt.Fprintf(e.stdout, "  remote client  %s\n", client)
+	fmt.Fprintf(e.stdout, "  remote client  %s\n", client.send)
 	fmt.Fprintf(e.stdout, "  remote rc      %s\n", rcFile)
 	fmt.Fprintf(e.stdout, "  remote socket  %s\n", remoteSocket)
 	fmt.Fprintf(e.stdout, "  local socket   %s\n", localSocket)
@@ -388,6 +388,29 @@ func probe(ctx context.Context, destination, control string) (remoteFacts, error
 	return facts, nil
 }
 
+// transport is how the generated function reaches the socket.
+type transport struct {
+	// send carries a transfer, and waits up to a day for the Mac's reply.
+	send string
+
+	// probe is the stale-socket check, which gives up after probeSeconds of
+	// silence. That bounds a socket that accepts and never answers, such as
+	// one an unreachable earlier session still holds; it is an idle timeout,
+	// not an absolute deadline.
+	probe string
+
+	// silentRefusal marks macOS nc, which exits 1 without a message when a
+	// connection is refused. It also does so for some other failures before
+	// connecting, so for this client a silent exit 1 is a heuristic for a
+	// stale socket rather than proof of one.
+	silentRefusal bool
+}
+
+// probeSeconds is the stale-socket check's inactivity timeout (nc -w,
+// socat -T and -t). It ends a connection that stays silent; it is not an
+// absolute deadline for a connect that blocks or a peer that keeps sending.
+const probeSeconds = 5
+
 // clientCommand picks the command that writes to the socket, given what the
 // host actually has.
 //
@@ -395,7 +418,7 @@ func probe(ctx context.Context, destination, control string) (remoteFacts, error
 // back to socat because some netcat builds cannot speak UNIX sockets at all.
 // When neither can, the error says exactly which package fixes it rather than
 // leaving the user to decode "invalid option -- 'U'".
-func clientCommand(f remoteFacts) (string, error) {
+func clientCommand(f remoteFacts) (transport, error) {
 	switch {
 	case f.os == "Darwin" && f.hasNC && f.ncUnix:
 		// macOS ships its own netcat, where -N is not the half-close flag at
@@ -404,22 +427,32 @@ func clientCommand(f remoteFacts) (string, error) {
 		// timeout value". This netcat closes the socket on stdin EOF anyway,
 		// so the flag is not needed. Checked ahead of the -N cases because the
 		// flag is present here and means something else.
-		return `nc -U -w 86400 "$_clipd_sock"`, nil
+		return transport{
+			send:          `nc -U -w 86400 "$_clipd_sock"`,
+			probe:         fmt.Sprintf(`nc -U -w %d "$_clipd_sock"`, probeSeconds),
+			silentRefusal: true,
+		}, nil
 	case f.hasNC && f.ncUnix && f.ncShutdown:
-		return `nc -N -U -w 86400 "$_clipd_sock"`, nil
+		return transport{
+			send:  `nc -N -U -w 86400 "$_clipd_sock"`,
+			probe: fmt.Sprintf(`nc -N -U -w %d "$_clipd_sock"`, probeSeconds),
+		}, nil
 	case f.hasSocat:
-		return `socat -T 86400 -t 86400 - UNIX-CLIENT:"$_clipd_sock"`, nil
+		return transport{
+			send:  `socat -T 86400 -t 86400 - UNIX-CLIENT:"$_clipd_sock"`,
+			probe: fmt.Sprintf(`socat -T %d -t %d - UNIX-CLIENT:"$_clipd_sock"`, probeSeconds, probeSeconds),
+		}, nil
 	case f.hasNC && f.ncUnix:
 		// -U but no -N, on something that is not macOS: netcat-openbsd from
 		// before the flag existed. Without a half-close the daemon never sees
 		// the end of the message, so it never replies and the client waits out
 		// its deadline. socat is preferred above; reaching here means there is
 		// none.
-		return "", errors.New("the host's netcat cannot half-close a connection (no -N flag), so a copy would hang: install a newer netcat-openbsd, or socat")
+		return transport{}, errors.New("the host's netcat cannot half-close a connection (no -N flag), so a copy would hang: install a newer netcat-openbsd, or socat")
 	case f.hasNC:
-		return "", errors.New("the host's netcat has no -U flag, so it cannot use a UNIX socket: install netcat-openbsd (Debian/Ubuntu) or socat")
+		return transport{}, errors.New("the host's netcat has no -U flag, so it cannot use a UNIX socket: install netcat-openbsd (Debian/Ubuntu) or socat")
 	default:
-		return "", errors.New("the host has neither nc nor socat: install netcat-openbsd or socat")
+		return transport{}, errors.New("the host has neither nc nor socat: install netcat-openbsd or socat")
 	}
 }
 
@@ -443,24 +476,45 @@ func rcFileFor(f remoteFacts) string {
 // sshd does not unlink a forwarded socket when the session ends, and unless
 // the server sets StreamLocalBindUnlink it then refuses every later forward to
 // that path. A refused connection on a UNIX socket means nothing is bound to
-// it; OpenBSD nc and socat say so, macOS nc fails silently. Any reply or other
-// error leaves the socket alone. A live forward accepts even when the Mac
-// daemon is down, so it survives;
-// the ping keeps a live daemon from reading the probe as clipboard data. The
-// inode check narrows the window in which a new session could bind a fresh
+// it, and the socket is removed only when the probe shows exactly that: exit
+// status 1, no reply, and a diagnostic line ending in ": Connection refused",
+// the form OpenBSD nc and socat print. macOS nc prints nothing, so for it an
+// otherwise silent exit 1 is accepted as the heuristic described on
+// transport.silentRefusal. A timeout or a peer that closes without replying
+// exits 0 and a signal exits above 128, so a live forward survives even when
+// the Mac daemon is down.
+//
+// The probe's reply, diagnostics and status share one capture without being
+// confused: reply lines are prefixed, the status is a tagged line, and
+// anything else is the client's own stderr. The probe runs as an if condition
+// because setup's install script runs under set -e, which some shells carry
+// into command substitutions. The ping keeps a live daemon from
+// reading the probe as clipboard data. The inode check excludes a path that
+// vanished, and narrows the window in which a new session could bind a fresh
 // socket between the probe and the rm.
-func staleSocketScript(client string) string {
+func staleSocketScript(t transport) string {
+	refusal := `*": Connection refused"|*": Connection refused
+"*`
+	if t.silentRefusal {
+		refusal = `"clipd-probe-status:1:"|` + refusal
+	}
 	return `_clipd_stale=0
 if [ -S "$_clipd_sock" ] && [ ! -L "$_clipd_sock" ]; then
   _clipd_inode=$(command ls -di "$_clipd_sock" 2>/dev/null) || _clipd_inode=
-  if _clipd_err=$(command printf 'clipd:magic:v1\n{"type":"ping"}\n' | LC_ALL=C command ` + client + ` 2>&1); then :; else
-    case $_clipd_err in
-      (''|*[Rr]efused*)
-        if [ -n "$_clipd_inode" ] && [ "$(command ls -di "$_clipd_sock" 2>/dev/null)" = "$_clipd_inode" ] && command rm -f -- "$_clipd_sock"; then
-          _clipd_stale=1
-        fi ;;
-    esac
-  fi
+  _clipd_err=$( { {
+    if command printf 'clipd:magic:v1\n{"type":"ping"}\n' | LC_ALL=C command ` + t.probe + `; then _clipd_status=0; else _clipd_status=$?; fi
+    command printf 'clipd-probe-status:%s:\n' "$_clipd_status" >&2
+  } | command sed 's/^/clipd-probe-reply:/' >&2; } 2>&1 ) || :
+  case $_clipd_err in
+    (*clipd-probe-reply:*) ;;
+    (*clipd-probe-status:1:*)
+      case $_clipd_err in
+        (` + refusal + `)
+          if [ -n "$_clipd_inode" ] && [ "$(command ls -di "$_clipd_sock" 2>/dev/null)" = "$_clipd_inode" ] && command rm -f -- "$_clipd_sock"; then
+            _clipd_stale=1
+          fi ;;
+      esac ;;
+  esac
 fi
 `
 }
@@ -472,6 +526,13 @@ const staleSocketReport = `if [ "$_clipd_stale" = 1 ]; then
   return 1
 fi
 `
+
+// socketCheck marks a part of the generated function that exists only because
+// the transport is a UNIX socket. The manual loopback-TCP recipe in the README
+// deletes these regions by their markers, so they must stay self-contained.
+func socketCheck(script, prefix string) string {
+	return indent("# >>> clipd socket check\n"+script+"# <<< clipd socket check\n", prefix)
+}
 
 // indent prefixes every line of script.
 func indent(script, prefix string) string {
@@ -511,7 +572,7 @@ const shellReplyReader = `(
   fi
 )`
 
-func shellFunction(client, socket string, hasTar bool) string {
+func shellFunction(client transport, socket string, hasTar bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n", blockStart)
 	fmt.Fprintf(&b, "# Sends to the clipd daemon on the Mac, through the socket SSH forwards.\n")
@@ -542,11 +603,12 @@ func shellFunction(client, socket string, hasTar bool) string {
   [ ! -t 2 ] || _clipd_progress=true
 `)
 
-	fmt.Fprintf(&b, "  if [ ! -S \"$_clipd_sock\" ]; then\n")
-	fmt.Fprintf(&b, "    command printf 'clipd: %%s does not exist, so this SSH session has no clipd forward.\\n' \"$_clipd_sock\" >&2\n")
-	fmt.Fprintf(&b, "    command printf '       Log out and back in. If ssh warns \"remote port forwarding failed\", see Troubleshooting in the clipd README.\\n' >&2\n")
-	fmt.Fprintf(&b, "    return 1\n")
-	fmt.Fprintf(&b, "  fi\n")
+	b.WriteString(socketCheck(`if [ ! -S "$_clipd_sock" ]; then
+  command printf 'clipd: %s does not exist, so this SSH session has no clipd forward.\n' "$_clipd_sock" >&2
+  command printf '       Log out and back in. If ssh warns "remote port forwarding failed", see Troubleshooting in the clipd README.\n' >&2
+  return 1
+fi
+`, "  "))
 	// ${1:-} rather than $1, so that a shell running under `set -u` does not
 	// abort on a plain `printf x | clipd`, which passes no arguments at all.
 	fmt.Fprintf(&b, "  if [ \"${1:-}\" = \"drop\" ]; then\n")
@@ -581,7 +643,7 @@ func shellFunction(client, socket string, hasTar bool) string {
 		// The name lands inside a JSON string, so the two characters JSON
 		// escapes have to be escaped here. Everything else the daemon rejects.
 		fmt.Fprintf(&b, "      _clipd_esc=$(command printf '%%s' \"$_clipd_name\" | command sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g') || return 1\n")
-		fmt.Fprintf(&b, "      if _clipd_reply=$( { command printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\",\"progress\":%%s}\\n' \"$_clipd_esc\" \"$_clipd_progress\"; command cat; } | command %s | ", client)
+		fmt.Fprintf(&b, "      if _clipd_reply=$( { command printf 'clipd:magic:v1\\n{\"type\":\"drop\",\"name\":\"%%s\",\"progress\":%%s}\\n' \"$_clipd_esc\" \"$_clipd_progress\"; command cat; } | command %s | ", client.send)
 		b.WriteString(shellReplyReader)
 		b.WriteString(" ); then :; else _clipd_client=$?; fi\n")
 		fmt.Fprintf(&b, "    else\n")
@@ -596,7 +658,7 @@ func shellFunction(client, socket string, hasTar bool) string {
 			//
 			// The socket is checked before tar starts: once the transport is
 			// gone, tar's own write errors would bury the reason.
-			b.WriteString(indent(staleSocketScript(client)+staleSocketReport, "      "))
+			b.WriteString(socketCheck(staleSocketScript(client)+staleSocketReport, "      "))
 			b.WriteString(`      _clipd_reply=$(
         _clipd_first=1
         for _clipd_path in "$@"; do
@@ -624,7 +686,7 @@ func shellFunction(client, socket string, hasTar bool) string {
             [ "$?" -gt 128 ] || command printf 'clipd drop: tar failed; the drop was not completed\n' >&2
           fi
         } | `)
-			fmt.Fprintf(&b, "command %s | ", client)
+			fmt.Fprintf(&b, "command %s | ", client.send)
 			b.WriteString(shellReplyReader)
 			b.WriteString("\n      ) || _clipd_client=$?\n")
 		} else {
@@ -633,16 +695,16 @@ func shellFunction(client, socket string, hasTar bool) string {
 		fmt.Fprintf(&b, "    fi\n")
 	}
 	fmt.Fprintf(&b, "  else\n")
-	fmt.Fprintf(&b, "    if _clipd_reply=$(command %s | ", client)
+	fmt.Fprintf(&b, "    if _clipd_reply=$(command %s | ", client.send)
 	b.WriteString(shellReplyReader)
 	b.WriteString(" ); then :; else _clipd_client=$?; fi\n")
 	fmt.Fprintf(&b, "  fi\n")
 	// A transport failure with a refused connection is a socket sshd left
 	// behind; anything else is reported without touching the socket.
 	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ] || [ -z \"$_clipd_reply\" ]; then\n")
-	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ]; then\n")
-	b.WriteString(indent(staleSocketScript(client)+staleSocketReport, "      "))
-	fmt.Fprintf(&b, "    fi\n")
+	b.WriteString(socketCheck(`if [ "$_clipd_client" -ne 3 ]; then
+`+indent(staleSocketScript(client)+staleSocketReport, "  ")+`fi
+`, "    "))
 	fmt.Fprintf(&b, "    if [ -n \"$_clipd_reply\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
 	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ]; then\n")
 	fmt.Fprintf(&b, "      command printf 'clipd: the transfer did not complete; check clipd status on the Mac.\\n' >&2\n")
@@ -749,7 +811,7 @@ cat "$tmp" > "$rc"
 
 // installRemote writes the shell function into the host's rc file, and reports
 // whether it removed a socket an earlier session left behind.
-func installRemote(ctx context.Context, destination, control, rcFile, client, block string) (bool, error) {
+func installRemote(ctx context.Context, destination, control, rcFile string, client transport, block string) (bool, error) {
 	script := fmt.Sprintf(installScript, rcFile, staleSocketScript(client), strings.TrimRight(block, "\n"))
 	out, err := runRemote(ctx, destination, control, script)
 	if err != nil {
