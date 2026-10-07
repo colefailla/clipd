@@ -190,10 +190,14 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		return exitOK
 	}
 
-	if err := installRemote(ctx, destination, control, rcFile, block); err != nil {
+	removed, err := installRemote(ctx, destination, control, rcFile, client, block)
+	if err != nil {
 		return fail(e, exitFailure, err)
 	}
 	fmt.Fprintf(e.stdout, "\nInstalled the clipd function in %s on %s.\n", rcFile, destination)
+	if removed {
+		fmt.Fprintf(e.stdout, "Removed a socket an earlier SSH session left behind on %s.\n", destination)
+	}
 
 	sshPath, changed, err := installSSHConfig(ctx, destination, sshBlock)
 	if err != nil {
@@ -225,15 +229,17 @@ An existing SSH session will not have the forward. If you multiplex with
 ControlMaster, the old master has to go first, which is what the -O exit above
 is for.
 
-One-time step on %s, if you have not done it already (needs sudo):
+When an SSH session ends, sshd leaves the socket behind, and the next login's
+forward fails. clipd notices the next time you use it, removes the leftover,
+and asks you to log out and back in; re-running setup also clears it.
 
-  echo 'StreamLocalBindUnlink yes' | sudo tee /etc/ssh/sshd_config.d/clipd.conf
-  sudo systemctl reload ssh    # the service is "sshd" on some distributions
+Optional, only on a server you administer: let sshd replace the leftover itself,
+so this never comes up. Run once from this Mac (asks for sudo on %s):
 
-A connection that drops uncleanly (sleep, network change) leaves the remote
-socket behind. Without this setting, sshd refuses every later forward with
-"remote port forwarding failed" until the socket is removed by hand.
-`, destination, destination, destination, destination)
+  ssh -t %s "echo 'StreamLocalBindUnlink yes' | sudo tee /etc/ssh/sshd_config.d/clipd.conf && { sudo systemctl reload ssh || sudo systemctl reload sshd; }"
+
+It is a server-wide sshd setting. On a server someone else runs, leave it to them.
+`, destination, destination, destination, destination, destination)
 	return exitOK
 }
 
@@ -431,6 +437,47 @@ func rcFileFor(f remoteFacts) string {
 	}
 }
 
+// staleSocketScript renders shell that removes $_clipd_sock when sshd left it
+// behind, setting _clipd_stale=1 if it did.
+//
+// sshd does not unlink a forwarded socket when the session ends, and unless
+// the server sets StreamLocalBindUnlink it then refuses every later forward to
+// that path. A refused connection on a UNIX socket means nothing is bound to
+// it; OpenBSD nc and socat say so, macOS nc fails silently. Any reply or other
+// error leaves the socket alone. A live forward accepts even when the Mac
+// daemon is down, so it survives;
+// the ping keeps a live daemon from reading the probe as clipboard data. The
+// inode check narrows the window in which a new session could bind a fresh
+// socket between the probe and the rm.
+func staleSocketScript(client string) string {
+	return `_clipd_stale=0
+if [ -S "$_clipd_sock" ] && [ ! -L "$_clipd_sock" ]; then
+  _clipd_inode=$(command ls -di "$_clipd_sock" 2>/dev/null) || _clipd_inode=
+  if _clipd_err=$(command printf 'clipd:magic:v1\n{"type":"ping"}\n' | LC_ALL=C command ` + client + ` 2>&1); then :; else
+    case $_clipd_err in
+      (''|*[Rr]efused*)
+        if [ -n "$_clipd_inode" ] && [ "$(command ls -di "$_clipd_sock" 2>/dev/null)" = "$_clipd_inode" ] && command rm -f -- "$_clipd_sock"; then
+          _clipd_stale=1
+        fi ;;
+    esac
+  fi
+fi
+`
+}
+
+// staleSocketReport explains a socket staleSocketScript removed.
+const staleSocketReport = `if [ "$_clipd_stale" = 1 ]; then
+  command printf 'clipd: %s was left behind by an earlier SSH session, so this session has no clipd forward.\n' "$_clipd_sock" >&2
+  command printf '       Removed it. Log out and back in to reconnect.\n' >&2
+  return 1
+fi
+`
+
+// indent prefixes every line of script.
+func indent(script, prefix string) string {
+	return prefix + strings.ReplaceAll(strings.TrimSuffix(script, "\n"), "\n", "\n"+prefix) + "\n"
+}
+
 // shellFunction renders the client the remote host will run.
 //
 // It is a shell function rather than a binary because that is the whole point:
@@ -496,7 +543,8 @@ func shellFunction(client, socket string, hasTar bool) string {
 `)
 
 	fmt.Fprintf(&b, "  if [ ! -S \"$_clipd_sock\" ]; then\n")
-	fmt.Fprintf(&b, "    command printf 'clipd: %%s is missing; reconnect with the socket forward\\n' \"$_clipd_sock\" >&2\n")
+	fmt.Fprintf(&b, "    command printf 'clipd: %%s does not exist, so this SSH session has no clipd forward.\\n' \"$_clipd_sock\" >&2\n")
+	fmt.Fprintf(&b, "    command printf '       Log out and back in. If ssh warns \"remote port forwarding failed\", see Troubleshooting in the clipd README.\\n' >&2\n")
 	fmt.Fprintf(&b, "    return 1\n")
 	fmt.Fprintf(&b, "  fi\n")
 	// ${1:-} rather than $1, so that a shell running under `set -u` does not
@@ -545,6 +593,10 @@ func shellFunction(client, socket string, hasTar bool) string {
 			// Each operand is reduced to an absolute -C directory and a ./basename.
 			// Prefixing operands prevents option injection while allowing multiple
 			// tar -C directives (a global -- would turn those into filenames).
+			//
+			// The socket is checked before tar starts: once the transport is
+			// gone, tar's own write errors would bury the reason.
+			b.WriteString(indent(staleSocketScript(client)+staleSocketReport, "      "))
 			b.WriteString(`      _clipd_reply=$(
         _clipd_first=1
         for _clipd_path in "$@"; do
@@ -567,7 +619,9 @@ func shellFunction(client, socket string, hasTar bool) string {
           if COPYFILE_DISABLE=1 command tar cf - "$@"; then
             command printf 'clipd:complete:v2\n'
           else
-            command printf 'clipd drop: tar failed; the drop was not completed\n' >&2
+            # Above 128 is a signal, normally SIGPIPE from a transport that
+            # already failed; the transport failure is what gets reported.
+            [ "$?" -gt 128 ] || command printf 'clipd drop: tar failed; the drop was not completed\n' >&2
           fi
         } | `)
 			fmt.Fprintf(&b, "command %s | ", client)
@@ -583,17 +637,21 @@ func shellFunction(client, socket string, hasTar bool) string {
 	b.WriteString(shellReplyReader)
 	b.WriteString(" ); then :; else _clipd_client=$?; fi\n")
 	fmt.Fprintf(&b, "  fi\n")
+	// A transport failure with a refused connection is a socket sshd left
+	// behind; anything else is reported without touching the socket.
+	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ] || [ -z \"$_clipd_reply\" ]; then\n")
+	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ]; then\n")
+	b.WriteString(indent(staleSocketScript(client)+staleSocketReport, "      "))
+	fmt.Fprintf(&b, "    fi\n")
+	fmt.Fprintf(&b, "    if [ -n \"$_clipd_reply\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
+	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ]; then\n")
+	fmt.Fprintf(&b, "      command printf 'clipd: the transfer did not complete; check clipd status on the Mac.\\n' >&2\n")
+	fmt.Fprintf(&b, "    fi\n")
+	fmt.Fprintf(&b, "    return 1\n  fi\n")
 	// The daemon's reply is the whole user interface for the result, so it is
 	// printed whatever it says; the status prefix on it is what turns the
 	// result into an exit code.
-	fmt.Fprintf(&b, "  if [ -n \"$_clipd_reply\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
-	// Failure to answer is not proof that a socket is stale. Do not probe with
-	// an unbounded shell transport or recommend deleting an unidentified listener.
-	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ] || [ -z \"$_clipd_reply\" ]; then\n")
-	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ]; then\n")
-	fmt.Fprintf(&b, "      command printf 'clipd: transfer failed or no reply arrived; check clipd status on the Mac and the SSH forwarding warning.\\n' >&2\n")
-	fmt.Fprintf(&b, "    fi\n")
-	fmt.Fprintf(&b, "    return 1\n  fi\n")
+	fmt.Fprintf(&b, "  command printf '%%s\\n' \"$_clipd_reply\"\n")
 	fmt.Fprintf(&b, "  case $_clipd_reply in\n")
 	fmt.Fprintf(&b, "    'clipd: ok: '*) return 0 ;;\n")
 	fmt.Fprintf(&b, "    *) return 1 ;;\n")
@@ -637,6 +695,9 @@ mkdir -p "$HOME/.clipd"
 chmod 700 "$HOME/.clipd"
 # A socket directly in $HOME is clipd's own leftover, from before the directory.
 if [ -S "$HOME/.clipd.sock" ]; then rm -f "$HOME/.clipd.sock"; fi
+_clipd_sock="$HOME/.clipd/socket"
+%s
+[ "$_clipd_stale" = 0 ] || printf 'clipd-removed-stale-socket\n'
 
 # Made by hand rather than with mktemp, which is not in POSIX: clipd asks a host
 # for tar, a shell and one of nc or socat, and nothing else. This file is inside
@@ -686,13 +747,15 @@ touch "$rc"
 cat "$tmp" > "$rc"
 `
 
-// installRemote writes the shell function into the host's rc file.
-func installRemote(ctx context.Context, destination, control, rcFile, block string) error {
-	script := fmt.Sprintf(installScript, rcFile, strings.TrimRight(block, "\n"))
-	if _, err := runRemote(ctx, destination, control, script); err != nil {
-		return fmt.Errorf("install the clipd function on %s: %s", destination, err)
+// installRemote writes the shell function into the host's rc file, and reports
+// whether it removed a socket an earlier session left behind.
+func installRemote(ctx context.Context, destination, control, rcFile, client, block string) (bool, error) {
+	script := fmt.Sprintf(installScript, rcFile, staleSocketScript(client), strings.TrimRight(block, "\n"))
+	out, err := runRemote(ctx, destination, control, script)
+	if err != nil {
+		return false, fmt.Errorf("install the clipd function on %s: %s", destination, err)
 	}
-	return nil
+	return strings.Contains(out, "clipd-removed-stale-socket"), nil
 }
 
 // sshQuote renders a value as one quoted ssh_config argument.

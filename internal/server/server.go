@@ -26,6 +26,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/colefailla/clipd/internal/clipboard"
+	"github.com/colefailla/clipd/internal/config"
 	"github.com/colefailla/clipd/internal/drop"
 	"github.com/colefailla/clipd/internal/protocol"
 )
@@ -49,24 +50,23 @@ const (
 	// connections faster than it finishes them.
 	defaultMaxConnections = 64
 
-	// idleTimeout bounds how long a connection may go without producing a
-	// byte.
-	//
-	// It is an idle deadline rather than a total one because the two failure
-	// modes look nothing alike: a large paste over a slow link is legitimately
-	// slow but always progressing, while a peer that opens a socket and says
-	// nothing is holding a slot for free. Extending the deadline on every read
-	// distinguishes them without having to guess a transfer rate.
-	idleTimeout = 30 * time.Second
+	// writeTimeout bounds writing a reply to a peer that has stopped reading,
+	// and a clipboard helper that has wedged. Reads have no idle bound: a
+	// producer such as sort or a build can be silent for minutes and still
+	// finish, so silence is not evidence of failure.
+	writeTimeout = 30 * time.Second
 
-	// maxConnLifetime is the absolute cap on one connection, whatever the idle
-	// deadline says.
+	// maxConnLifetime is the default absolute cap on one connection.
 	//
 	// Generous, because a large drop over a slow link is legitimately slow:
-	// 256 MiB at a megabit takes most of half an hour. It exists for the case
-	// the idle deadline cannot see — a peer that stays just inside the idle
-	// window forever, holding a work slot for free while always "progressing".
+	// 256 MiB at a megabit takes most of half an hour. Together with the
+	// connection cap it bounds what a silent or dripping peer can hold.
 	maxConnLifetime = 30 * time.Minute
+
+	// replyReserve is the end of a connection's lifetime kept back from reading
+	// and work, so a transfer that runs out of time can still be told why
+	// without the lifetime itself being extended.
+	replyReserve = 5 * time.Second
 
 	// drainTimeout bounds the rejection drain, which has no reason to be slow:
 	// the sender is already transmitting, and the drain only exists to let the
@@ -404,29 +404,28 @@ func (s *Server) isClosed() bool {
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	hard := time.Now().Add(s.maxTransfer)
-	ctx, cancel := context.WithDeadline(ctx, hard)
+	readEnd := hard.Add(-min(replyReserve, s.maxTransfer/2))
+	ctx, cancel := context.WithDeadline(ctx, readEnd)
 	defer cancel()
 	conn = &lifetimeConn{Conn: conn, hard: hard}
 
-	// An idle deadline from the first byte, refreshed by the reader below on
-	// every successful read. A peer that connects and says nothing cannot hold
-	// a slot open; a peer that is genuinely sending can take as long as the
-	// data takes, up to that reader's absolute cap.
-	if err := conn.SetDeadline(time.Now().Add(min(idleTimeout, s.maxTransfer))); err != nil {
+	if err := conn.SetReadDeadline(readEnd); err != nil {
 		s.warnPeer("set deadline failed", "error", err)
 		return
 	}
-	idle := newIdleReader(conn)
-	idle.hard = hard
-	reader := bufio.NewReader(idle)
+	if err := conn.SetWriteDeadline(hard); err != nil {
+		s.warnPeer("set deadline failed", "error", err)
+		return
+	}
+	reader := bufio.NewReader(conn)
 
 	structured, err := protocol.Sniff(reader)
 	if err != nil {
 		if isTimeout(err) {
-			// A peer that blew its deadline gets no response: writing one
-			// would refresh the deadline and hand it another window, which is
-			// the slot-holding behaviour the deadline exists to prevent.
+			// lifetimeConn caps the reply at the same lifetime, so answering
+			// hands the peer no extra time.
 			s.warnPeer("connection timed out before a request arrived")
+			s.respondError(conn, s.lifetimeExceeded())
 			return
 		}
 		s.warnPeer("read failed", "error", err)
@@ -434,7 +433,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	}
 
 	if structured {
-		s.handleStructured(ctx, conn, idle, reader)
+		s.handleStructured(ctx, conn, reader)
 		return
 	}
 	// A raw stream is always work: it buffers a payload and forks pbcopy.
@@ -442,7 +441,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	defer func() { <-s.sem }()
-	s.handleClipboard(ctx, conn, idle, reader)
+	s.handleClipboard(ctx, conn, reader)
 }
 
 // acquire takes a work slot, or tells the peer why it could not.
@@ -452,7 +451,7 @@ func (s *Server) acquire(ctx context.Context, conn net.Conn) bool {
 		return true
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			s.respondError(conn, "transfer lifetime exceeded")
+			s.respondError(conn, s.lifetimeExceeded())
 		} else {
 			s.respondError(conn, "busy: shutting down")
 		}
@@ -465,7 +464,7 @@ func (s *Server) acquire(ctx context.Context, conn net.Conn) bool {
 //
 // This is the case that makes `nc` a complete client, so it must stay the
 // behaviour for any stream that does not explicitly ask for something else.
-func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, idle *idleReader, r io.Reader) {
+func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, r io.Reader) {
 	// One byte past the limit, so an oversized payload is detected rather than
 	// silently truncated onto the clipboard. There is no declared length to
 	// check first — the stream ends when the peer half-closes — so the cap has
@@ -475,6 +474,7 @@ func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, idle *idleR
 	if err != nil && !errors.Is(err, io.EOF) {
 		if isTimeout(err) {
 			s.warnPeer("connection timed out mid-payload")
+			s.respondError(conn, s.lifetimeExceeded())
 			return
 		}
 		s.warnPeer("payload read failed", "error", err)
@@ -482,13 +482,14 @@ func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, idle *idleR
 	}
 	if n > s.maxPayload {
 		s.warnPeer("payload rejected", "limit_bytes", s.maxPayload)
-		s.respondError(conn, fmt.Sprintf("payload exceeds the %d byte limit", s.maxPayload))
-		drainRejected(idle, r)
+		s.respondError(conn, fmt.Sprintf("input is larger than the %s clipboard limit; send it as a file with clipd drop --name <file>, or raise max_payload_bytes%s",
+			config.FormatSize(s.maxPayload), raiseLimit))
+		drainRejected(conn, r)
 		return
 	}
 
 	// Bound the clipboard write so a wedged helper cannot pin this handler.
-	writeCtx, cancel := context.WithTimeout(ctx, idleTimeout)
+	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 	if err := s.clip.Write(writeCtx, buf.Bytes()); err != nil {
 		s.warnPeer("clipboard write failed", "error", err)
@@ -506,11 +507,12 @@ func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, idle *idleR
 
 // handleStructured reads the JSON envelope after the magic prefix and
 // dispatches on its type.
-func (s *Server) handleStructured(ctx context.Context, conn net.Conn, idle *idleReader, r *bufio.Reader) {
+func (s *Server) handleStructured(ctx context.Context, conn net.Conn, r *bufio.Reader) {
 	req, err := protocol.ReadRequest(r)
 	if err != nil {
 		if isTimeout(err) {
 			s.warnPeer("connection timed out mid-frame")
+			s.respondError(conn, s.lifetimeExceeded())
 			return
 		}
 		s.warnPeer("malformed request", "error", err)
@@ -534,7 +536,7 @@ func (s *Server) handleStructured(ctx context.Context, conn net.Conn, idle *idle
 
 	switch req.Type {
 	case protocol.TypeDrop, protocol.TypeStreamDrop:
-		s.handleDrop(ctx, conn, idle, r, req)
+		s.handleDrop(ctx, conn, r, req)
 	default:
 		s.warnPeer("unknown request type", "type", req.Type)
 		s.respondError(conn, fmt.Sprintf("unknown request type %q", req.Type))
@@ -543,7 +545,7 @@ func (s *Server) handleStructured(ctx context.Context, conn net.Conn, idle *idle
 
 // handleDrop extracts the tar stream following the envelope into the drop
 // directory.
-func (s *Server) handleDrop(ctx context.Context, conn net.Conn, idle *idleReader, r io.Reader, req protocol.Request) {
+func (s *Server) handleDrop(ctx context.Context, conn net.Conn, r io.Reader, req protocol.Request) {
 	if s.dropDir == "" {
 		s.respondError(conn, "drop is not configured on this daemon")
 		return
@@ -620,15 +622,50 @@ func (s *Server) handleDrop(ctx context.Context, conn net.Conn, idle *idleReader
 		// lines. Error names are validated relative paths or bounded quoted names;
 		// payload contents never appear here.
 		s.warnPeer("drop rejected", "error", err)
-		s.respondError(conn, err.Error())
-		drainRejected(idle, r)
+		s.respondError(conn, s.dropFailure(err))
+		drainRejected(conn, r)
 		return
 	}
 	// Routine success is acknowledged to the sender. Keeping it at Debug avoids
 	// growing launchd's unrotated log by one line for every ordinary drop.
 	s.log.Debug("files dropped", "count", len(res.Names), "bytes", res.Bytes, "dir", s.dropDir)
-	s.respondOK(conn, fmt.Sprintf("dropped %s (%d bytes) into %s in %s",
-		dropSummary(res.Names), res.Bytes, s.dropDir, time.Since(started).Round(time.Millisecond)))
+	reply := fmt.Sprintf("dropped %s (%d bytes) into %s in %s",
+		dropSummary(res.Names), res.Bytes, s.dropDir, time.Since(started).Round(time.Millisecond))
+	switch {
+	case res.Skipped == 1:
+		reply += "; skipped 1 symlink or other special file"
+	case res.Skipped > 1:
+		reply += fmt.Sprintf("; skipped %d symlinks or other special files", res.Skipped)
+	}
+	s.respondOK(conn, reply)
+}
+
+// raiseLimit ends every reply about a configurable limit.
+const raiseLimit = " in the Mac's clipd config, then run clipd restart"
+
+// dropFailure names the setting to raise when a drop hits a configured limit.
+func (s *Server) dropFailure(err error) string {
+	switch {
+	case errors.Is(err, drop.ErrTooLarge):
+		return fmt.Sprintf("drop is larger than the %s limit; raise max_drop_bytes%s", config.FormatSize(s.maxDropBytes), raiseLimit)
+	case errors.Is(err, drop.ErrTooManyFiles):
+		return fmt.Sprintf("drop has more than %d files; raise max_drop_files%s", s.maxDropFiles, raiseLimit)
+	case isTimeout(err), errors.Is(err, context.DeadlineExceeded):
+		return s.lifetimeExceeded()
+	}
+	return err.Error()
+}
+
+// lifetimeExceeded names the setting behind a connection's time limit.
+func (s *Server) lifetimeExceeded() string {
+	limit := s.maxTransfer.String() // "30m0s", "1h0m0s", "1m30s"
+	if strings.HasSuffix(limit, "m0s") {
+		limit = strings.TrimSuffix(limit, "0s")
+	}
+	if strings.HasSuffix(limit, "h0m") {
+		limit = strings.TrimSuffix(limit, "0m")
+	}
+	return fmt.Sprintf("transfer took longer than the %s limit; raise max_transfer_seconds%s", limit, raiseLimit)
 }
 
 // dropSummary bounds replies independently of the configured file count.
@@ -656,12 +693,11 @@ func dropSummary(names []string) string {
 // still be lost. net/http makes the same trade at the same size, for the same
 // reason.
 //
-// Bounded in time as well as bytes. Every read refreshes the idle deadline, so
-// the byte cap alone says nothing about duration: a sender dripping one byte
-// just inside each idle window reaches 256 KiB in about eighty-eight days, and
-// holds a work slot for every one of them.
-func drainRejected(idle *idleReader, r io.Reader) {
-	idle.clamp(drainTimeout)
+// Bounded in time as well as bytes, so a sender dripping bytes cannot hold the
+// work slot for the rest of the connection's lifetime. lifetimeConn keeps the
+// drain deadline from outliving the connection.
+func drainRejected(conn net.Conn, r io.Reader) {
+	_ = conn.SetReadDeadline(time.Now().Add(drainTimeout))
 	_, _ = io.CopyN(io.Discard, r, drainCap)
 }
 
@@ -695,7 +731,7 @@ func (s *Server) respond(conn net.Conn, line string) {
 		}
 		line += "..."
 	}
-	if err := conn.SetWriteDeadline(time.Now().Add(idleTimeout)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		return
 	}
 	if _, err := fmt.Fprintf(conn, "%s\n", line); err != nil {
@@ -703,8 +739,8 @@ func (s *Server) respond(conn net.Conn, line string) {
 	}
 }
 
-// lifetimeConn prevents response/progress writes from extending a connection's
-// absolute lifetime when a peer stops reading. Read-idle refreshes obey it too.
+// lifetimeConn prevents any later deadline, for a reply, progress or a drain,
+// from extending a connection's absolute lifetime.
 type lifetimeConn struct {
 	net.Conn
 	hard time.Time
@@ -720,54 +756,6 @@ func (c *lifetimeConn) SetDeadline(t time.Time) error     { return c.Conn.SetDea
 func (c *lifetimeConn) SetReadDeadline(t time.Time) error { return c.Conn.SetReadDeadline(c.clamp(t)) }
 func (c *lifetimeConn) SetWriteDeadline(t time.Time) error {
 	return c.Conn.SetWriteDeadline(c.clamp(t))
-}
-
-// idleReader refreshes the connection deadline on every successful read, so
-// that the deadline bounds silence rather than total transfer time — and caps
-// the connection as a whole, so that "always progressing" is not the same as
-// "allowed to run forever".
-type idleReader struct {
-	conn net.Conn
-	r    io.Reader
-
-	// hard is the absolute end of this connection and is never extended, only
-	// brought forward. Refreshing on every read is the right answer for a slow
-	// but honest transfer and the wrong one for a peer that sends a byte just
-	// inside each window: that peer progresses for ever, and holds a work slot
-	// the whole time.
-	hard time.Time
-}
-
-func newIdleReader(conn net.Conn) *idleReader {
-	return &idleReader{conn: conn, r: conn, hard: time.Now().Add(maxConnLifetime)}
-}
-
-func (i *idleReader) Read(p []byte) (int, error) {
-	n, err := i.r.Read(p)
-	if n > 0 {
-		// Best effort: a failure to extend the deadline is not worth failing a
-		// read that already succeeded. The old deadline still applies, so the
-		// connection stays bounded either way.
-		_ = i.conn.SetReadDeadline(i.next(idleTimeout))
-	}
-	return n, err
-}
-
-// next returns the earlier of "d from now" and the connection's hard deadline.
-func (i *idleReader) next(d time.Duration) time.Time {
-	if t := time.Now().Add(d); t.Before(i.hard) {
-		return t
-	}
-	return i.hard
-}
-
-// clamp brings the hard deadline forward, for a phase of the connection that
-// should be over quickly whatever the idle timeout would otherwise allow.
-func (i *idleReader) clamp(d time.Duration) {
-	if t := time.Now().Add(d); t.Before(i.hard) {
-		i.hard = t
-	}
-	_ = i.conn.SetReadDeadline(i.hard)
 }
 
 // isTimeout reports whether err is a deadline expiry.

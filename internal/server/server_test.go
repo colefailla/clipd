@@ -213,8 +213,8 @@ func TestOversizedPayloadIsRejected(t *testing.T) {
 	if h.clip.WriteCount() != 0 {
 		t.Error("an oversized payload reached the clipboard")
 	}
-	if !strings.Contains(reply, "exceeds") {
-		t.Errorf("reply = %q, want it to mention the limit", reply)
+	if !strings.Contains(reply, "1 KiB") || !strings.Contains(reply, "max_payload_bytes") {
+		t.Errorf("reply = %q, want it to name the limit and its setting", reply)
 	}
 }
 
@@ -290,8 +290,13 @@ func TestDropRespectsLimits(t *testing.T) {
 		"big.bin": strings.Repeat("x", 500),
 	})))
 
-	if !strings.Contains(reply, "size limit") {
-		t.Errorf("reply = %q, want a size-limit message", reply)
+	if !strings.Contains(reply, "100 bytes") || !strings.Contains(reply, "max_drop_bytes") {
+		t.Errorf("reply = %q, want it to name the size limit and its setting", reply)
+	}
+
+	reply = h.send(dropRequest(tarOf(t, map[string]string{"a": "1", "b": "2", "c": "3"})))
+	if !strings.Contains(reply, "more than 2 files") || !strings.Contains(reply, "max_drop_files") {
+		t.Errorf("reply = %q, want it to name the file limit and its setting", reply)
 	}
 }
 
@@ -566,8 +571,8 @@ func TestRejectionSurvivesAnInFlightPayload(t *testing.T) {
 	if reply == "" {
 		t.Fatal("the rejection was lost")
 	}
-	if !strings.Contains(reply, "exceeds") {
-		t.Errorf("reply = %q, want it to mention the limit", reply)
+	if !strings.Contains(reply, "max_payload_bytes") {
+		t.Errorf("reply = %q, want it to name the limit's setting", reply)
 	}
 	if h.clip.WriteCount() != 0 {
 		t.Error("an oversized payload reached the clipboard")
@@ -663,5 +668,86 @@ func TestLifetimeBoundsPeerThatDoesNotReadProgress(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("timed out request left entries: %v, %v", entries, err)
+	}
+}
+
+// A producer such as sort or a build can be silent for longer than any idle
+// window before its first byte, and again between bytes. Neither is a failure.
+func TestSilentProducerIsNotCutOff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits past the former 30-second idle cutoff")
+	}
+	t.Parallel()
+	h := newHarness(t)
+	conn, err := net.DialTimeout("unix", h.socket, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	time.Sleep(31 * time.Second)
+	if _, err := conn.Write([]byte("sorted output")); err != nil {
+		t.Fatalf("write after silence: %v", err)
+	}
+	_ = conn.(*net.UnixConn).CloseWrite()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	reply, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if !strings.HasPrefix(string(reply), protocol.StatusOK) {
+		t.Fatalf("silent producer was cut off: %q", reply)
+	}
+	if got := string(h.clip.Data()); got != "sorted output" {
+		t.Fatalf("clipboard = %q", got)
+	}
+}
+
+func withMaxTransfer(d time.Duration) harnessOption { return func(o *Options) { o.MaxTransfer = d } }
+
+// A transfer that runs out of time is told why, inside the same lifetime:
+// reading stops replyReserve early rather than the reply extending it.
+func TestLifetimeExceededIsExplainedWithinTheLifetime(t *testing.T) {
+	t.Parallel()
+	const lifetime = 2 * time.Second
+	h := newHarness(t, withMaxTransfer(lifetime))
+	for name, first := range map[string][]byte{
+		"clipboard": []byte("partial clipboard"),
+		"drop":      []byte("clipd:magic:v1\n{\"type\":\"drop-stream-v2\"}\n"),
+		"silent":    nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn, err := net.DialTimeout("unix", h.socket, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			start := time.Now()
+			if _, err := conn.Write(first); err != nil {
+				t.Fatal(err)
+			}
+			// Never half-close: the sender is still "producing".
+			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			reply, _ := io.ReadAll(conn)
+			if elapsed := time.Since(start); elapsed > lifetime+time.Second {
+				t.Fatalf("connection outlived its lifetime: %v", elapsed)
+			}
+			if !strings.Contains(string(reply), "took longer than the 2s limit") || !strings.Contains(string(reply), "max_transfer_seconds") {
+				t.Fatalf("reply = %q", reply)
+			}
+		})
+	}
+}
+
+func TestLifetimeExceededFormatsTheLimit(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		10 * time.Second: "the 10s limit",
+		90 * time.Second: "the 1m30s limit",
+		30 * time.Minute: "the 30m limit",
+		time.Hour:        "the 1h limit",
+		90 * time.Minute: "the 1h30m limit",
+	} {
+		if got := (&Server{maxTransfer: d}).lifetimeExceeded(); !strings.Contains(got, want) {
+			t.Errorf("%v: %q, want %q", d, got, want)
+		}
 	}
 }

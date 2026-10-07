@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +59,9 @@ func TestGeneratedClientStreamsToRealReceiver(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if err := os.Symlink("/etc/passwd", filepath.Join(book, "link")); err != nil {
+				t.Fatal(err)
+			}
 			facts := remoteFacts{os: "Linux", hasNC: true, ncUnix: true, ncShutdown: true}
 			if runtime.GOOS == "darwin" {
 				facts.os = "Darwin"
@@ -73,6 +77,12 @@ func TestGeneratedClientStreamsToRealReceiver(t *testing.T) {
 			out, err := command.CombinedOutput()
 			if err != nil {
 				t.Fatalf("transfer failed: %v\n%s", err, out)
+			}
+			if !strings.Contains(string(out), "skipped 1 symlink or other special file") {
+				t.Fatalf("symlink skip not reported: %s", out)
+			}
+			if _, err := os.Lstat(filepath.Join(destination, "book title", "link")); !os.IsNotExist(err) {
+				t.Fatalf("symlink was recreated: %v", err)
 			}
 			for _, name := range []string{"book title/audio.m4b", "book title/nested/quote\".cue", "book title/--use-compress-program=bad", "audio.m4b", "book title-1/audio.m4b"} {
 				if _, err := os.Stat(filepath.Join(destination, name)); err != nil {
@@ -168,5 +178,115 @@ func TestClientRejectsAmbiguousReplies(t *testing.T) {
 		if err == nil {
 			t.Fatalf("accepted ambiguous reply %q: %s", reply, out)
 		}
+	}
+}
+
+// staleSocket leaves a socket file with nothing bound to it, as sshd does when
+// a session ends.
+func staleSocket(t *testing.T, path string) {
+	t.Helper()
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.SetUnlinkOnClose(false)
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientRemovesStaleSocket(t *testing.T) {
+	if _, err := exec.LookPath("nc"); err != nil {
+		t.Skip("nc unavailable")
+	}
+	facts := remoteFacts{os: "Linux", hasNC: true, ncUnix: true, ncShutdown: true}
+	if runtime.GOOS == "darwin" {
+		facts.os = "Darwin"
+	}
+	client, err := clientCommand(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, shell := range []string{"sh", "dash", "bash", "zsh"} {
+		t.Run(shell, func(t *testing.T) {
+			binary, err := exec.LookPath(shell)
+			if err != nil {
+				t.Skip("shell unavailable")
+			}
+			dir, err := os.MkdirTemp("", "clipd-stale-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			socket := filepath.Join(dir, "socket")
+			if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("body"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			block := shellFunction(client, socket, true)
+			for _, use := range []string{"printf hi | clipd", "clipd drop file.txt", "printf hi | clipd drop --name x.txt"} {
+				staleSocket(t, socket)
+				command := exec.Command(binary, "-c", "set -u\n"+block+"\n"+use+"\n")
+				command.Dir = dir
+				out, err := command.CombinedOutput()
+				if err == nil {
+					t.Fatalf("%s: succeeded against a stale socket: %s", use, out)
+				}
+				if !strings.Contains(string(out), "left behind by an earlier SSH session") {
+					t.Fatalf("%s: stale socket not explained: %s", use, out)
+				}
+				if strings.Contains(string(out), "tar failed") || strings.Contains(string(out), "did not complete") {
+					t.Fatalf("%s: misleading failure message: %s", use, out)
+				}
+				if _, err := os.Lstat(socket); !os.IsNotExist(err) {
+					t.Fatalf("%s: stale socket was not removed: %v", use, err)
+				}
+			}
+		})
+	}
+}
+
+// A forward whose Mac daemon is down accepts the connection and then closes
+// it. That socket belongs to a live session and must survive.
+func TestClientPreservesLiveSocketWithoutReply(t *testing.T) {
+	if _, err := exec.LookPath("nc"); err != nil {
+		t.Skip("nc unavailable")
+	}
+	facts := remoteFacts{os: "Linux", hasNC: true, ncUnix: true, ncShutdown: true}
+	if runtime.GOOS == "darwin" {
+		facts.os = "Darwin"
+	}
+	client, err := clientCommand(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("", "clipd-live-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "socket")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	out, err := exec.Command("sh", "-c", shellFunction(client, socket, true)+"\nprintf hi | clipd\n").CombinedOutput()
+	if err == nil {
+		t.Fatalf("succeeded without a reply: %s", out)
+	}
+	if !strings.Contains(string(out), "did not complete") || strings.Contains(string(out), "left behind") {
+		t.Fatalf("live socket failure misreported: %s", out)
+	}
+	if _, err := os.Lstat(socket); err != nil {
+		t.Fatalf("live socket was removed: %v", err)
 	}
 }

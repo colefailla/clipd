@@ -229,3 +229,58 @@ func TestLargeDropStreamsWithBoundedAllocations(t *testing.T) {
 		t.Fatalf("large file: %v, %v, result %+v", info, err, res)
 	}
 }
+
+// Special entries are skipped and counted, as rsync does without -l, rather
+// than refusing a folder that happens to contain a symlink. None of them may
+// create anything on the Mac.
+func TestStreamSkipsSpecialEntries(t *testing.T) {
+	dir := t.TempDir()
+	res, err := Extract(streamOf(t,
+		entry{name: "./project/", typeflag: tar.TypeDir},
+		entry{name: "./project/main.go", body: "package main"},
+		entry{name: "./project/escape", typeflag: tar.TypeSymlink, linkname: "/etc/passwd"},
+		entry{name: "./project/up", typeflag: tar.TypeSymlink, linkname: "../../outside"},
+		entry{name: "./project/copy.go", typeflag: tar.TypeLink, linkname: "./project/main.go"},
+		entry{name: "./project/pipe", typeflag: tar.TypeFifo},
+		entry{name: "./project/tty", typeflag: tar.TypeChar},
+	), Options{Dir: dir, Stream: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Skipped != 5 || len(res.Names) != 1 || res.Names[0] != "project" {
+		t.Fatalf("result %+v", res)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "project", "main.go")); err != nil || string(got) != "package main" {
+		t.Fatalf("main.go = %q, %v", got, err)
+	}
+	for _, name := range []string{"escape", "up", "copy.go", "pipe", "tty"} {
+		if _, err := os.Lstat(filepath.Join(dir, "project", name)); !os.IsNotExist(err) {
+			t.Fatalf("special entry %s was created: %v", name, err)
+		}
+	}
+}
+
+// A skipped entry's body would be discarded without counting against
+// MaxBytes, so one that declares a body is refused.
+func TestStreamRefusesSpecialEntryWithPayload(t *testing.T) {
+	// archive/tar will not write a body for a symlink, so write a regular
+	// file and patch its header into one.
+	raw, err := io.ReadAll(archiveOf(t, entry{name: "link", body: "data"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[156] = tar.TypeSymlink
+	copy(raw[148:156], "        ")
+	sum := 0
+	for _, b := range raw[:512] {
+		sum += int(b)
+	}
+	copy(raw[148:156], fmt.Sprintf("%06o\x00 ", sum))
+	buf := bytes.NewReader(raw)
+	dir := t.TempDir()
+	_, err = Extract(io.MultiReader(buf, strings.NewReader(Completion)), Options{Dir: dir, Stream: true})
+	if err == nil || !strings.Contains(err.Error(), "payload") {
+		t.Fatalf("special entry with a payload: %v", err)
+	}
+	assertDirEmpty(t, dir)
+}

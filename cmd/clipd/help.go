@@ -15,147 +15,100 @@ Options:
 
 	"setup": `clipd setup [options] <ssh-host>
 
-Run on the Mac. Probes a POSIX-shell remote and configures socket forwarding.
-The destination may be an SSH alias, hostname or IP; all use SSH UNIX sockets.
-Only the destination spelling supplied to setup receives the generated block.
+Run on the Mac. Connects to the host, checks which nc or socat it has, and
+writes two things:
 
-Files created or edited:
-  Mac: ~/.ssh/config gets a managed Host/Match block and RemoteForward.
-       config.clipd-backup preserves the first version before clipd's edits.
-  Remote: ~/.bashrc, ~/.zshrc or ~/.profile gets the generated shell function.
-          Its .clipd-backup preserves the first version before clipd's edits.
-          ~/.clipd is created/restricted to 0700; SSH binds socket inside it.
+  Remote: a clipd shell function in ~/.bashrc, ~/.zshrc or ~/.profile, and a
+          private ~/.clipd directory for the socket. No program is installed.
+  Mac:    a block in ~/.ssh/config that forwards the remote socket to the
+          daemon's socket.
 
-RemoteForward connects the remote socket to the Mac's daemon socket.
-StreamLocalBindMask requests a private socket; Host * resets config scope.
-No remote binary or service is installed. No daemon config file is created.
-Remote rc writes preserve inode/symlink metadata but are not crash-atomic.
-A backup is a recovery aid, not cross-machine rollback. Partial success is
-reported; re-running setup replaces managed blocks and is safe to retry.
+Both are between clipd markers, so re-running setup replaces them, leaving the
+rest of each file alone. The first run saves a .clipd-backup of each file.
+The host may be an SSH alias, hostname, IP or user@host; the block matches it
+exactly as typed, so set up each name you use.
+
+Reconnect afterwards for the forward to take effect.
+
+sshd leaves the remote socket behind when you log out, which makes the next
+login's forward fail. clipd removes the leftover the first time you use it and
+asks you to reconnect; re-running setup also clears it. On a server you run,
+setup prints a one-line sshd change that stops it happening at all.
 
 Options:
-  -print    show generated shell and SSH settings without editing those files
+  -print    show what would be written, without changing anything
 
-Reconnect afterward. Remove managed blocks to undo setup, retaining unrelated
-content. Backups are first versions, not current snapshots.
+To undo, delete the blocks between the clipd markers. See the README for
+details and troubleshooting.`,
 
-One-time step on the remote, needs root: add StreamLocalBindUnlink yes to its
-sshd config and reload sshd. Without it, a socket left by a dropped connection
-makes every later forward fail. See README Troubleshooting.`,
+	"drop": `clipd drop [--no-progress] <file-or-folder>...
+<command> | clipd drop --name <filename>
 
-	"drop": `clipd drop [--no-progress] <file-or-directory>...
-       <command> | clipd drop --name <filename>
+Run on the remote host. Sends files and folders to the Mac's ~/Drop.
 
-Run on the configured remote host. Sends files beneath the Mac's drop directory
-(default ~/Drop). Use clipd -h on the remote for a short command summary.
-
-  clipd drop report.pdf
-  clipd drop author/book
-  clipd drop author/book/*
+  clipd drop report.pdf                       ~/Drop/report.pdf
+  clipd drop photos                           ~/Drop/photos/, structure kept
+  clipd drop photos/*                         photos' contents, into ~/Drop
   journalctl -u nginx | clipd drop --name nginx.log
 
-Directories retain their structure. Wildcards are expanded by your shell;
-children land directly in Drop, normally excluding hidden files. Existing files
-and directories get numbered alternatives, never overwrites or directory merges.
-Conflicting paths within one request and special archive entries are rejected.
+Nothing is overwritten: a second report.pdf arrives as report-1.pdf. A drop is
+all or nothing, and the exit status is the Mac's answer, so
+clipd drop x && rm x only removes x once it has arrived. Symlinks and other
+special files are skipped, never followed, and the reply counts them.
 
-Archives stream without remote payload staging. The Mac publishes only after
-validation, a successful-producer completion marker and EOF. A failed transfer
-cleans up its private received files; originals are untouched. No retry or
-resume. Multi-name publication is not crash-atomic; cleanup errors are reported.
-A lost final reply can report failure after files were published; check Drop
-before retrying. The exit status is the daemon's answer, so clipd drop x && rm x
-remains safe.
-Upstream status in producer | clipd drop --name x is your shell's responsibility.
+Progress shows in a terminal; --no-progress hides it.
 
-Interactive progress shows percentage for the current file, bytes, speed,
-elapsed time and ETA on stderr. Unknown-size stdin shows bytes and time.
---no-progress hides it. Only the final clipd: ok: confirms publication.
+Default limits: 256 MiB and 256 files per drop, 30 minutes per transfer. An
+error names the limit you hit; see clipd help config on the Mac to raise it.
 
-Default limits: 256 MiB total, 256 files, 30-minute lifetime, 30-second idle.
-On the Mac, use clipd help config to adjust size/lifetime, then clipd restart.
-Upgrade the Mac binary before rerunning setup to update the remote function.
-Older functions remain supported with their original flattened/staged behavior.
-
-On Debian, noninteractive .bashrc commonly returns before the generated block.
-Use an interactive shell or put the block before that return.`,
+After updating clipd on the Mac, rerun clipd setup to update this function.
+On Debian, ssh host 'clipd ...' needs ssh -t: its .bashrc skips non-interactive
+shells before reaching the function.`,
 
 	"config": `clipd config file
 
-Location: $XDG_CONFIG_HOME/clipd/config.json, or ~/.config/clipd/config.json.
-Override with -config <path> or CLIPD_CONFIG. Built-in defaults work without a
-file. clipd install writes all supported settings, retaining configured values;
-clipd setup does not create this file. Pre-v3 config files are not migrated.
+~/.config/clipd/config.json ($XDG_CONFIG_HOME/clipd/config.json when set), or
+the path given by -config or CLIPD_CONFIG. Optional: every setting has a
+default. clipd install writes one with every setting filled in.
 
-Keys (sizes are numeric bytes, times are numeric seconds):
-  address                ~/.clipd.sock; UNIX path or manual loopback TCP address
-  drop_dir               ~/Drop; published files and directories
-  max_payload_bytes      10485760 (10 MiB); clipboard, 1 byte to 1 GiB
-  max_drop_bytes         268435456 (256 MiB); whole drop, maximum 1 TiB
-  max_drop_files         256; regular files per drop, maximum 65536
-  max_concurrent         8; work slots, maximum 64
-  max_transfer_seconds   1800 (30 minutes); lifetime, 1 to 86400 (24 hours)
+  address                ~/.clipd.sock   socket, or loopback host:port
+  drop_dir               ~/Drop          where drops land
+  max_payload_bytes      10485760        clipboard, 10 MiB; up to 1 GiB
+  max_drop_bytes         268435456       per drop, 256 MiB; up to 1 TiB
+  max_drop_files         256             per drop; up to 65536
+  max_concurrent         8               at once; up to 64
+  max_transfer_seconds   1800            per transfer, 30 min; up to 86400
 
-Omitted keys use defaults. Zero means default for numeric limits and lifetime,
-not unlimited. Negative values and unknown keys are rejected.
-Clipboard size times concurrency must fit a 2 GiB budget; buffer allocation may
-transiently exceed it. Each concurrent drop can stage up to its own disk limit.
-The fixed 30-second idle timeout remains active even with a longer lifetime.
+Sizes are bytes, times are seconds: 10 GiB = 10737418240, one hour = 3600.
+A missing setting or 0 means the default, never unlimited. Unknown settings
+are rejected. max_payload_bytes times max_concurrent must fit in 2 GiB.
 
-10 GiB = 10737418240; 100 GiB = 107374182400; one hour = 3600 seconds.
-After editing config.json, run clipd restart on the Mac. Settings are read only
-at startup. clipd status shows limits and flags edits since startup.
-Older binaries reject the new lifetime key; upgrade before adding it.`,
+The daemon reads this file only at startup: run clipd restart after editing.
+clipd status shows the limits in use and notices unapplied edits.
+Config files from before v3 are not migrated.`,
 
 	"security": `clipd security model
 
-clipd has no authentication and no encryption of its own, and that is the
-design rather than a gap in it.
+clipd has no authentication or encryption of its own, by design. The daemon
+listens on a UNIX socket only you can use. It reaches a remote host only through
+your SSH connection, which encrypts it, checks the host key and authenticates
+you. On the remote, the socket sits in your private ~/.clipd directory.
 
-The default listener is a private UNIX socket. The manual TCP fallback binds
-loopback only and is reachable by other local accounts. SSH supplies encrypted
-transport for forwarded traffic; filesystem permissions authorize UNIX access.
+So anything running as you on that host can write to your clipboard and send
+you files. Other accounts there cannot. Letting a remote machine write to your
+clipboard means trusting what runs there as you; anything able to abuse that
+already has your files on that machine.
 
-The socket reaches another machine only when you forward it over SSH. By the
-time bytes arrive, SSH has encrypted the channel, verified the host key
-against known_hosts, and authenticated you. The socket's 0600 permissions then
-decide who on that machine may write to it.
+What limits the damage: bracketed paste in modern shells stops pasted text from
+running before you press Enter; drops stay inside ~/Drop, never overwrite and
+never arrive executable; and sizes, file counts, connections and transfer time
+are all bounded.
 
-Adding a token here would duplicate a decision SSH has already made, and worse:
-a token stored on the remote machine is a stealable secret that works from
-anywhere until you rotate it, whereas the socket is an ephemeral capability
-that dies with the SSH session and cannot be copied off the box.
+The address setting also accepts a loopback host:port, for hosts whose SSH
+cannot forward a socket. Every account on a machine can reach loopback, so it is
+weaker than the socket; anything reachable from the network is refused.
 
-What this does mean:
-
-  Anything running as you on the remote host can write to your clipboard and
-  send you files. Other user accounts there cannot, because of the socket's
-  permissions, but your own processes can — including a build script or a
-  package install.
-
-That is inherent to letting a remote machine write to your clipboard at all.
-It also matters less than it sounds: anything positioned to abuse it already
-has your files, your history and your keystrokes on that machine.
-
-Two things reduce what it can do to you:
-
-  Bracketed paste, on by default in modern shells, means pasted text ending in
-  a newline is not executed until you press Enter.
-
-  Streaming drops validate relative paths and retain directories. Files never
-  overwrite, never arrive executable, and receive best-effort quarantine.
-  Legacy archive drops retain basename flattening. Hard-link publication and
-  quarantine use pathname APIs, so root-path confinement is not absolute.
-
-The 'address' setting also accepts a loopback host:port, for hosts whose SSH
-cannot forward a UNIX socket — OpenSSH gained that ability only in 6.7, and its
-Windows build still lacks it. That is a tunnel endpoint like the socket, not a
-network service: a reachable address is refused at startup rather than warned
-about, because nothing here authenticates and no warning makes that safe.
-
-What a port gives up against a socket is that any user on the machine can reach
-loopback, where a 0600 socket admits only its owner. Prefer the socket wherever
-SSH can forward one.`,
+SECURITY.md in the repository lists the exact guarantees and their exceptions.`,
 
 	"install": `clipd install
 

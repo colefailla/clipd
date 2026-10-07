@@ -665,7 +665,7 @@ func TestInstallScriptRejectsMalformedMarkersBeforeWriting(t *testing.T) {
 				t.Fatalf("seed rc file: %v", err)
 			}
 			newBlock := blockStart + "\nclipd() { :; }\n" + blockEnd
-			script := fmt.Sprintf(installScript, "$HOME/.profile", newBlock)
+			script := fmt.Sprintf(installScript, "$HOME/.profile", staleSocketScript(`nc -U "$_clipd_sock"`), newBlock)
 			cmd := exec.Command(sh, "-c", script)
 			cmd.Env = append(os.Environ(), "HOME="+home)
 			out, err := cmd.CombinedOutput()
@@ -687,6 +687,58 @@ func TestInstallScriptRejectsMalformedMarkersBeforeWriting(t *testing.T) {
 				t.Fatalf("install created a backup before validation: %v", err)
 			}
 		})
+	}
+}
+
+// TestInstallScriptRemovesOnlyAStaleSocket covers re-running setup as the fix
+// for a socket an earlier session left behind.
+func TestInstallScriptRemovesOnlyAStaleSocket(t *testing.T) {
+	if _, err := exec.LookPath("nc"); err != nil {
+		t.Skip("nc unavailable")
+	}
+	for _, live := range []bool{false, true} {
+		home, err := os.MkdirTemp("", "cdh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(home)
+		if err := os.Mkdir(filepath.Join(home, ".clipd"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		socket := filepath.Join(home, ".clipd", "socket")
+		if live {
+			ln, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			go func() {
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					conn.Close()
+				}
+			}()
+		} else {
+			staleSocket(t, socket)
+		}
+		script := fmt.Sprintf(installScript, "$HOME/.profile", staleSocketScript(`nc -U "$_clipd_sock"`), blockStart+"\nclipd() { :; }\n"+blockEnd)
+		cmd := exec.Command("sh", "-c", script)
+		cmd.Env = append(os.Environ(), "HOME="+home)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("live=%v: install failed: %v\n%s", live, err, out)
+		}
+		_, statErr := os.Lstat(socket)
+		removed := strings.Contains(string(out), "clipd-removed-stale-socket")
+		if live && (removed || statErr != nil) {
+			t.Fatalf("install removed a live socket: %s", out)
+		}
+		if !live && (!removed || !os.IsNotExist(statErr)) {
+			t.Fatalf("install kept a stale socket: %s, %v", out, statErr)
+		}
 	}
 }
 

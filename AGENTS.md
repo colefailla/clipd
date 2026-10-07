@@ -77,10 +77,13 @@ a change supported by a concrete need:
 Treat every connected peer and every byte it supplies as untrusted, including an
 SSH-authorized sender. Bounds must cover connections, concurrent work, buffered
 payloads and their concurrency product, archive entries/files/extracted bytes,
-total wire bytes, frame/reply/log size, idle time, absolute lifetime, and log
-rate. These are per-request or in-flight bounds; cumulative successfully
-published files are intentionally not bounded. Never log clipboard/file contents
-or unbounded peer-controlled strings.
+total wire bytes, frame/reply/log size, reply-write time, absolute lifetime, and
+log rate. These are per-request or in-flight bounds; cumulative successfully
+published files are intentionally not bounded. Reads deliberately have no idle
+timeout: the owner removed the 30-second cutoff because silent producers such
+as `sort | clipd` or a quiet build are legitimate. Silence is bounded by the
+absolute lifetime and the connection cap; do not reintroduce a read-idle cutoff.
+Never log clipboard/file contents or unbounded peer-controlled strings.
 
 Custom-socket claims must match the code. `requirePrivateSocketDir` currently
 checks only the immediate parent's Unix mode bits. It does not validate every
@@ -195,6 +198,12 @@ must not mutate the developer's live environment.
 - A socket at clipd's configured private path is removable only after bounded
   probing concludes nothing accepts it. Refuse and preserve live foreign
   listeners and every non-socket file.
+- The generated function and setup remove the remote `~/.clipd/socket` only
+  when a ping fails with a refused connection (or silently, as macOS `nc`
+  does), returns no reply, and the inode is unchanged. A live forward accepts
+  even when the Mac daemon is down and must survive. sshd never unlinks these
+  sockets itself unless the server sets `StreamLocalBindUnlink yes`, which is
+  optional advice for servers the user administers, never a setup requirement.
 - Keep literal loopback acceptance and empty/non-loopback refusal covered for
   IPv4 and IPv6.
 

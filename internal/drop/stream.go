@@ -131,8 +131,19 @@ func extractStream(r io.Reader, opts Options) (Result, error) {
 		if entries >= maxFiles*16 {
 			return fail(errors.New("drop: archive exceeds the entry limit"))
 		}
-		if h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeDir {
-			return fail(errors.New("drop: streaming archives accept only regular files and directories"))
+		switch h.Typeflag {
+		case tar.TypeReg, tar.TypeDir:
+		case tar.TypeSymlink, tar.TypeLink, tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+			// Never written: a symlink or device has no meaning on the Mac and
+			// could point outside the drop directory. A body here would be
+			// discarded unseen by MaxBytes, so one is refused.
+			if h.Size != 0 {
+				return fail(errors.New("drop: special archive entry has a payload"))
+			}
+			res.Skipped++
+			continue
+		default:
+			return fail(errors.New("drop: streaming archives accept only files, directories and links"))
 		}
 		if h.Typeflag == tar.TypeDir && h.Size != 0 {
 			return fail(errors.New("drop: directory has a payload"))
@@ -159,7 +170,7 @@ func extractStream(r io.Reader, opts Options) (Result, error) {
 			continue
 		}
 		if len(txn.files) >= maxFiles {
-			return fail(errors.New("drop: archive exceeds the file limit"))
+			return fail(ErrTooManyFiles)
 		}
 		source := io.Reader(tr)
 		if opts.Progress != nil {

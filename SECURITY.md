@@ -31,12 +31,42 @@ than escalations:
 What *is* in scope: anything that writes outside the drop directory, escapes
 the socket's permissions, or lets a peer consume unbounded daemon resources.
 
-See the README's security section, or `clipd help security`, for the full
-model.
+See the README's security section, or `clipd help security`, for the model in
+plain terms. The rest of this file is the precise version.
 
-Streaming drops validate relative paths, file types and resource limits before
-publication, and require a successful-producer completion marker. Legacy drops
-retain basename flattening and the documented entry-boundary truncation gap.
-Publication is not crash-atomic. Hard-link publication and quarantine use path
-APIs; opened-root confinement does not cover those operations absolutely.
-Custom socket validation checks only the immediate parent's mode bits.
+## Guarantees and known exceptions
+
+**Drops.** Streaming drops (current shell functions) write only regular files
+and directories. They validate every relative path and refuse the whole drop for
+an absolute path, `..`, control or bidirectional characters, or a collision
+within one request. Symlinks, hard links, devices and FIFOs are skipped, never
+created or followed, and counted in the reply; one that declares a body, or any
+other entry type, refuses the drop. Files are received into a
+private staging directory inside the drop directory and published only after
+the whole archive has parsed and the sender's completion marker, sent only after
+`tar` succeeded, has arrived. Published files are `0600`, directories `0700`,
+and existing names are never overwritten or merged. Legacy drops, from shell
+functions generated before streaming, flatten paths to basenames and keep Go's
+tar reader's entry-boundary truncation gap.
+
+Exceptions: publishing several names is not crash-atomic. Hard-link publication
+and the quarantine attribute use pathname APIs, so confinement to the opened
+drop root is not absolute for those two operations. Quarantine is best effort.
+
+**Resources.** Per-request bounds cover connections (64), concurrent work,
+buffered clipboard payloads and their product with concurrency (2 GiB), archive
+entries, files and bytes, frame and reply sizes, the absolute lifetime of a
+connection (`max_transfer_seconds`), reply writes and log rate. Reads have no
+separate idle timeout: a silent sender holds its connection until that lifetime
+ends, within the connection cap. Reading stops up to five seconds before the
+lifetime ends, so the reason can be written without extending it. Cumulative
+published files are not bounded.
+
+**Sockets.** The Mac socket is mode `0600`. A custom socket path is checked for
+the immediate parent directory's mode bits only, not every ancestor, ownership
+or macOS ACLs. On the remote, the generated shell function removes
+`~/.clipd/socket` only after a ping to it fails with a refused connection (or
+fails silently, as macOS `nc` does) and returns no reply, and only if the file
+is still the same socket by inode. Re-running `clipd setup` applies the same
+check. Another session binding a new socket in that instant is a race within
+the user's own account, accepted under the boundary above.

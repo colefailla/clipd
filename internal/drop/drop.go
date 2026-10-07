@@ -102,6 +102,10 @@ type Result struct {
 
 	// Bytes is the total written.
 	Bytes int64
+
+	// Skipped counts symlinks, hard links and other special entries that were
+	// left out rather than written, as rsync does without -l.
+	Skipped int
 }
 
 // Default limits, used when Options leaves them at zero.
@@ -113,6 +117,13 @@ const (
 // ErrNoFiles reports that the archive parsed correctly but contained nothing
 // this package is willing to write.
 var ErrNoFiles = errors.New("drop: the archive contained no regular files")
+
+// ErrTooLarge and ErrTooManyFiles report a drop over its configured limits, so
+// the daemon can name the setting to raise.
+var (
+	ErrTooLarge     = errors.New("drop: archive exceeds the size limit")
+	ErrTooManyFiles = errors.New("drop: archive exceeds the file limit")
+)
 
 // A transaction owns one private staging directory and the files accumulated
 // there. Paths are relative to the opened drop root, so os.Root keeps every
@@ -287,9 +298,8 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 	// maxFiles bounds what is written, which is not the same as what is read.
 	// Entries this package skips — directories, symlinks, devices — are never
 	// written and so never count against it, and an archive made entirely of
-	// them would stream forever: the reader keeps making progress, so the
-	// connection's idle deadline never fires, and the handler holds a
-	// concurrency slot for as long as the sender cares to keep writing.
+	// them would stream until the connection's lifetime ran out, with the
+	// handler holding a concurrency slot all the while.
 	//
 	// Generous relative to maxFiles, because a legitimate archive of a
 	// directory tree carries a directory header per level on top of its files.
@@ -356,6 +366,9 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 				return fail(fmt.Errorf("drop: archive entry %q is type %q and declares a %d byte body",
 					shortName(header.Name), rune(header.Typeflag), header.Size))
 			}
+			if header.Typeflag != tar.TypeDir {
+				res.Skipped++
+			}
 			continue
 		}
 
@@ -365,7 +378,7 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 		}
 
 		if len(txn.files) >= maxFiles {
-			return fail(fmt.Errorf("drop: archive holds more than %d files", maxFiles))
+			return fail(ErrTooManyFiles)
 		}
 
 		staged, n, err := stage(tr, root, txn.dir, len(txn.files), maxBytes-res.Bytes)
@@ -416,10 +429,9 @@ func Extract(r io.Reader, opts Options) (Result, error) {
 // archive/tar and never surfaces as an entry at all, so the entry counter never
 // advances and Next never returns; an entry whose type this package skips can
 // still declare a body the reader discards from the wire. Neither writes a
-// byte, so neither is caught by MaxBytes or MaxFiles, and every read refreshes
-// the connection's idle deadline — so both stream for as long as the sender
-// cares to keep going. This is the one bound that does not depend on the
-// archive's account of itself.
+// byte, so neither is caught by MaxBytes or MaxFiles, and both would stream
+// until the connection's lifetime ran out. This is the one bound that does not
+// depend on the archive's account of itself.
 type wireReader struct {
 	r         io.Reader
 	remaining int64
@@ -649,7 +661,7 @@ func isControl(r rune) bool {
 // including if a directory entry is replaced with a symlink on a shared path.
 func stage(r io.Reader, root *os.Root, txnDir string, index int, remaining int64) (path string, n int64, err error) {
 	if remaining < 0 {
-		return "", 0, errors.New("drop: archive exceeds the size limit")
+		return "", 0, ErrTooLarge
 	}
 
 	path = filepath.Join(txnDir, strconv.Itoa(index))
@@ -673,7 +685,7 @@ func stage(r io.Reader, root *os.Root, txnDir string, index int, remaining int64
 		return path, n, err
 	}
 	if n > remaining {
-		return path, n, errors.New("drop: archive exceeds the size limit")
+		return path, n, ErrTooLarge
 	}
 	// The file must be durable before a final name can point at its inode.
 	if err := f.Sync(); err != nil {
