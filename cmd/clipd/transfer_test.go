@@ -432,3 +432,88 @@ func TestStaleSocketProbeWithRealTransports(t *testing.T) {
 		}
 	}
 }
+
+// TestClipboardCopiesFileArguments: `clipd file ...` copies the files'
+// contents, and refuses before sending anything when one cannot be read, so a
+// failed copy never leaves a partial clipboard.
+func TestClipboardCopiesFileArguments(t *testing.T) {
+	if _, err := exec.LookPath("nc"); err != nil {
+		t.Skip("nc unavailable")
+	}
+	client := localTransport(t)
+	for _, shell := range []string{"sh", "dash", "bash", "zsh"} {
+		t.Run(shell, func(t *testing.T) {
+			binary, err := exec.LookPath(shell)
+			if err != nil {
+				t.Skip("shell unavailable")
+			}
+			dir, err := os.MkdirTemp("", "clipd-files-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			socket := filepath.Join(dir, "socket")
+			fake := &clipboard.Fake{}
+			srv, err := server.New(server.Options{Clipboard: fake, DropDir: filepath.Join(dir, "received"), MaxPayload: 1024, MaxTransfer: 10 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ln, err := server.Listen(socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- srv.Serve(ctx, ln) }()
+			defer func() {
+				cancel()
+				<-done
+			}()
+			for name, body := range map[string]string{"a.txt": "first\n", "b.txt": "second\n", "-dash.txt": "dash\n"} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Mkdir(filepath.Join(dir, "folder"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			block := shellFunction(client, socket, true)
+			run := func(command string) (string, error) {
+				t.Helper()
+				cmd := exec.Command(binary, "-c", "set -u\n"+block+"\n"+command+"\n")
+				cmd.Dir = dir
+				out, err := cmd.CombinedOutput()
+				return string(out), err
+			}
+			copies := map[string]string{
+				"clipd a.txt":          "first\n",
+				"clipd a.txt b.txt":    "first\nsecond\n",
+				"clipd -dash.txt":      "dash\n",
+				"clipd < b.txt":        "second\n",
+				"printf piped | clipd": "piped",
+			}
+			if shell == "bash" || shell == "zsh" {
+				copies["clipd <(printf substituted)"] = "substituted"
+			}
+			for command, want := range copies {
+				if out, err := run(command); err != nil || string(fake.Data()) != want {
+					t.Fatalf("%s: clipboard %q, want %q (%v)\n%s", command, fake.Data(), want, err, out)
+				}
+			}
+			for command, message := range map[string]string{
+				"clipd missing.txt":       "cannot read missing.txt",
+				"clipd folder":            "use clipd drop",
+				"clipd a.txt missing.txt": "cannot read missing.txt",
+			} {
+				before := fake.WriteCount()
+				out, err := run(command)
+				if err == nil || !strings.Contains(out, message) {
+					t.Fatalf("%s: err %v, output %q, want %q", command, err, out, message)
+				}
+				if fake.WriteCount() != before {
+					t.Fatalf("%s: a refused copy reached the clipboard", command)
+				}
+			}
+		})
+	}
+}

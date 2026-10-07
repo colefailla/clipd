@@ -194,6 +194,7 @@ The daemon runs on the Mac. 'clipd setup <host>' edits your SSH config and
 remote shell startup file; it installs no remote binary or service:
 
   ls -l | clipd            copy output to the Mac's clipboard
+  clipd notes.txt          copy a file's contents
   clipd drop report.pdf    send files to the Mac's ~/Drop
 
 Commands:

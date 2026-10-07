@@ -581,7 +581,7 @@ func shellFunction(client transport, socket string, hasTar bool) string {
 	fmt.Fprintf(&b, "  _clipd_reply=\n")
 	fmt.Fprintf(&b, "  _clipd_client=0\n")
 	b.WriteString(`  case ${1:-} in (-h|--help|help)
-    command printf '%s\n' 'Usage: command | clipd' '       clipd drop [--no-progress] file-or-directory ...' '       command | clipd drop --name filename' '' 'Drops go to the Mac configured by clipd setup. Directories retain their structure.' 'Interactive drops show progress; --no-progress hides it.' 'On the Mac: clipd status shows limits; clipd help config explains settings.' 'After editing the Mac config, run clipd restart.'
+    command printf '%s\n' 'Usage: command | clipd' '       clipd file ...' '       clipd drop [--no-progress] file-or-directory ...' '       command | clipd drop --name filename' '' 'Drops go to the Mac configured by clipd setup. Directories retain their structure.' 'Interactive drops show progress; --no-progress hides it.' 'On the Mac: clipd status shows limits; clipd help config explains settings.' 'After editing the Mac config, run clipd restart.'
     return 0 ;;
   esac
   _clipd_progress=false
@@ -679,6 +679,24 @@ fi
 		}
 		fmt.Fprintf(&b, "    fi\n")
 	}
+	// File arguments copy their contents, as `clipd < file` does. Each one is
+	// checked before connecting, because a raw copy has no completion marker:
+	// a cat that failed halfway would leave a truncated clipboard.
+	b.WriteString(`  elif [ "$#" -gt 0 ]; then
+    for _clipd_path in "$@"; do
+      if [ -d "$_clipd_path" ]; then
+        command printf 'clipd: %s is a directory; use clipd drop to send it\n' "$_clipd_path" >&2
+        return 64
+      fi
+      if [ ! -e "$_clipd_path" ] || [ ! -r "$_clipd_path" ]; then
+        command printf 'clipd: cannot read %s\n' "$_clipd_path" >&2
+        return 1
+      fi
+    done
+`)
+	fmt.Fprintf(&b, "    if _clipd_reply=$(command cat -- \"$@\" | command %s | ", client.send)
+	b.WriteString(shellReplyReader)
+	b.WriteString(" ); then :; else _clipd_client=$?; fi\n")
 	fmt.Fprintf(&b, "  else\n")
 	fmt.Fprintf(&b, "    if _clipd_reply=$(command %s | ", client.send)
 	b.WriteString(shellReplyReader)

@@ -206,7 +206,7 @@ On the remote host:
 
 ```bash
 ls -l | clipd                       # copy stdout
-clipd < notes.txt                   # copy a file's contents
+clipd notes.txt                     # copy a file's contents
 cat ~/.ssh/id_ed25519.pub | clipd   # grab a public key
 
 clipd drop report.pdf                        # send a file to ~/Drop
