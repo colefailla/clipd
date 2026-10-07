@@ -51,11 +51,13 @@ const MaxFrameBytes = 8 << 10
 
 // Request types.
 const (
-	// TypeDrop is a file transfer: the JSON line is followed by a tar stream
-	// on the same connection.
+	// TypeDrop with a Name is one file's raw bytes. Without a Name it was the
+	// original archive drop, which the daemon now refuses with instructions
+	// to rerun setup, since only outdated shell functions send it.
 	TypeDrop = "drop"
 
-	// TypeStreamDrop is a versioned body extension; legacy drop bodies stay unchanged.
+	// TypeStreamDrop is an archive drop: a tar stream followed by the
+	// completion marker, sent only after tar succeeded.
 	TypeStreamDrop = "drop-stream-v2"
 
 	// TypePing asks the listener to identify itself and does nothing else.
@@ -102,7 +104,7 @@ type Request struct {
 	// existed on disk. It is the sender's suggestion, not an instruction: the
 	// daemon reduces it to a bare filename before it becomes a path.
 	//
-	// Empty means the body is a tar stream and the names come from the archive.
+	// It is empty on a TypeStreamDrop, whose names come from the archive.
 	Name     string `json:"name,omitempty"`
 	Progress bool   `json:"progress,omitempty"`
 }

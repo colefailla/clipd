@@ -191,9 +191,9 @@ must not mutate the developer's live environment.
 ### Drops, protocol, and server
 
 - Treat every tar header, name, type, size, and body as attacker-controlled.
-  Legacy drops flatten paths to basenames. Streaming drops preserve validated
-  relative trees beneath newly reserved top-level names. Reject or safely handle absolute paths, `..`, both
-  separator styles, symlink/hardlink/device/FIFO entries, unsupported bodies,
+  Drops preserve validated relative trees beneath newly reserved top-level
+  names. Reject or safely handle absolute paths, `..`, both separator styles,
+  symlink/hardlink/device/FIFO entries, unsupported bodies,
   long/control/bidirectional names, collisions, and leading dashes.
 - Accept only regular-file payloads, keep received files mode `0600`, preserve
   file/entry/extracted/wire/collision limits, and do not rely only on tar's
@@ -222,13 +222,15 @@ must not mutate the developer's live environment.
   sockets itself unless the server sets `StreamLocalBindUnlink yes`, which is
   optional advice for servers the user administers, never a setup requirement.
 
-Legacy tar-integrity limitation: Go's tar reader accepts EOF at an entry
-boundary without proving end-of-archive blocks arrived. Legacy `drop` requests
-retain this behavior for compatibility. New `drop-stream-v2` requests require
-zero padding followed by the completion marker and EOF before publication;
-generated clients send that marker only after tar succeeds. The v1 envelope
-and raw/legacy body semantics remain unchanged. New clients talking to old
-daemons receive a structured-request rejection, never raw clipboard fallback.
+Archive drops use `drop-stream-v2`, which requires zero padding followed by
+the completion marker and EOF before publication; generated clients send that
+marker only after tar succeeds. That marker is what proves the archive arrived
+whole, since Go's tar reader accepts EOF at an entry boundary. A `drop` request
+carries one named file; a `drop` without a name is an archive from a shell
+function generated before streaming, and is refused with an instruction to
+rerun setup. The v1 envelope and raw clipboard semantics remain unchanged, and
+new clients talking to old daemons receive a structured-request rejection,
+never raw clipboard fallback.
 
 ### Config and LaunchAgent
 
@@ -247,8 +249,6 @@ daemons receive a structured-request rejection, never raw clipboard fallback.
 These are not protections to preserve or assume. Address them only when they are
 in scope, add regression coverage, and remove/update this list when fixed:
 
-- Legacy generated clients still pre-spool archives on remote disk and may
-  leave private payloads after SIGKILL or power loss; new clients stream instead.
 - Hard-link publication and quarantine use path-based operations because
   `os.Root` lacks those APIs; opened-root confinement is therefore not absolute.
 - Backup-path errors are not fully classified, and LaunchAgent rollback restores

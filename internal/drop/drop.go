@@ -1,10 +1,9 @@
-// Package drop receives legacy flat drops and versioned streaming directory
-// drops. Payloads are privately staged, bounded and validated before publication.
+// Package drop receives streaming directory drops and single named files.
+// Payloads are privately staged, bounded and validated before publication.
 // Files never overwrite existing names or inherit executable permissions.
 package drop
 
 import (
-	"archive/tar"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -83,7 +82,6 @@ type Options struct {
 	// Dir is the directory files are written into. It is created if missing.
 	Dir             string
 	Context         context.Context
-	Stream          bool
 	Progress        func(string, int64, int64)
 	PublishProgress func(int, int)
 
@@ -270,156 +268,6 @@ func rollback(root *os.Root, stageDir string, published []publishedFile, cause e
 		return fmt.Errorf("%w (cleanup also failed: %v)", cause, errors.Join(cleanup...))
 	}
 	return cause
-}
-
-// Extract reads a tar stream from r and writes its regular files into
-// opts.Dir.
-//
-// It is deliberately lossy. Directory structure, ownership, modes, symlinks
-// and every other archive feature are discarded; what survives is the file's
-// basename and its contents. On any error, files already written by this call
-// are removed, so a rejected drop leaves nothing behind to be mistaken for a
-// complete one.
-func Extract(r io.Reader, opts Options) (Result, error) {
-	if opts.Stream {
-		return extractStream(r, opts)
-	}
-	if opts.Dir == "" {
-		return Result{}, errors.New("drop: no destination directory")
-	}
-	maxBytes := opts.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = DefaultMaxBytes
-	}
-	maxFiles := opts.MaxFiles
-	if maxFiles <= 0 {
-		maxFiles = DefaultMaxFiles
-	}
-	// maxFiles bounds what is written, which is not the same as what is read.
-	// Entries this package skips — directories, symlinks, devices — are never
-	// written and so never count against it, and an archive made entirely of
-	// them would stream until the connection's lifetime ran out, with the
-	// handler holding a concurrency slot all the while.
-	//
-	// Generous relative to maxFiles, because a legitimate archive of a
-	// directory tree carries a directory header per level on top of its files.
-	maxEntries := maxFiles * 16
-
-	if err := os.MkdirAll(opts.Dir, dirPerm); err != nil {
-		return Result{}, fmt.Errorf("drop: create %s: %w", opts.Dir, err)
-	}
-	root, err := os.OpenRoot(opts.Dir)
-	if err != nil {
-		return Result{}, fmt.Errorf("drop: open destination %s: %w", opts.Dir, err)
-	}
-	defer root.Close()
-
-	txn, err := beginTransaction(root)
-	if err != nil {
-		return Result{}, err
-	}
-	var published []publishedFile
-	// No final name is created until the complete archive has parsed. If
-	// publishing or cleanup then fails, remove every final name this request
-	// created as well as its private staging directory.
-	fail := func(cause error) (Result, error) {
-		return Result{}, rollback(root, txn.dir, published, cause)
-	}
-
-	var res Result
-
-	// The wire budget is the file bytes the caller allows, plus framing for the
-	// most entries the archive may hold. Both terms are bounded by config
-	// validation, so the sum cannot overflow.
-	budget := maxBytes + int64(maxEntries)*wirePerEntry
-	wire := &wireReader{r: r, remaining: budget}
-
-	tr := tar.NewReader(wire)
-	entries := 0
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return fail(readError(err, budget))
-		}
-		// Counted after the header arrives rather than before it, so an archive
-		// holding exactly maxEntries is accepted rather than refused one short.
-		entries++
-		if entries > maxEntries {
-			return fail(fmt.Errorf("drop: archive holds more than %d entries", maxEntries))
-		}
-
-		// Only regular files. Everything else a tar can describe — symlinks,
-		// hard links, directories, character and block devices, FIFOs — is
-		// either a way to write outside Dir or a way to create something the
-		// sender has no business creating on this machine.
-		if header.Typeflag != tar.TypeReg {
-			// Skipping is not the same as ignoring. archive/tar discards a
-			// skipped entry's declared body from the wire on the next call, so
-			// an entry of an unsupported type that claims a huge size is a way
-			// to send unbounded data that never counts against MaxBytes,
-			// because none of it reaches disk. The wire budget above stops it
-			// eventually; refusing it here says why.
-			if header.Size > 0 {
-				return fail(fmt.Errorf("drop: archive entry %q is type %q and declares a %d byte body",
-					shortName(header.Name), rune(header.Typeflag), header.Size))
-			}
-			if header.Typeflag != tar.TypeDir {
-				res.Skipped++
-			}
-			continue
-		}
-
-		name, err := safeName(header.Name)
-		if err != nil {
-			return fail(err)
-		}
-
-		if len(txn.files) >= maxFiles {
-			return fail(ErrTooManyFiles)
-		}
-
-		staged, n, err := stage(tr, root, txn.dir, len(txn.files), maxBytes-res.Bytes)
-		if err != nil {
-			return fail(readError(err, budget))
-		}
-		txn.files = append(txn.files, stagedFile{path: staged, name: name})
-		res.Bytes += n
-	}
-
-	if len(txn.files) == 0 {
-		return fail(ErrNoFiles)
-	}
-
-	// Publication begins only after Next returned EOF for the whole archive.
-	// A corrupt or truncated later entry therefore cannot expose the valid
-	// prefix as though it were the complete drop.
-	for _, file := range txn.files {
-		// Marked before it is published, so the attribute is already on the
-		// inode by the time the file has a name a user could open.
-		if err := requestContext(opts).Err(); err != nil {
-			return fail(err)
-		}
-		if err := verifyRootPath(root); err != nil {
-			return fail(err)
-		}
-		quarantine(requestContext(opts), filepath.Join(opts.Dir, file.path))
-		if err := requestContext(opts).Err(); err != nil {
-			return fail(err)
-		}
-		name, err := publish(root, file.path, file.name)
-		if err != nil {
-			return fail(err)
-		}
-		published = append(published, publishedFile{staged: file.path, name: name})
-		res.Names = append(res.Names, name)
-	}
-	if err := removeTransaction(root, txn.dir); err != nil {
-		return fail(fmt.Errorf("drop: remove completed staging directory: %w", err))
-	}
-	return res, nil
 }
 
 // wireReader bounds the total bytes read from a peer for one archive.

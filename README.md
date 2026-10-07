@@ -334,9 +334,9 @@ plain `ssh <host> 'clipd drop file'` works.
 After updating clipd on the Mac, rerun `clipd setup <host>` for each host to
 update its shell function. Update the Mac first: a new function needs a new
 daemon, and an old daemon refuses its requests with an error rather than
-mistaking them for clipboard text. Hosts you have not rerun setup on keep
-working with their older function, which flattens folders into loose files and
-copies the whole archive to the remote disk before sending.
+mistaking them for clipboard text. On a host you have not rerun setup on,
+copying still works, but sending files or folders stops with an error telling
+you to rerun `clipd setup` for that host.
 
 ## Security
 

@@ -71,10 +71,14 @@ type ownedDir struct {
 	info os.FileInfo
 }
 
-// extractStream keeps payloads in the same flat, marker-owned staging shape as
-// legacy drops. Directories are reserved only after the full stream validates.
-// Existing destination trees are never merged into or overwritten.
-func extractStream(r io.Reader, opts Options) (Result, error) {
+// Extract reads a tar stream from r, followed by the sender's completion
+// marker, and publishes its regular files and directories beneath opts.Dir.
+//
+// Payloads are staged in a private, marker-owned directory and nothing gets a
+// final name until the whole stream has validated, so a rejected or truncated
+// drop leaves nothing behind. Existing destination trees are never merged into
+// or overwritten. Symlinks, hard links and devices are skipped and counted.
+func Extract(r io.Reader, opts Options) (Result, error) {
 	maxBytes, maxFiles := opts.MaxBytes, opts.MaxFiles
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxBytes
@@ -113,7 +117,11 @@ func extractStream(r io.Reader, opts Options) (Result, error) {
 		}
 		return Result{}, cause
 	}
-	wire := &wireReader{r: r, remaining: maxBytes + int64(maxFiles*16)*wirePerEntry}
+	// The wire budget is the file bytes allowed plus framing for the most
+	// entries the archive may hold. Both terms are bounded by config
+	// validation, so the sum cannot overflow.
+	budget := maxBytes + int64(maxFiles*16)*wirePerEntry
+	wire := &wireReader{r: r, remaining: budget}
 	tr := tar.NewReader(wire)
 	paths := make(map[string]bool) // true means directory
 	var res Result
@@ -126,7 +134,7 @@ func extractStream(r io.Reader, opts Options) (Result, error) {
 			break
 		}
 		if err != nil {
-			return fail(err)
+			return fail(readError(err, budget))
 		}
 		if entries >= maxFiles*16 {
 			return fail(errors.New("drop: archive exceeds the entry limit"))
@@ -177,6 +185,9 @@ func extractStream(r io.Reader, opts Options) (Result, error) {
 			source = &fileProgress{r: tr, name: name, size: h.Size, report: opts.Progress}
 		}
 		staged, n, err := stage(source, root, txn.dir, len(txn.files), maxBytes-res.Bytes)
+		if errors.Is(err, errWireLimit) {
+			err = readError(err, budget)
+		}
 		if err != nil {
 			return fail(err)
 		}

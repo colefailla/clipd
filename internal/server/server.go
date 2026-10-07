@@ -553,7 +553,6 @@ func (s *Server) handleDrop(ctx context.Context, conn net.Conn, r io.Reader, req
 	opts := drop.Options{
 		Dir:      s.dropDir,
 		Context:  ctx,
-		Stream:   req.Type == protocol.TypeStreamDrop,
 		MaxBytes: s.maxDropBytes,
 		MaxFiles: s.maxDropFiles,
 	}
@@ -598,22 +597,30 @@ func (s *Server) handleDrop(ctx context.Context, conn net.Conn, r io.Reader, req
 			}
 		}
 	}
-	// A name means the body is one file's bytes, sent by a pipeline that had
-	// no file to hand to tar. Without one the body is an archive and the names
-	// come from inside it. Exactly one of these may run: both read the same
-	// stream to its end.
+	// A named drop is one file's bytes, sent by a pipeline that had no file to
+	// hand to tar. A streaming drop is an archive whose names come from inside
+	// it. Exactly one of these may run: both read the same stream to its end.
 	var (
 		res drop.Result
 		err error
 	)
-	if req.Name != "" {
-		if opts.Stream {
-			s.respondError(conn, "streaming named input is not supported")
-			return
-		}
+	switch {
+	case req.Type == protocol.TypeDrop && req.Name != "":
 		res, err = drop.Save(r, req.Name, opts)
-	} else {
+	case req.Type == protocol.TypeStreamDrop && req.Name == "":
 		res, err = drop.Extract(r, opts)
+	case req.Type == protocol.TypeDrop:
+		// An archive under the original drop type comes from a shell function
+		// generated before streaming drops. Its format is no longer accepted,
+		// so the sender is told how to update rather than having its archive
+		// read as something else.
+		s.warnPeer("drop rejected", "reason", "archive drop from an outdated clipd function")
+		s.respondError(conn, "this host's clipd function is out of date; on the Mac, run clipd setup for this host")
+		drainRejected(conn, r)
+		return
+	default:
+		s.respondError(conn, "streaming named input is not supported")
+		return
 	}
 	if err != nil {
 		// Warn rather than Error: every one of these is caused by what a peer

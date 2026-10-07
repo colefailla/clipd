@@ -26,7 +26,7 @@ func TestStreamPreservesDirectoriesAndRenamesWholeTree(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "book", "old"), []byte("old"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Extract(streamOf(t, entry{name: "./book/chapter/a.mp3", body: "audio"}, entry{name: "./book/info.cue", body: "cue"}), Options{Dir: dir, Stream: true})
+	res, err := Extract(streamOf(t, entry{name: "./book/chapter/a.mp3", body: "audio"}, entry{name: "./book/info.cue", body: "cue"}), Options{Dir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestStreamRefusesIncompleteArchivesBeforePublication(t *testing.T) {
 	for _, length := range []int{0, 512, 1024, len(complete) - 1024, len(complete)} {
 		t.Run(fmt.Sprint(length), func(t *testing.T) {
 			dir := t.TempDir()
-			if _, err := Extract(bytes.NewReader(complete[:length]), Options{Dir: dir, Stream: true}); err == nil {
+			if _, err := Extract(bytes.NewReader(complete[:length]), Options{Dir: dir}); err == nil {
 				t.Fatal("accepted missing trailer")
 			}
 			assertDirEmpty(t, dir)
@@ -57,7 +57,7 @@ func TestStreamRefusesIncompleteArchivesBeforePublication(t *testing.T) {
 	}
 	for _, suffix := range []string{Completion + "extra", "clipd:complete:v", "not-complete\n"} {
 		dir := t.TempDir()
-		if _, err := Extract(io.MultiReader(bytes.NewReader(complete), strings.NewReader(suffix)), Options{Dir: dir, Stream: true}); err == nil {
+		if _, err := Extract(io.MultiReader(bytes.NewReader(complete), strings.NewReader(suffix)), Options{Dir: dir}); err == nil {
 			t.Fatal("accepted invalid trailer")
 		}
 		assertDirEmpty(t, dir)
@@ -68,7 +68,7 @@ func TestStreamRejectsHostileAndConflictingPaths(t *testing.T) {
 	for _, name := range []string{"../outside", "/absolute", "a/../outside", `a\outside`, "a/./b", "a\n/b", strings.Repeat("x/", 33) + "b", stageDirPrefix + "user/file"} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			if _, err := Extract(streamOf(t, entry{name: name, body: "x"}), Options{Dir: dir, Stream: true}); err == nil {
+			if _, err := Extract(streamOf(t, entry{name: name, body: "x"}), Options{Dir: dir}); err == nil {
 				t.Fatal("accepted unsafe path")
 			}
 			assertDirEmpty(t, dir)
@@ -76,7 +76,7 @@ func TestStreamRejectsHostileAndConflictingPaths(t *testing.T) {
 	}
 	for _, entries := range [][]entry{{{name: "a", body: "x"}, {name: "a", body: "y"}}, {{name: "a/b", body: "x"}, {name: "a", body: "y"}}, {{name: "a", body: "x"}, {name: "a/b", body: "y"}}} {
 		dir := t.TempDir()
-		if _, err := Extract(streamOf(t, entries...), Options{Dir: dir, Stream: true}); err == nil {
+		if _, err := Extract(streamOf(t, entries...), Options{Dir: dir}); err == nil {
 			t.Fatal("accepted conflicting paths")
 		}
 		assertDirEmpty(t, dir)
@@ -85,13 +85,13 @@ func TestStreamRejectsHostileAndConflictingPaths(t *testing.T) {
 
 func TestStreamSizeLimitsAndCancelledPublication(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := Extract(streamOf(t, entry{name: "book/a", body: "123"}, entry{name: "book/b", body: "456"}), Options{Dir: dir, Stream: true, MaxBytes: 5}); err == nil {
+	if _, err := Extract(streamOf(t, entry{name: "book/a", body: "123"}, entry{name: "book/b", body: "456"}), Options{Dir: dir, MaxBytes: 5}); err == nil {
 		t.Fatal("accepted oversized stream")
 	}
 	assertDirEmpty(t, dir)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := Extract(streamOf(t, entry{name: "book/a", body: "123"}), Options{Dir: dir, Stream: true, Context: ctx}); err == nil {
+	if _, err := Extract(streamOf(t, entry{name: "book/a", body: "123"}), Options{Dir: dir, Context: ctx}); err == nil {
 		t.Fatal("accepted cancelled stream")
 	}
 	assertDirEmpty(t, dir)
@@ -131,7 +131,7 @@ func TestStreamPublicationFailureRollsBackFilesAndDirectories(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_, err := Extract(streamOf(t, entry{name: "book/a", body: "first"}, entry{name: "taken.txt", body: "second"}), Options{Dir: dir, Stream: true})
+	_, err := Extract(streamOf(t, entry{name: "book/a", body: "first"}, entry{name: "taken.txt", body: "second"}), Options{Dir: dir})
 	if err == nil {
 		t.Fatal("accepted exhausted collision names")
 	}
@@ -181,7 +181,7 @@ func TestStreamRefusesReplacedRootBeforePathPublication(t *testing.T) {
 			t.Fatal(err)
 		}
 	}}
-	if _, err := Extract(reader, Options{Dir: dir, Stream: true}); err == nil {
+	if _, err := Extract(reader, Options{Dir: dir}); err == nil {
 		t.Fatal("published after drop root replacement")
 	}
 	assertDirEmpty(t, foreign)
@@ -214,7 +214,7 @@ func TestLargeDropStreamsWithBoundedAllocations(t *testing.T) {
 	}()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	res, err := Extract(reader, Options{Dir: dir, Stream: true, MaxBytes: 512 << 20})
+	res, err := Extract(reader, Options{Dir: dir, MaxBytes: 512 << 20})
 	_ = reader.Close()
 	producerErr := <-produced
 	if err != nil || producerErr != nil {
@@ -243,7 +243,7 @@ func TestStreamSkipsSpecialEntries(t *testing.T) {
 		entry{name: "./project/copy.go", typeflag: tar.TypeLink, linkname: "./project/main.go"},
 		entry{name: "./project/pipe", typeflag: tar.TypeFifo},
 		entry{name: "./project/tty", typeflag: tar.TypeChar},
-	), Options{Dir: dir, Stream: true})
+	), Options{Dir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestStreamRefusesSpecialEntryWithPayload(t *testing.T) {
 	copy(raw[148:156], fmt.Sprintf("%06o\x00 ", sum))
 	buf := bytes.NewReader(raw)
 	dir := t.TempDir()
-	_, err = Extract(io.MultiReader(buf, strings.NewReader(Completion)), Options{Dir: dir, Stream: true})
+	_, err = Extract(io.MultiReader(buf, strings.NewReader(Completion)), Options{Dir: dir})
 	if err == nil || !strings.Contains(err.Error(), "payload") {
 		t.Fatalf("special entry with a payload: %v", err)
 	}

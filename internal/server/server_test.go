@@ -149,10 +149,11 @@ func tarOf(t *testing.T, files map[string]string) []byte {
 	return buf.Bytes()
 }
 
-// dropRequest frames an archive as a drop, the way the remote shell function
-// does with printf and tar.
+// dropRequest frames an archive as a streaming drop, the way the remote shell
+// function does with printf, tar and the completion marker.
 func dropRequest(archive []byte) []byte {
-	return append([]byte(protocol.Magic+`{"type":"drop"}`+"\n"), archive...)
+	request := append([]byte(protocol.Magic+`{"type":"`+protocol.TypeStreamDrop+`"}`+"\n"), archive...)
+	return append(request, drop.Completion...)
 }
 
 // namedDropRequest frames raw bytes as a drop under one name, the way the
@@ -257,15 +258,18 @@ func TestDropWritesFiles(t *testing.T) {
 }
 
 // TestDropCannotEscapeTheDropDirectory is the end-to-end version of the
-// extraction tests: a hostile archive arriving over a real socket must still
-// land inside the drop directory.
+// extraction tests: a hostile archive arriving over a real socket is refused,
+// and nothing is written inside the drop directory or beside it.
 func TestDropCannotEscapeTheDropDirectory(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
-	h.send(dropRequest(tarOf(t, map[string]string{
+	reply := h.send(dropRequest(tarOf(t, map[string]string{
 		"../../escaped.txt": "no",
 	})))
+	if !strings.HasPrefix(reply, protocol.StatusError) {
+		t.Fatalf("reply = %q, want the hostile drop refused", reply)
+	}
 
 	parent := filepath.Dir(h.dropDir)
 	entries, err := os.ReadDir(parent)
@@ -277,8 +281,28 @@ func TestDropCannotEscapeTheDropDirectory(t *testing.T) {
 			t.Fatal("a drop wrote outside the drop directory")
 		}
 	}
-	if _, err := os.Stat(filepath.Join(h.dropDir, "escaped.txt")); err != nil {
-		t.Errorf("the entry did not land in the drop directory: %v", err)
+	if _, err := os.Stat(filepath.Join(h.dropDir, "escaped.txt")); !os.IsNotExist(err) {
+		t.Errorf("a refused drop was published: %v", err)
+	}
+}
+
+// TestOutdatedArchiveDropIsRefused covers a remote whose shell function predates
+// streaming drops: its archive must be refused with the fix, not extracted or
+// mistaken for clipboard data.
+func TestOutdatedArchiveDropIsRefused(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	outdated := append([]byte(protocol.Magic+`{"type":"drop"}`+"\n"), tarOf(t, map[string]string{"notes.txt": "x"})...)
+	reply := h.send(outdated)
+	if !strings.HasPrefix(reply, protocol.StatusError) || !strings.Contains(reply, "run clipd setup") {
+		t.Fatalf("reply = %q, want an error that says to rerun setup", reply)
+	}
+	if entries, _ := os.ReadDir(h.dropDir); len(entries) != 0 {
+		t.Fatalf("an outdated drop published %d entries", len(entries))
+	}
+	if h.clip.WriteCount() != 0 {
+		t.Fatal("an outdated drop reached the clipboard")
 	}
 }
 

@@ -64,60 +64,47 @@ func archiveOf(t *testing.T, entries ...entry) io.Reader {
 	return &buf
 }
 
-// TestExtractConfinesHostileNames is the test this package exists for.
+// TestExtractRefusesHostileNames is the test this package exists for.
 //
-// Every name here is a real archive-extraction attack. The property being
-// pinned is not "these particular strings are handled" but the invariant that
-// makes them all harmless at once: nothing is ever written outside Dir,
-// because every entry is reduced to a basename before it becomes a path.
-func TestExtractConfinesHostileNames(t *testing.T) {
+// Every name here is a real archive-extraction attack. The invariant that makes
+// them all harmless at once: a path that could leave Dir refuses the whole
+// drop, so nothing is written anywhere, inside Dir or outside it.
+func TestExtractRefusesHostileNames(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name string
-		give string
-		want string
-	}{
-		{"parent traversal", "../../.ssh/authorized_keys", "authorized_keys"},
-		{"deep traversal", "../../../../../../etc/passwd", "passwd"},
-		{"absolute path", "/etc/passwd", "passwd"},
-		{"absolute traversal", "/../../etc/shadow", "shadow"},
-		{"windows separators", `..\..\Windows\System32\drivers\etc\hosts`, "hosts"},
-		{"embedded traversal", "a/b/../../../../c.txt", "c.txt"},
-		{"trailing dot segments", "notes/./x.txt", "x.txt"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, name := range []string{
+		"../../.ssh/authorized_keys",
+		"../../../../../../etc/passwd",
+		"/etc/passwd",
+		"/../../etc/shadow",
+		`..\..\Windows\System32\drivers\etc\hosts`,
+		"a/b/../../../../c.txt",
+		"notes/./x.txt",
+	} {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			dir := filepath.Join(t.TempDir(), "drop")
-			res, err := Extract(archiveOf(t, entry{name: tc.give, body: "payload"}), Options{Dir: dir})
+			parent := t.TempDir()
+			dir := filepath.Join(parent, "drop")
+			if _, err := Extract(streamOf(t, entry{name: name, body: "payload"}), Options{Dir: dir}); err == nil {
+				t.Fatal("Extract accepted a path that could leave the drop directory")
+			}
+			assertDirEmpty(t, dir)
+			ents, err := os.ReadDir(parent)
 			if err != nil {
-				t.Fatalf("Extract: %v", err)
+				t.Fatalf("read parent: %v", err)
 			}
-			if len(res.Names) != 1 || res.Names[0] != tc.want {
-				t.Fatalf("wrote %v, want exactly [%s]", res.Names, tc.want)
-			}
-
-			// The written file is inside Dir, and Dir holds nothing else.
-			written := filepath.Join(dir, tc.want)
-			if _, err := os.Stat(written); err != nil {
-				t.Fatalf("stat %s: %v", written, err)
-			}
-			ents, err := os.ReadDir(dir)
-			if err != nil {
-				t.Fatalf("read dir: %v", err)
-			}
-			if len(ents) != 1 {
-				t.Fatalf("drop directory holds %d entries, want 1", len(ents))
+			for _, e := range ents {
+				if e.Name() != "drop" {
+					t.Fatalf("a hostile drop wrote %s beside the drop directory", e.Name())
+				}
 			}
 		})
 	}
 }
 
 // TestExtractNothingEscapesTheParent is the same property checked from the
-// other side: after extracting an archive full of traversal attempts, the
+// other side: after refusing an archive full of traversal attempts, the
 // directory above Dir must be untouched.
 func TestExtractNothingEscapesTheParent(t *testing.T) {
 	t.Parallel()
@@ -125,13 +112,13 @@ func TestExtractNothingEscapesTheParent(t *testing.T) {
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "drop")
 
-	_, err := Extract(archiveOf(t,
+	_, err := Extract(streamOf(t,
 		entry{name: "../escaped.txt", body: "no"},
 		entry{name: "../../escaped2.txt", body: "no"},
 		entry{name: "/tmp/escaped3.txt", body: "no"},
 	), Options{Dir: dir})
-	if err != nil {
-		t.Fatalf("Extract: %v", err)
+	if err == nil {
+		t.Fatal("Extract accepted traversal entries")
 	}
 
 	ents, err := os.ReadDir(parent)
@@ -149,15 +136,14 @@ func TestExtractNothingEscapesTheParent(t *testing.T) {
 
 // TestExtractSkipsNonRegularEntries covers every tar type that is a way to
 // write somewhere else or to create something a sender has no business
-// creating: links of both kinds, directories, devices and FIFOs.
+// creating: links of both kinds, devices and FIFOs.
 func TestExtractSkipsNonRegularEntries(t *testing.T) {
 	t.Parallel()
 
 	dir := filepath.Join(t.TempDir(), "drop")
-	res, err := Extract(archiveOf(t,
+	res, err := Extract(streamOf(t,
 		entry{name: "evil-link", typeflag: tar.TypeSymlink, linkname: "/etc/passwd"},
 		entry{name: "evil-hard", typeflag: tar.TypeLink, linkname: "/etc/passwd"},
-		entry{name: "subdir", typeflag: tar.TypeDir},
 		entry{name: "evil-dev", typeflag: tar.TypeChar},
 		entry{name: "evil-blk", typeflag: tar.TypeBlock},
 		entry{name: "evil-fifo", typeflag: tar.TypeFifo},
@@ -166,8 +152,8 @@ func TestExtractSkipsNonRegularEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if len(res.Names) != 1 || res.Names[0] != "real.txt" {
-		t.Fatalf("wrote %v, want only [real.txt]", res.Names)
+	if len(res.Names) != 1 || res.Names[0] != "real.txt" || res.Skipped != 5 {
+		t.Fatalf("wrote %v, skipped %d; want only [real.txt], 5 skipped", res.Names, res.Skipped)
 	}
 
 	ents, err := os.ReadDir(dir)
@@ -205,7 +191,7 @@ func TestExtractWillNotFollowAPlantedSymlink(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	res, err := Extract(archiveOf(t, entry{name: "notes.txt", body: "overwritten"}), Options{Dir: dir})
+	res, err := Extract(streamOf(t, entry{name: "notes.txt", body: "overwritten"}), Options{Dir: dir})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -233,7 +219,7 @@ func TestExtractNeverOverwrites(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	res, err := Extract(archiveOf(t, entry{name: "notes.txt", body: "second"}), Options{Dir: dir})
+	res, err := Extract(streamOf(t, entry{name: "notes.txt", body: "second"}), Options{Dir: dir})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -253,7 +239,7 @@ func TestExtractStripsTheExecutableBit(t *testing.T) {
 	t.Parallel()
 
 	dir := filepath.Join(t.TempDir(), "drop")
-	if _, err := Extract(archiveOf(t,
+	if _, err := Extract(streamOf(t,
 		entry{name: "payload.sh", body: "#!/bin/sh\n", mode: 0o777},
 	), Options{Dir: dir}); err != nil {
 		t.Fatalf("Extract: %v", err)
@@ -274,7 +260,7 @@ func TestExtractEnforcesLimits(t *testing.T) {
 	t.Run("total bytes", func(t *testing.T) {
 		t.Parallel()
 		dir := filepath.Join(t.TempDir(), "drop")
-		_, err := Extract(archiveOf(t,
+		_, err := Extract(streamOf(t,
 			entry{name: "a.bin", body: strings.Repeat("x", 600)},
 			entry{name: "b.bin", body: strings.Repeat("x", 600)},
 		), Options{Dir: dir, MaxBytes: 1000})
@@ -287,7 +273,7 @@ func TestExtractEnforcesLimits(t *testing.T) {
 	t.Run("a single oversized file", func(t *testing.T) {
 		t.Parallel()
 		dir := filepath.Join(t.TempDir(), "drop")
-		_, err := Extract(archiveOf(t,
+		_, err := Extract(streamOf(t,
 			entry{name: "big.bin", body: strings.Repeat("x", 5000)},
 		), Options{Dir: dir, MaxBytes: 1000})
 		if err == nil {
@@ -303,7 +289,7 @@ func TestExtractEnforcesLimits(t *testing.T) {
 		for i := range 10 {
 			entries = append(entries, entry{name: string(rune('a'+i)) + ".txt", body: "x"})
 		}
-		_, err := Extract(archiveOf(t, entries...), Options{Dir: dir, MaxFiles: 3})
+		_, err := Extract(streamOf(t, entries...), Options{Dir: dir, MaxFiles: 3})
 		if err == nil {
 			t.Fatal("Extract succeeded, want a file-count error")
 		}
@@ -317,7 +303,7 @@ func TestExtractCleansUpAfterAFailure(t *testing.T) {
 	t.Parallel()
 
 	dir := filepath.Join(t.TempDir(), "drop")
-	_, err := Extract(archiveOf(t,
+	_, err := Extract(streamOf(t,
 		entry{name: "ok-1.txt", body: "fine"},
 		entry{name: "ok-2.txt", body: "fine"},
 		entry{name: "toobig.bin", body: strings.Repeat("x", 5000)},
@@ -355,6 +341,10 @@ func TestExtractPublishesOnlyAfterTheWholeArchiveArrives(t *testing.T) {
 		close(firstWritten)
 		<-finish
 		if err := tw.Close(); err != nil {
+			writerDone <- err
+			return
+		}
+		if _, err := io.WriteString(pw, Completion); err != nil {
 			writerDone <- err
 			return
 		}
@@ -566,7 +556,7 @@ func TestExtractRejectsAnOverlongName(t *testing.T) {
 	t.Parallel()
 
 	dir := filepath.Join(t.TempDir(), "drop")
-	_, err := Extract(archiveOf(t,
+	_, err := Extract(streamOf(t,
 		entry{name: strings.Repeat("n", maxNameBytes+1), body: "x"},
 	), Options{Dir: dir})
 	if err == nil {
@@ -579,7 +569,7 @@ func TestExtractRejectsAnEmptyArchive(t *testing.T) {
 	t.Parallel()
 
 	dir := filepath.Join(t.TempDir(), "drop")
-	_, err := Extract(archiveOf(t), Options{Dir: dir})
+	_, err := Extract(streamOf(t), Options{Dir: dir})
 	if !errors.Is(err, ErrNoFiles) {
 		t.Fatalf("err = %v, want ErrNoFiles", err)
 	}
@@ -599,7 +589,7 @@ func TestExtractPreservesContentAndOrder(t *testing.T) {
 	t.Parallel()
 
 	dir := filepath.Join(t.TempDir(), "drop")
-	res, err := Extract(archiveOf(t,
+	res, err := Extract(streamOf(t,
 		entry{name: "one.txt", body: "first"},
 		entry{name: "two.txt", body: "second"},
 	), Options{Dir: dir})
@@ -663,9 +653,8 @@ func assertDirEmpty(t *testing.T, dir string) {
 // TestExtractBoundsSkippedEntries pins the second budget.
 //
 // maxFiles only counts what is written, so an archive made entirely of entries
-// this package skips would otherwise stream forever: the reader keeps making
-// progress, the connection's idle deadline never fires, and the handler holds
-// a concurrency slot for as long as the sender keeps writing.
+// this package skips would otherwise stream until the connection's lifetime
+// ran out, holding a concurrency slot the whole time.
 func TestExtractBoundsSkippedEntries(t *testing.T) {
 	t.Parallel()
 
@@ -697,7 +686,7 @@ func TestExtractBoundsSkippedEntries(t *testing.T) {
 		if err == nil {
 			t.Fatal("Extract accepted an endless archive")
 		}
-		if !strings.Contains(err.Error(), "entries") {
+		if !strings.Contains(err.Error(), "entry limit") {
 			t.Errorf("err = %v, want it to name the entry limit", err)
 		}
 	case <-time.After(10 * time.Second):
@@ -749,7 +738,7 @@ func TestExtractRejectsInvalidUTF8Name(t *testing.T) {
 	t.Parallel()
 
 	dir := filepath.Join(t.TempDir(), "drop")
-	_, err := Extract(archiveOf(t,
+	_, err := Extract(streamOf(t,
 		entry{name: "csi\x9b2J.txt", body: "x"},
 	), Options{Dir: dir})
 	if err == nil {
@@ -793,7 +782,7 @@ func TestExtractWritesAwkwardNames(t *testing.T) {
 	}
 
 	dir := filepath.Join(t.TempDir(), "drop")
-	res, err := Extract(archiveOf(t, entries...), Options{Dir: dir})
+	res, err := Extract(streamOf(t, entries...), Options{Dir: dir})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -908,7 +897,7 @@ func TestQuarantineHelperHonorsDeadline(t *testing.T) {
 
 func TestZeroByteFileAtExactSizeLimit(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := Extract(archiveOf(t, entry{name: "a", body: "123"}, entry{name: "empty"}), Options{Dir: dir, MaxBytes: 3}); err != nil {
+	if _, err := Extract(streamOf(t, entry{name: "a", body: "123"}, entry{name: "empty"}), Options{Dir: dir, MaxBytes: 3}); err != nil {
 		t.Fatal(err)
 	}
 }

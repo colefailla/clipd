@@ -42,9 +42,9 @@ other entry type, refuses the drop. Files are received into a
 private staging directory inside the drop directory and published only after
 the whole archive has parsed and the sender's completion marker, sent only after
 `tar` succeeded, has arrived. Published files are `0600`, directories `0700`,
-and existing names are never overwritten or merged. Legacy drops, from shell
-functions generated before streaming, flatten paths to basenames and keep Go's
-tar reader's entry-boundary truncation gap.
+and existing names are never overwritten or merged. Archive drops from shell
+functions generated before streaming are refused, with an instruction to rerun
+`clipd setup`.
 
 Exceptions: publishing several names is not crash-atomic. Hard-link publication
 and the quarantine attribute use pathname APIs, so confinement to the opened
