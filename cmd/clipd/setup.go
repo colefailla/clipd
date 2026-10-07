@@ -680,8 +680,13 @@ fi
 		fmt.Fprintf(&b, "    fi\n")
 	}
 	// File arguments copy their contents, as `clipd < file` does. Each one is
-	// checked before connecting, because a raw copy has no completion marker:
-	// a cat that failed halfway would leave a truncated clipboard.
+	// checked before connecting, which catches the common mistakes before the
+	// clipboard is touched. A raw copy has no completion marker, so a read that
+	// fails partway still reaches the Mac as an ordinary end of input; cat's
+	// failure is carried out on fd 3, because a pipeline reports only its last
+	// command's status, and a copy the Mac acknowledged is then reported as
+	// failed. A failed transport also fails cat, so that case keeps its own
+	// handling below.
 	b.WriteString(`  elif [ "$#" -gt 0 ]; then
     for _clipd_path in "$@"; do
       if [ -d "$_clipd_path" ]; then
@@ -694,9 +699,19 @@ fi
       fi
     done
 `)
-	fmt.Fprintf(&b, "    if _clipd_reply=$(command cat -- \"$@\" | command %s | ", client.send)
+	fmt.Fprintf(&b, "    if _clipd_reply=$( { { command cat -- \"$@\" || command printf 'clipd-read-failed\\n' >&3; } | command %s | ", client.send)
 	b.WriteString(shellReplyReader)
-	b.WriteString(" ); then :; else _clipd_client=$?; fi\n")
+	b.WriteString("; } 3>&1 ); then :; else _clipd_client=$?; fi\n")
+	b.WriteString(`    case $_clipd_reply in
+      (*clipd-read-failed*)
+        _clipd_reply=$(command printf '%s\n' "$_clipd_reply" | command sed '/^clipd-read-failed$/d')
+        case $_clipd_reply in
+          ('clipd: ok: '*)
+            command printf 'clipd: could not read every file; the clipboard may hold a partial copy\n' >&2
+            return 1 ;;
+        esac ;;
+    esac
+`)
 	fmt.Fprintf(&b, "  else\n")
 	fmt.Fprintf(&b, "    if _clipd_reply=$(command %s | ", client.send)
 	b.WriteString(shellReplyReader)

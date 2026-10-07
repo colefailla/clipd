@@ -224,7 +224,7 @@ func TestClientRemovesStaleSocket(t *testing.T) {
 				t.Fatal(err)
 			}
 			block := shellFunction(client, socket, true)
-			for _, use := range []string{"printf hi | clipd", "clipd drop file.txt", "printf hi | clipd drop --name x.txt"} {
+			for _, use := range []string{"printf hi | clipd", "clipd file.txt", "clipd drop file.txt", "printf hi | clipd drop --name x.txt"} {
 				staleSocket(t, socket)
 				command := exec.Command(binary, "-c", "set -u\n"+block+"\n"+use+"\n")
 				command.Dir = dir
@@ -235,7 +235,7 @@ func TestClientRemovesStaleSocket(t *testing.T) {
 				if !strings.Contains(string(out), "left behind by an earlier SSH session") {
 					t.Fatalf("%s: stale socket not explained: %s", use, out)
 				}
-				if strings.Contains(string(out), "tar failed") || strings.Contains(string(out), "did not complete") {
+				if strings.Contains(string(out), "tar failed") || strings.Contains(string(out), "did not complete") || strings.Contains(string(out), "could not read") {
 					t.Fatalf("%s: misleading failure message: %s", use, out)
 				}
 				if _, err := os.Lstat(socket); !os.IsNotExist(err) {
@@ -513,6 +513,69 @@ func TestClipboardCopiesFileArguments(t *testing.T) {
 				if fake.WriteCount() != before {
 					t.Fatalf("%s: a refused copy reached the clipboard", command)
 				}
+			}
+		})
+	}
+}
+
+// TestClipboardReportsAFailedFileRead: a read that fails partway through still
+// reaches the Mac as an ordinary end of input, so the Mac acknowledges a
+// partial copy. The function must report that as a failure, never as ok.
+func TestClipboardReportsAFailedFileRead(t *testing.T) {
+	if _, err := exec.LookPath("nc"); err != nil {
+		t.Skip("nc unavailable")
+	}
+	client := localTransport(t)
+	for _, shell := range []string{"sh", "dash", "bash", "zsh"} {
+		t.Run(shell, func(t *testing.T) {
+			binary, err := exec.LookPath(shell)
+			if err != nil {
+				t.Skip("shell unavailable")
+			}
+			dir, err := os.MkdirTemp("", "clipd-readfail-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			socket := filepath.Join(dir, "socket")
+			fake := &clipboard.Fake{}
+			srv, err := server.New(server.Options{Clipboard: fake, DropDir: filepath.Join(dir, "received"), MaxPayload: 1024, MaxTransfer: 10 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ln, err := server.Listen(socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- srv.Serve(ctx, ln) }()
+			defer func() {
+				cancel()
+				<-done
+			}()
+			if err := os.WriteFile(filepath.Join(dir, "report.txt"), []byte("complete contents\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// A cat that sends part of the file and then hits a read error,
+			// as one reading from a network filesystem that dropped would.
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			fakeCat := "#!/bin/sh\nprintf partial\necho 'cat: report.txt: Input/output error' >&2\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(bin, "cat"), []byte(fakeCat), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(binary, "-c", "set -u\n"+shellFunction(client, socket, true)+"\nclipd report.txt\n")
+			command.Dir = dir
+			command.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			out, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "could not read every file") || strings.Contains(string(out), "clipd: ok:") {
+				t.Fatalf("a partial read was not reported as a failure: %v\n%s", err, out)
+			}
+			if got := string(fake.Data()); got != "partial" {
+				t.Fatalf("clipboard = %q; the test no longer exercises a partial copy", got)
 			}
 		})
 	}

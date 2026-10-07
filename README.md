@@ -67,9 +67,8 @@ clipd differs in three ways:
 - **The daemon replies.** A copy prints `clipd: ok: copied 47 bytes` instead of
   succeeding silently or hanging with no output.
 
-The structured-frame design, the stale-socket recovery, the umask handling and
-the path-or-host address are all taken from clipper. It solved these problems
-first.
+The structured-frame design, the stale-socket recovery and the umask handling
+are all taken from clipper. It solved these problems first.
 
 ## Install
 
@@ -334,9 +333,11 @@ plain `ssh <host> 'clipd drop file'` works.
 After updating clipd on the Mac, rerun `clipd setup <host>` for each host to
 update its shell function. Update the Mac first: a new function needs a new
 daemon, and an old daemon refuses its requests with an error rather than
-mistaking them for clipboard text. On a host you have not rerun setup on,
-copying still works, but sending files or folders stops with an error telling
-you to rerun `clipd setup` for that host.
+mistaking them for clipboard text. A host you have not rerun setup on keeps
+working, with one exception: a function from before folders kept their
+structure can no longer send files or folders with `clipd drop`, and gets an
+error telling you to rerun `clipd setup` for that host. Copying and
+`clipd drop --name` still work there.
 
 ## Security
 
