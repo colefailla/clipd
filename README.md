@@ -16,6 +16,18 @@ pg_dump mydb | clipd drop --name db.sql  # output that never touched disk
 function in your `~/.bashrc` (or `~/.zshrc`, `~/.profile`) that pipes into
 `nc`, which every Unix box already has. The daemon runs only on the Mac.
 
+## What it supports
+
+| | |
+|---|---|
+| **Receiving machine** | macOS. A Linux desktop also works, with `wl-copy`, `xclip` or `xsel` for the clipboard. |
+| **Remote machines** | Linux, macOS and the BSDs, with a POSIX shell, `nc` or `socat`, and `tar` for sending files and folders. |
+| **SSH** | OpenSSH 6.7 or newer on the remote (2014 onward), which can forward a socket. |
+| **Not supported** | Windows, which has no POSIX shell for the remote function. Dropbear, and OpenSSH older than 6.7, which cannot forward a socket. |
+
+On a Linux desktop, run `clipd serve` to start the daemon. `clipd install`,
+which starts it at login, writes a macOS LaunchAgent and only works on a Mac.
+
 ## How it works
 
 ```text
@@ -188,68 +200,6 @@ SSH config markers name the host — `# >>> clipd: debian >>>` — so setting up
 several hosts leaves each one's forward intact. Your SSH config is backed up
 before the first edit.
 
-### Hosts that cannot forward a socket
-
-`clipd setup` only knows how to forward a socket, and refuses to run when the
-daemon is set to a TCP address. Almost nothing needs the alternative: OpenSSH
-has forwarded UNIX sockets since 6.7, released in 2014, so every current Linux
-and macOS host is covered. The exceptions are Windows OpenSSH, which still
-cannot, and systems old enough to predate 6.7.
-
-Those are configured by hand. **Read the cost at the end before you do.**
-
-1. While the daemon is still on a socket, generate a TCP version of the
-   function `setup` would install. Replace `oldbox` with the host:
-
-   ```bash
-   clipd setup -print oldbox > clipd-print.txt &&
-     sed -n '/^# >>> clipd >>>$/,/^# <<< clipd <<<$/p' clipd-print.txt | sed \
-       -e '/# >>> clipd socket check/,/# <<< clipd socket check/d' \
-       -e '/^  _clipd_sock=/d' \
-       -e 's|UNIX-CLIENT:"$_clipd_sock"|TCP4:127.0.0.1:8199|' \
-       -e '/command nc /s| -U | |' \
-       -e 's|"$_clipd_sock"|127.0.0.1 8199|' > clipd-tcp.sh &&
-     grep -q '^# <<< clipd <<<$' clipd-tcp.sh &&
-     ! grep -q '_clipd_sock' clipd-tcp.sh &&
-     sh -n clipd-tcp.sh &&
-     echo 'clipd-tcp.sh is ready.' ||
-     { echo 'Could not generate clipd-tcp.sh; see any error above.' >&2; rm -f clipd-tcp.sh; }
-   rm -f clipd-print.txt
-   ```
-
-   The first `sed` keeps only the function. The second deletes the parts
-   marked `clipd socket check`, which only make sense for a socket file, and
-   points the three transfer commands at the port, keeping all their flags.
-   The checks after it stop if `setup` failed or the result is incomplete, so
-   use `clipd-tcp.sh` only after it says it is ready.
-
-2. Point the daemon at a loopback port and restart it:
-
-   ```json
-   { "address": "127.0.0.1:8199" }
-   ```
-
-   ```bash
-   clipd restart
-   ```
-
-3. Forward the port instead of the socket, in `~/.ssh/config`:
-
-   ```text
-   Host oldbox
-     RemoteForward 8199 127.0.0.1:8199
-   ```
-
-4. Put the contents of `clipd-tcp.sh` into the remote's rc file, replacing
-   the block between the `# >>> clipd >>>` markers if setup had added one.
-
-**The cost.** A socket is protected by its `0600` mode inside a `0700`
-directory, so only you can write to it. A loopback port has no permissions at
-all: every account on that host can reach port 8199 and put things on your
-clipboard or drop files on your Mac. sshd binds remote forwards to loopback, so
-it is not exposed to the network — but it is exposed to everyone logged into
-that machine. Use it only where you would trust all of them.
-
 ## Usage
 
 On the remote host:
@@ -390,7 +340,7 @@ copies the whole archive to the remote disk before sending.
 
 ## Security
 
-**The default listener is a private UNIX socket.** It reaches another machine
+**The daemon listens only on a private UNIX socket.** It reaches another machine
 only through your SSH connection: SSH encrypts the channel, verifies the host
 key against `known_hosts` and authenticates you, and the socket's `0600`
 permissions decide who on that machine may write to it.
@@ -427,11 +377,6 @@ What limits the damage:
   transfer time are all bounded, so a misbehaving sender cannot exhaust the
   Mac's memory or tie the daemon up indefinitely.
 
-The [TCP fallback](#hosts-that-cannot-forward-a-socket) is weaker: it binds
-loopback only, and anything reachable from the network is refused at startup,
-but every account on the machine can reach a loopback port. Prefer the socket
-wherever SSH can forward one.
-
 The exact guarantees, and their known exceptions, are in
 [SECURITY.md](SECURITY.md).
 
@@ -443,7 +388,7 @@ the file is optional. `clipd install` writes one with every setting filled in.
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `address` | `~/.clipd.sock` | the daemon's socket, or a loopback `host:port` for the [TCP fallback](#hosts-that-cannot-forward-a-socket) |
+| `address` | `~/.clipd.sock` | the daemon's socket path |
 | `drop_dir` | `~/Drop` | where dropped files land |
 | `max_payload_bytes` | `10485760` (10 MiB) | largest clipboard copy; up to 1 GiB |
 | `max_drop_bytes` | `268435456` (256 MiB) | largest drop, all files together; up to 1 TiB |

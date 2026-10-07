@@ -4,6 +4,28 @@ Repository-wide instructions for AI agents working on clipd. Keep this file for
 durable constraints, verified behavior, and clearly labelled known gaps. The
 README is user-facing; SECURITY.md defines the published security boundary.
 
+## Scope
+
+clipd copies text and sends files from machines the user SSHes into, to the
+machine they are sitting at. It is meant to stay small: closer to
+wincent/clipper plus file drops than to a general transfer tool.
+
+- Receiving machine: macOS, with a LaunchAgent. A Linux desktop also works,
+  started with `clipd serve`; there is no Linux service installer.
+- Remote machines: Linux, macOS and the BSDs with a POSIX shell, `nc` or
+  `socat`, `tar` for archive drops, and OpenSSH 6.7 or newer for socket
+  forwarding.
+- Out of scope: Windows, Dropbear, OpenSSH older than 6.7, and any transport
+  other than an SSH-forwarded UNIX socket.
+
+## What is worth changing
+
+Change code for what a real user of this scope would plausibly hit, and for
+genuine security or data-loss problems. Do not add code, tests or documentation
+to defend theoretical edge cases outside that, and prefer an existing OpenSSH or
+shell mechanism over new clipd code. When a review finds an issue, first say
+which real scenario it affects; an issue with none is reported, not fixed.
+
 ## Working agreement
 
 - An explicit instruction from the current user/repository owner overrides this
@@ -37,8 +59,10 @@ a change supported by a concrete need:
 - The remote client remains generated shell rather than a second binary.
 - Built-in defaults are a valid configuration. Running or setting up clipd does
   not create a config file; `clipd install` persists one.
-- UNIX-socket forwarding is the supported setup path. The loopback-TCP fallback
-  is manual and `clipd setup` refuses to configure it.
+- The daemon listens only on a UNIX socket, reached remotely through an SSH
+  socket forward. A host:port address is rejected with a pointer to a socket
+  path. Do not reintroduce a TCP listener: the protocol has no authentication,
+  and a loopback port is reachable by every local account.
 - The Go module has no third-party runtime/module dependencies.
 - Successfully published drop files belong to the user and are not
   automatically deleted. Daemon-owned stale staging directories are different
@@ -46,7 +70,7 @@ a change supported by a concrete need:
 
 ## Security boundaries
 
-### Default UNIX-socket mode
+### UNIX-socket mode
 
 - For forwarded traffic, SSH supplies transport encryption, host verification,
   and user authentication. Filesystem permissions authorize direct local and
@@ -59,18 +83,6 @@ a change supported by a concrete need:
 - There is intentionally no additional token or TLS layer in this mode. Do not
   add one without an attack that defeats SSH plus filesystem authorization and
   explicit approval from the repository owner.
-
-### Loopback-TCP fallback
-
-- The daemon can hold a TCP listener on literal loopback addresses or
-  `localhost`. It must refuse empty-host and non-loopback addresses because the
-  protocol itself has no authentication.
-- A loopback port has no per-user filesystem permissions. Other local accounts
-  on the Mac can reach it, and other accounts on a remote host can reach a
-  remotely forwarded loopback port. This is a consciously weaker fallback, not
-  equivalent protection to the UNIX socket.
-- Listener validation and TCP exposure are security-sensitive. Never claim that
-  clipd has no TCP socket or that the network is categorically out of scope.
 
 ### Untrusted peers and resources
 
@@ -205,12 +217,10 @@ must not mutate the developer's live environment.
   for it a silent exit 1 is a documented heuristic, not proof. The ping uses
   its own short inactivity timeout (`probeSeconds`), not an absolute deadline;
   transfers keep their day-long one. The probe runs as an `if` condition
-  because setup's install script runs under `set -e`. A live forward accepts even when the Mac daemon is down
-  and must survive. sshd never unlinks these
+  because setup's install script runs under `set -e`. A live forward accepts
+  even when the Mac daemon is down and must survive. sshd never unlinks these
   sockets itself unless the server sets `StreamLocalBindUnlink yes`, which is
   optional advice for servers the user administers, never a setup requirement.
-- Keep literal loopback acceptance and empty/non-loopback refusal covered for
-  IPv4 and IPv6.
 
 Legacy tar-integrity limitation: Go's tar reader accepts EOF at an entry
 boundary without proving end-of-archive blocks arrived. Legacy `drop` requests

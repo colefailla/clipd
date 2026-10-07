@@ -5,8 +5,7 @@
 // launchd owns backgrounding, log redirection and restart-on-crash, so
 // duplicating any of that here would only add ways to disagree with launchd.
 //
-// SSH protects forwarded traffic. UNIX socket permissions authorize access;
-// the manual loopback TCP fallback is reachable by other local accounts.
+// SSH protects forwarded traffic and UNIX socket permissions authorize access.
 // Connected peers remain untrusted, so payloads, work and time are bounded.
 package server
 

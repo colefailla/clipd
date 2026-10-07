@@ -50,9 +50,9 @@ const EnvConfig = "CLIPD_CONFIG"
 
 // Defaults.
 const (
-	// DefaultAddress is a socket in the user's home directory rather than a
-	// TCP port. Home is not world-writable, which /tmp is: a socket there
-	// could be replaced by another user between daemon restarts.
+	// DefaultAddress is a socket in the user's home directory. Home is not
+	// world-writable, which /tmp is: a socket there could be replaced by
+	// another user between daemon restarts.
 	DefaultAddress = "~/.clipd.sock"
 
 	// DefaultDropDir is where `clipd drop` puts files. A dedicated directory,
@@ -89,11 +89,8 @@ const (
 
 // Config is the on-disk configuration.
 type Config struct {
-	// Address is a socket path or a host:port. A leading /, ~ or . makes it a
-	// UNIX domain socket, which is the supported configuration. Anything else
-	// is a TCP listener and must be loopback — a reachable address is refused
-	// at startup, since nothing here authenticates. The port form exists only
-	// for hosts whose SSH cannot forward a socket.
+	// Address is the daemon's UNIX socket path. It must start with /, ~ or .;
+	// see IsSocketPath.
 	Address string `json:"address"`
 
 	// DropDir receives files sent with `clipd drop`.
@@ -477,6 +474,15 @@ func writeAtomic(path string, data []byte) error {
 	return d.Sync()
 }
 
+// IsSocketPath reports whether an address names a socket path. A leading /, ~
+// or . is required, so a host:port from the loopback TCP mode clipd used to
+// offer is refused rather than taken as a relative file name.
+func IsSocketPath(address string) bool {
+	return strings.HasPrefix(address, "/") ||
+		strings.HasPrefix(address, "~") ||
+		strings.HasPrefix(address, ".")
+}
+
 // Validate rejects a configuration the daemon could not honour.
 func (c Config) Validate() error {
 	if c.MaxTransferSeconds < 1 || c.MaxTransferSeconds > 86400 {
@@ -484,6 +490,9 @@ func (c Config) Validate() error {
 	}
 	if c.Address == "" {
 		return errors.New("address: must not be empty")
+	}
+	if !IsSocketPath(c.Address) {
+		return fmt.Errorf("address: %q is not a socket path; clipd listens only on a UNIX socket, such as %s", c.Address, DefaultAddress)
 	}
 	if c.MaxPayloadBytes < 1 {
 		return fmt.Errorf("max_payload_bytes: %d must be positive", c.MaxPayloadBytes)

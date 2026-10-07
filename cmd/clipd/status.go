@@ -105,9 +105,6 @@ func daemonStart(cfg config.Config) (time.Time, error) {
 	// -config pointing elsewhere, reloading here compared the chosen file
 	// against a socket the default config named, and reported staleness for a
 	// daemon that was not the one being asked about.
-	if !server.IsSocketPath(cfg.Address) {
-		return time.Time{}, errors.New("not a socket")
-	}
 	sock, err := server.ExpandPath(cfg.Address)
 	if err != nil {
 		return time.Time{}, err
@@ -122,16 +119,6 @@ func daemonStart(cfg config.Config) (time.Time, error) {
 // reportListener says whether something is actually accepting on the
 // configured address, and returns the exit code that answer implies.
 func reportListener(out io.Writer, address string) int {
-	if !server.IsSocketPath(address) {
-		fmt.Fprintf(out, "  address      %s (TCP — no authentication; loopback only)\n", address)
-		if err := server.Ping("tcp", address); err != nil {
-			fmt.Fprintf(out, "  daemon       not answering (%v)\n", err)
-			return exitFailure
-		}
-		fmt.Fprintf(out, "  daemon       answering\n")
-		return exitOK
-	}
-
 	path, err := server.ExpandPath(address)
 	if err != nil {
 		fmt.Fprintf(out, "  address      %s (%v)\n", address, err)

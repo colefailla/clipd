@@ -23,7 +23,7 @@ import (
 // with.
 func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int {
 	flags := newFlagSet(e, g, "serve", "Usage: clipd serve [options]")
-	address := flags.String("address", "", "socket path or host:port to listen on (default from config)")
+	address := flags.String("address", "", "socket path to listen on (default from config)")
 	dropDir := flags.String("drop-dir", "", "directory for dropped files (default from config)")
 	if code, ok := flags.parse(args); !ok {
 		return code
@@ -94,14 +94,6 @@ func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	// file behind, and nothing else will ever clear it up.
 	if n := drop.CleanStale(resolvedDrop, time.Duration(cfg.MaxTransferSeconds)*time.Second+time.Minute); n > 0 {
 		logger.Info("removed incomplete drops left by a previous run", "count", n)
-	}
-
-	if !server.IsSocketPath(cfg.Address) {
-		// Worth saying every time. Nothing in this daemon authenticates, so a
-		// TCP listener is only ever safe on the loopback interface, and the
-		// user has configured their way off the supported path to get here.
-		logger.Warn("listening on TCP; this daemon has no authentication, so anything that can reach this address can write to the clipboard",
-			"address", cfg.Address)
 	}
 
 	// Signals are handled here rather than in main so that short-lived

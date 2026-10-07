@@ -219,24 +219,6 @@ func TestListenRefusesWritableSocketDirectory(t *testing.T) {
 	}
 }
 
-func TestIsSocketPath(t *testing.T) {
-	t.Parallel()
-
-	sockets := []string{"/var/run/clipd.sock", "~/.clipd.sock", "./clipd.sock"}
-	hosts := []string{"localhost:8199", "127.0.0.1:8199", "[::1]:8199", ":8199"}
-
-	for _, s := range sockets {
-		if !IsSocketPath(s) {
-			t.Errorf("IsSocketPath(%q) = false, want true", s)
-		}
-	}
-	for _, h := range hosts {
-		if IsSocketPath(h) {
-			t.Errorf("IsSocketPath(%q) = true, want false", h)
-		}
-	}
-}
-
 func TestExpandPathResolvesTilde(t *testing.T) {
 	t.Parallel()
 
@@ -252,39 +234,21 @@ func TestExpandPathResolvesTilde(t *testing.T) {
 	}
 }
 
-// TestListenRefusesNonLoopbackTCP: the daemon has no authentication, so a
-// reachable TCP address would hand the clipboard to whatever can route to it.
-// That configuration is refused rather than warned about.
-func TestListenRefusesNonLoopbackTCP(t *testing.T) {
+// TestListenRefusesTCPAddresses: clipd listens only on a UNIX socket. A
+// host:port, loopback or not, is refused with a reason rather than bound, or
+// taken as the name of a socket file in the working directory.
+func TestListenRefusesTCPAddresses(t *testing.T) {
 	t.Parallel()
 
-	for _, addr := range []string{
-		"0.0.0.0:0", ":0", "192.168.1.5:0", "[::]:0", "example.com:0",
-	} {
+	for _, addr := range []string{"127.0.0.1:0", "localhost:0", "[::1]:0", "0.0.0.0:0", ":0"} {
 		ln, err := Listen(addr)
 		if err == nil {
 			ln.Close()
-			t.Errorf("Listen(%q) bound a reachable address", addr)
+			t.Errorf("Listen(%q) bound a TCP address", addr)
 			continue
 		}
-		if !strings.Contains(err.Error(), "no authentication") {
+		if !strings.Contains(err.Error(), "not a socket path") {
 			t.Errorf("Listen(%q) failed with %v, want it to explain why", addr, err)
 		}
-	}
-}
-
-// TestListenAllowsLoopbackTCP keeps the case the restriction exists to
-// preserve: hosts where SSH cannot forward a UNIX socket still need an
-// endpoint, and a loopback port is one.
-func TestListenAllowsLoopbackTCP(t *testing.T) {
-	t.Parallel()
-
-	for _, addr := range []string{"127.0.0.1:0", "localhost:0", "[::1]:0"} {
-		ln, err := Listen(addr)
-		if err != nil {
-			t.Errorf("Listen(%q): %v", addr, err)
-			continue
-		}
-		ln.Close()
 	}
 }

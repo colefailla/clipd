@@ -124,14 +124,6 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	if err != nil {
 		return fail(e, exitConfig, err)
 	}
-	if !server.IsSocketPath(cfg.Address) {
-		return failf(e, exitConfig,
-			"setup forwards a UNIX socket, but this daemon is configured to listen on %q.\n"+
-				"       Set address to a socket path to use setup, or configure the host by hand:\n"+
-				"       see \"Hosts that cannot forward a socket\" in the README.",
-			cfg.Address)
-	}
-
 	control, cleanup, err := controlPath()
 	if err != nil {
 		return fail(e, exitFailure, err)
@@ -527,13 +519,6 @@ const staleSocketReport = `if [ "$_clipd_stale" = 1 ]; then
 fi
 `
 
-// socketCheck marks a part of the generated function that exists only because
-// the transport is a UNIX socket. The manual loopback-TCP recipe in the README
-// deletes these regions by their markers, so they must stay self-contained.
-func socketCheck(script, prefix string) string {
-	return indent("# >>> clipd socket check\n"+script+"# <<< clipd socket check\n", prefix)
-}
-
 // indent prefixes every line of script.
 func indent(script, prefix string) string {
 	return prefix + strings.ReplaceAll(strings.TrimSuffix(script, "\n"), "\n", "\n"+prefix) + "\n"
@@ -603,7 +588,7 @@ func shellFunction(client transport, socket string, hasTar bool) string {
   [ ! -t 2 ] || _clipd_progress=true
 `)
 
-	b.WriteString(socketCheck(`if [ ! -S "$_clipd_sock" ]; then
+	b.WriteString(indent(`if [ ! -S "$_clipd_sock" ]; then
   command printf 'clipd: %s does not exist, so this SSH session has no clipd forward.\n' "$_clipd_sock" >&2
   command printf '       Log out and back in. If ssh warns "remote port forwarding failed", see Troubleshooting in the clipd README.\n' >&2
   return 1
@@ -658,7 +643,7 @@ fi
 			//
 			// The socket is checked before tar starts: once the transport is
 			// gone, tar's own write errors would bury the reason.
-			b.WriteString(socketCheck(staleSocketScript(client)+staleSocketReport, "      "))
+			b.WriteString(indent(staleSocketScript(client)+staleSocketReport, "      "))
 			b.WriteString(`      _clipd_reply=$(
         _clipd_first=1
         for _clipd_path in "$@"; do
@@ -702,7 +687,7 @@ fi
 	// A transport failure with a refused connection is a socket sshd left
 	// behind; anything else is reported without touching the socket.
 	fmt.Fprintf(&b, "  if [ \"$_clipd_client\" -ne 0 ] || [ -z \"$_clipd_reply\" ]; then\n")
-	b.WriteString(socketCheck(`if [ "$_clipd_client" -ne 3 ]; then
+	b.WriteString(indent(`if [ "$_clipd_client" -ne 3 ]; then
 `+indent(staleSocketScript(client)+staleSocketReport, "  ")+`fi
 `, "    "))
 	fmt.Fprintf(&b, "    if [ -n \"$_clipd_reply\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")

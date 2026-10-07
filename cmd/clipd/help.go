@@ -71,7 +71,7 @@ Over ssh, ask for an interactive shell: ssh host 'bash -ic "clipd drop x"'
 the path given by -config or CLIPD_CONFIG. Optional: every setting has a
 default. clipd install writes one with every setting filled in.
 
-  address                ~/.clipd.sock   socket, or loopback host:port
+  address                ~/.clipd.sock   socket path
   drop_dir               ~/Drop          where drops land
   max_payload_bytes      10485760        clipboard, 10 MiB; up to 1 GiB
   max_drop_bytes         268435456       per drop, 256 MiB; up to 1 TiB
@@ -103,10 +103,6 @@ What limits the damage: bracketed paste in modern shells stops pasted text from
 running before you press Enter; drops stay inside ~/Drop, never overwrite and
 never arrive executable; and sizes, file counts, connections and transfer time
 are all bounded.
-
-The address setting also accepts a loopback host:port, for hosts whose SSH
-cannot forward a socket. Every account on a machine can reach loopback, so it is
-weaker than the socket; anything reachable from the network is refused.
 
 SECURITY.md in the repository lists the exact guarantees and their exceptions.`,
 

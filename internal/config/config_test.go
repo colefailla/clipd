@@ -113,6 +113,37 @@ func TestLoadRejectsTrailingData(t *testing.T) {
 	}
 }
 
+func TestIsSocketPath(t *testing.T) {
+	t.Parallel()
+
+	for _, s := range []string{"/var/run/clipd.sock", "~/.clipd.sock", "./clipd.sock"} {
+		if !IsSocketPath(s) {
+			t.Errorf("IsSocketPath(%q) = false, want true", s)
+		}
+	}
+	for _, h := range []string{"localhost:8199", "127.0.0.1:8199", "[::1]:8199", ":8199", "clipd.sock"} {
+		if IsSocketPath(h) {
+			t.Errorf("IsSocketPath(%q) = true, want false", h)
+		}
+	}
+}
+
+// TestTCPAddressIsRejected covers a config written for the loopback TCP mode
+// clipd no longer has: it must fail with a pointer to a socket path rather
+// than bind a file named after the port.
+func TestTCPAddressIsRejected(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"address":"127.0.0.1:8199"}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "not a socket path") || !strings.Contains(err.Error(), DefaultAddress) {
+		t.Fatalf("Load = %v, want a socket-path error naming %s", err, DefaultAddress)
+	}
+}
+
 func TestValidateRejectsBadValues(t *testing.T) {
 	t.Parallel()
 
