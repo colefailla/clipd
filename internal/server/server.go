@@ -615,7 +615,7 @@ func (s *Server) handleDrop(ctx context.Context, conn net.Conn, r io.Reader, req
 		// so the sender is told how to update rather than having its archive
 		// read as something else.
 		s.warnPeer("drop rejected", "reason", "archive drop from an outdated clipd function")
-		s.respondError(conn, "this host's clipd function is out of date; on the Mac, run clipd setup for this host")
+		s.respondError(conn, "this host's clipd function needs updating. On the receiving computer, run 'clipd setup <host>'.")
 		drainRejected(conn, r)
 		return
 	default:
@@ -647,13 +647,13 @@ func (s *Server) handleDrop(ctx context.Context, conn net.Conn, r io.Reader, req
 }
 
 // raiseLimit ends every reply about a configurable limit.
-const raiseLimit = " in the Mac's clipd config, then run clipd restart"
+const raiseLimit = " in clipd's config on the receiving computer, then restart clipd"
 
 // dropFailure names the setting to raise when a drop hits a configured limit.
 func (s *Server) dropFailure(err error) string {
 	switch {
 	case errors.Is(err, drop.ErrTooLarge):
-		return fmt.Sprintf("drop is larger than the %s limit; raise max_drop_bytes%s", config.FormatSize(s.maxDropBytes), raiseLimit)
+		return fmt.Sprintf("drop exceeds the %s limit; increase max_drop_bytes%s", config.FormatSize(s.maxDropBytes), raiseLimit)
 	case errors.Is(err, drop.ErrTooManyFiles):
 		return fmt.Sprintf("drop has more than %d files; raise max_drop_files%s", s.maxDropFiles, raiseLimit)
 	case isTimeout(err), errors.Is(err, context.DeadlineExceeded):

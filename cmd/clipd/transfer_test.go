@@ -571,7 +571,7 @@ func TestClipboardReportsAFailedFileRead(t *testing.T) {
 			command.Dir = dir
 			command.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 			out, err := command.CombinedOutput()
-			if err == nil || !strings.Contains(string(out), "could not read every file") || strings.Contains(string(out), "clipd: ok:") {
+			if err == nil || !strings.Contains(string(out), "couldn't read all the files") || strings.Contains(string(out), "clipd: ok:") {
 				t.Fatalf("a partial read was not reported as a failure: %v\n%s", err, out)
 			}
 			if got := string(fake.Data()); got != "partial" {

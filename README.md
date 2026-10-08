@@ -269,7 +269,7 @@ Each drop is limited to 256 MiB and 256 files by default, and each transfer to
 30 minutes. Going over tells you which limit you hit and what to change:
 
 ```text
-clipd: error: drop is larger than the 256 MiB limit; raise max_drop_bytes in the Mac's clipd config, then run clipd restart
+clipd: error: drop exceeds the 256 MiB limit; increase max_drop_bytes in clipd's config on the receiving computer, then restart clipd
 ```
 
 To send something like a 20 GB video, change that line in the Mac's

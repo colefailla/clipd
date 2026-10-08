@@ -666,7 +666,7 @@ fi
           fi
           while [ "${_clipd_path%/}" != "$_clipd_path" ]; do _clipd_path=${_clipd_path%/}; done
           _clipd_base=${_clipd_path##*/}
-          case $_clipd_base in (''|.|..) command printf 'clipd drop: give a file or directory name, not a filesystem root\n' >&2; exit 3 ;; esac
+          case $_clipd_base in (''|.|..) command printf 'clipd drop: send a file or folder, not a filesystem root\n' >&2; exit 3 ;; esac
           case $_clipd_path in (*/*) _clipd_parent=${_clipd_path%/*}; [ -n "$_clipd_parent" ] || _clipd_parent=/ ;; (*) _clipd_parent=. ;; esac
           case $_clipd_parent in (/*|./*|../*|.) ;; (*) _clipd_parent=./$_clipd_parent ;; esac
           _clipd_parent=$(command -p sh -c 'CDPATH=; command cd "$1" && command pwd -P' sh "$_clipd_parent") || exit 3
@@ -721,7 +721,7 @@ fi
         _clipd_reply=$(command printf '%s\n' "$_clipd_reply" | command sed '/^clipd-read-failed$/d')
         case $_clipd_reply in
           ('clipd: ok: '*)
-            command printf 'clipd: could not read every file; the clipboard may hold a partial copy\n' >&2
+            command printf "clipd: couldn't read all the files. The clipboard may contain a partial copy.\n" >&2
             return 1 ;;
         esac ;;
     esac

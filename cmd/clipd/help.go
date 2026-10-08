@@ -1,127 +1,153 @@
 package main
 
 var helpTopics = map[string]string{
-	"serve": `clipd serve
+	"serve": `clipd serve [options]
 
-Runs the daemon in the foreground until SIGINT or SIGTERM. Requires pbcopy on
-macOS, or a supported clipboard helper in a Linux graphical session.
+Run the daemon in this terminal. Press Ctrl-C to stop it.
 
-It does not detach: under the LaunchAgent, launchd owns backgrounding,
-restarts and log files.
-
-Options:
-  -address <path>     socket path to listen on (default ~/.clipd.sock)
-  -drop-dir <path>    where dropped files land (default ~/Drop)`,
-
-	"setup": `clipd setup [options] <ssh-host>
-
-Run on the Mac. Connects to the host, checks which nc or socat it has, and
-writes two things:
-
-  Remote: a clipd shell function in ~/.bashrc, ~/.zshrc or ~/.profile, and a
-          private ~/.clipd directory for the socket. No program is installed.
-  Mac:    a block in ~/.ssh/config that forwards the remote socket to the
-          daemon's socket.
-
-Both are between clipd markers, so re-running setup replaces them, leaving the
-rest of each file alone. The first run saves a .clipd-backup of each file.
-The host may be an SSH alias, hostname, IP or user@host; the block matches it
-exactly as typed, so set up each name you use.
-
-Reconnect afterwards for the forward to take effect.
-
-sshd leaves the remote socket behind when you log out, which makes the next
-login's forward fail. clipd removes the leftover the first time you use it and
-asks you to reconnect; re-running setup also clears it. On a server you run,
-setup prints a one-line sshd change that stops it happening at all.
+On macOS, 'clipd install' runs it in the background and starts it at login.
+On a Linux desktop, use this command in a graphical session with wl-copy,
+xclip or xsel installed. macOS uses pbcopy.
 
 Options:
-  -print    show what would be written, without changing anything
+  -address <path>     socket path (default: from config)
+  -drop-dir <path>    folder for received files (default: from config)
 
-To undo, delete the blocks between the clipd markers. See the README for
-details and troubleshooting.`,
+Without a config file, the defaults are ~/.clipd.sock and ~/Drop.`,
 
-	"drop": `clipd drop [--no-progress] <file-or-folder>...
-<command> | clipd drop --name <filename>
+	"setup": `clipd setup [options] <host>
 
-Run on the remote host. Sends files and folders to the Mac's ~/Drop.
+Run on the receiving computer to configure an SSH host.
+Setup connects to the host, checks for nc or socat, and writes:
 
-  clipd drop report.pdf                       ~/Drop/report.pdf
-  clipd drop photos                           ~/Drop/photos/, structure kept
-  clipd drop photos/*                         photos' contents, into ~/Drop
+  On the host:  a clipd function in ~/.bashrc, ~/.zshrc or ~/.profile,
+                plus a private ~/.clipd directory for the socket.
+                No binary or service is installed.
+  Locally:      a block in ~/.ssh/config that forwards the host's socket
+                to the local clipd socket.
+
+Running setup again replaces the marked clipd blocks and leaves the rest
+of each file alone. Existing files are backed up to .clipd-backup files
+before the first change.
+
+<host> can be an SSH alias, hostname, IP address or user@host. Use the same
+name you use when connecting. If you connect by two names, set up both.
+
+Log out and reconnect afterwards to use the forward. Run setup again
+when you need to update the host's clipd function.
+
+Options:
+  -print    show the proposed changes without writing them
+
+To remove the setup, delete the marked clipd blocks from your local SSH
+config and the host's shell startup file.
+See Troubleshooting in the README for connection and leftover-socket problems.`,
+
+	"drop": `clipd drop [--no-progress] <file-or-folder> ...
+command | clipd drop --name <filename>
+
+Run on the remote host. Sends files and folders to the receiving computer's
+configured drop folder (default: ~/Drop).
+
+  clipd drop report.pdf               send report.pdf
+  clipd drop photos                   send the folder and keep its structure
+  clipd drop photos/*                 send the items matched by your shell
   journalctl -u nginx | clipd drop --name nginx.log
 
-Nothing is overwritten: a second report.pdf arrives as report-1.pdf. A drop is
-all or nothing, and the exit status is the Mac's answer, so
-clipd drop x && rm x only removes x once it has arrived. Symlinks and other
-special files are skipped, never followed, and the reply counts them.
+Existing files are never overwritten. A second report.pdf arrives as
+report-1.pdf. clipd reports success after the receiving computer has saved
+the drop, so you can use:
 
-Progress shows in a terminal; --no-progress hides it.
+  clipd drop report.pdf && rm report.pdf
 
-Default limits: 256 MiB and 256 files per drop, 30 minutes per transfer. An
-error names the limit you hit; see clipd help config on the Mac to raise it.
+Symlinks and other special files are skipped, never followed.
+The reply tells you how many were skipped.
 
-After updating clipd on the Mac, rerun clipd setup to update this function.
-Over ssh, ask for an interactive shell: ssh host 'bash -ic "clipd drop x"'
-(zsh -ic on zsh hosts). ssh -t alone does not make the shell interactive.`,
+Drops show progress in a terminal. Use --no-progress to hide it.
 
-	"config": `clipd config file
+Default limits: 256 MiB and 256 files per drop, 30 minutes per transfer.
+Errors identify the limit you hit. Run 'clipd help config' on the receiving
+computer for settings and limits.
 
-~/.config/clipd/config.json ($XDG_CONFIG_HOME/clipd/config.json when set), or
-the path given by -config or CLIPD_CONFIG. Optional: every setting has a
-default. clipd install writes one with every setting filled in.
+To run a drop over SSH without opening a shell first:
 
-  address                ~/.clipd.sock   socket path
-  drop_dir               ~/Drop          where drops land
-  max_payload_bytes      10485760        clipboard, 10 MiB; up to 1 GiB
-  max_drop_bytes         268435456       per drop, 256 MiB; up to 1 TiB
-  max_drop_files         256             per drop; up to 65536
-  max_concurrent         8               at once; up to 64
-  max_transfer_seconds   1800            per transfer, 30 min; up to 86400
+  ssh host 'bash -ic "clipd drop report.pdf"'
 
-Sizes are bytes, times are seconds: 10 GiB = 10737418240, one hour = 3600.
-A missing setting or 0 means the default, never unlimited. Unknown settings
-are rejected. max_payload_bytes times max_concurrent must fit in 2 GiB.
+Use zsh -ic on Zsh hosts. ssh -t alone does not load the interactive shell
+startup file. See the README for quoting and shell startup details.`,
 
-The daemon reads this file only at startup: run clipd restart after editing.
-clipd status shows the limits in use and notices unapplied edits.
+	"config": `clipd help config
+
+The config file is optional. Without it, clipd uses the defaults below.
+'clipd install' writes the file and preserves existing settings.
+
+Default path: ~/.config/clipd/config.json
+With XDG_CONFIG_HOME set: $XDG_CONFIG_HOME/clipd/config.json
+Use -config <path> or CLIPD_CONFIG to select a different file.
+
+  setting                default        meaning
+  address                ~/.clipd.sock  UNIX socket path
+  drop_dir               ~/Drop         folder for received files
+  max_payload_bytes      10485760       bytes per clipboard copy (10 MiB; max 1 GiB)
+  max_drop_bytes         268435456      bytes per drop (256 MiB; max 1 TiB)
+  max_drop_files         256            files per drop (max 65536)
+  max_concurrent         8              copies and drops at once (max 64)
+  max_transfer_seconds   1800           seconds per transfer (30 minutes; max 24 hours)
+
+Sizes are bytes; times are seconds. For example, 10 GiB is 10737418240
+bytes and one hour is 3600 seconds.
+
+Omitted settings use their defaults. For numeric limits, 0 also uses the
+default; it does not mean unlimited. Unknown settings are rejected.
+max_payload_bytes multiplied by max_concurrent must not exceed 2 GiB.
+
+Settings are read when the daemon starts. On macOS, run 'clipd restart'
+after editing them. On Linux, stop and restart 'clipd serve'.
+
+'clipd status' shows the resolved config and, for the macOS login service,
+warns when the file has been edited since the daemon started.
 Config files from before v3 are not migrated.`,
 
-	"security": `clipd security model
+	"security": `clipd help security
 
-clipd has no authentication or encryption of its own, by design. The daemon
-listens on a UNIX socket only you can use. It reaches a remote host only through
-your SSH connection, which encrypts it, checks the host key and authenticates
-you. On the remote, the socket sits in your private ~/.clipd directory.
+SSH encrypts forwarded traffic, verifies the host key and authenticates
+your account. clipd uses private UNIX sockets and adds no separate password
+or encryption layer.
 
-So anything running as you on that host can write to your clipboard and send
-you files. Other accounts there cannot. Letting a remote machine write to your
-clipboard means trusting what runs there as you; anything able to abuse that
-already has your files on that machine.
+On the remote host, the socket is inside your private ~/.clipd directory.
+Other ordinary accounts cannot use it, but anything running as your user
+can write to the receiving computer's clipboard and send it files.
+Only forward clipd to accounts whose programs you trust with that access.
 
-What limits the damage: bracketed paste in modern shells stops pasted text from
-running before you press Enter; drops stay inside ~/Drop, never overwrite and
-never arrive executable; and sizes, file counts, connections and transfer time
-are all bounded.
+Received files stay inside the configured drop folder, never overwrite
+existing files, and are not given executable permissions. Symlinks and
+other special files are skipped.
 
-SECURITY.md in the repository lists the exact guarantees and their exceptions.`,
+Sizes, file counts, connections and transfer time are bounded.
+These limits do not cap the total size of files you keep over time.
 
-	"install": `clipd install
+SECURITY.md in the repository describes the guarantees and known exceptions.`,
 
-macOS only. Writes ~/Library/LaunchAgents/com.clipd.agent.plist and loads it
-into your GUI session, so the daemon starts at login and restarts if it
-crashes. No root privileges are required.
+	"install": `clipd install [options]
+
+macOS only. Starts clipd now and at login, and restarts it if it crashes.
+Installs ~/Library/LaunchAgents/com.clipd.agent.plist for your user account.
+No sudo is needed.
+
+It also writes the selected config file with all settings filled in,
+preserving existing values. The default is ~/.config/clipd/config.json;
+XDG_CONFIG_HOME, -config or CLIPD_CONFIG can select another path.
 
 Options:
-  -exec <path>   binary path to record in the plist (default: this binary)`,
+  -exec <path>   clipd binary to run (default: this binary)`,
 
 	"restart": `clipd restart
 
-macOS only. Stops and starts the LaunchAgent.
+macOS only. Stops and restarts the installed clipd login service.
+Run this after editing the config so the daemon reads the new settings.
 
-The config file is read once, when the daemon starts, so editing it has no
-effect until this is run. 'clipd status' says when the file has been edited
-since the daemon last started.
+'clipd status' warns if the config file has been edited since the service
+started.
 
 Equivalent to:
 
@@ -129,28 +155,37 @@ Equivalent to:
 
 	"uninstall": `clipd uninstall
 
-macOS only. Unloads the LaunchAgent and removes its plist. The config file and
-log directory are left in place, as are the clipd shell functions on any remote
-hosts — delete the block between the clipd markers in their rc files.`,
+macOS only. Stops the daemon and removes its login service.
+It leaves the clipd binary, config file, logs and received files in place.
+
+Remote shell functions and SSH forwards are also left in place.
+To remove them, delete the marked clipd blocks from your local ~/.ssh/config
+and each host's ~/.bashrc, ~/.zshrc or ~/.profile.`,
 
 	"status": `clipd status
 
-Shows the resolved configuration and whether the daemon is actually listening.
+Shows the resolved config and checks whether the daemon answers.
+On macOS, it also shows the login service's state and log path.
 
-It dials the socket rather than just checking that the file exists, because a
-daemon killed with SIGKILL leaves the socket file behind. A stale socket and a
-live one look identical in a directory listing.
+It talks to the daemon rather than checking only for a socket file,
+which can remain after a crash.
 
-The exit code carries the verdict — 0 when the daemon answers, 1 when it does
-not — so 'clipd status && ...' works as a preflight.`,
+The displayed settings come from the config file, not from the running
+daemon. For the macOS login service, status warns about edits made since
+the daemon started.
+
+Exits 0 when the daemon answers and 1 when it does not.
+Config and command errors have separate exit codes.
+You can use 'clipd status && ...' in scripts.`,
 
 	"version": `clipd version
 
-Prints the version, commit and build date recorded at build time, plus the Go
-toolchain and target platform.`,
+Shows the version, commit and build date, plus the Go version and platform
+it was built for.`,
 
 	"help": `clipd help [topic]
 
-With no topic, prints the command list. Topics: serve, setup, drop, config,
-security, install, restart, uninstall, status, version.`,
+With no topic, shows the overview.
+Topics: serve, setup, drop, config, security, install, restart, uninstall,
+status, version.`,
 }

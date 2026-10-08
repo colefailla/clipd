@@ -295,7 +295,7 @@ func TestOutdatedArchiveDropIsRefused(t *testing.T) {
 	h := newHarness(t)
 	outdated := append([]byte(protocol.Magic+`{"type":"drop"}`+"\n"), tarOf(t, map[string]string{"notes.txt": "x"})...)
 	reply := h.send(outdated)
-	if !strings.HasPrefix(reply, protocol.StatusError) || !strings.Contains(reply, "run clipd setup") {
+	if !strings.HasPrefix(reply, protocol.StatusError) || !strings.Contains(reply, "run 'clipd setup <host>'") {
 		t.Fatalf("reply = %q, want an error that says to rerun setup", reply)
 	}
 	if entries, _ := os.ReadDir(h.dropDir); len(entries) != 0 {
