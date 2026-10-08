@@ -141,7 +141,7 @@ func TestGeneratedClientStreamsToRealReceiver(t *testing.T) {
 func TestRemoteHelpWorksWithoutForward(t *testing.T) {
 	block := shellFunction(fakeTransport(`nc -U "$_clipd_sock"`), "/nonexistent/socket", true)
 	out, err := exec.Command("sh", "-c", block+"\nclipd -h\n").CombinedOutput()
-	if err != nil || !strings.Contains(string(out), "clipd restart") {
+	if err != nil || !strings.Contains(string(out), "clipd status") {
 		t.Fatalf("help = %s, %v", out, err)
 	}
 }
@@ -232,10 +232,10 @@ func TestClientRemovesStaleSocket(t *testing.T) {
 				if err == nil {
 					t.Fatalf("%s: succeeded against a stale socket: %s", use, out)
 				}
-				if !strings.Contains(string(out), "left behind by an earlier SSH session") {
+				if !strings.Contains(string(out), "removed the unused socket") {
 					t.Fatalf("%s: stale socket not explained: %s", use, out)
 				}
-				if strings.Contains(string(out), "tar failed") || strings.Contains(string(out), "did not complete") || strings.Contains(string(out), "could not read") {
+				if strings.Contains(string(out), "tar failed") || strings.Contains(string(out), "couldn't confirm") || strings.Contains(string(out), "could not read") {
 					t.Fatalf("%s: misleading failure message: %s", use, out)
 				}
 				if _, err := os.Lstat(socket); !os.IsNotExist(err) {
@@ -277,7 +277,7 @@ func TestClientPreservesLiveSocketWithoutReply(t *testing.T) {
 	if err == nil {
 		t.Fatalf("succeeded without a reply: %s", out)
 	}
-	if !strings.Contains(string(out), "did not complete") || strings.Contains(string(out), "left behind") {
+	if !strings.Contains(string(out), "couldn't confirm the transfer") || strings.Contains(string(out), "removed the unused socket") {
 		t.Fatalf("live socket failure misreported: %s", out)
 	}
 	if _, err := os.Lstat(socket); err != nil {

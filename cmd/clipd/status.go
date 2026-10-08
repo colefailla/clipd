@@ -52,15 +52,15 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 	if old := config.LegacyPath(); old != "" {
 		fmt.Fprintf(out, "  note         an unused pre-v3 config remains at %s\n", old)
 	}
-	fmt.Fprintf(out, "  max payload  %s\n", config.FormatSize(cfg.MaxPayloadBytes))
-	fmt.Fprintf(out, "  max drop     %s across %d files\n",
+	fmt.Fprintf(out, "  clipboard    %s per copy\n", config.FormatSize(cfg.MaxPayloadBytes))
+	fmt.Fprintf(out, "  drops        %s and %d files per drop\n",
 		config.FormatSize(cfg.MaxDropBytes), cfg.MaxDropFiles)
 
 	dropDir, err := server.ExpandPath(cfg.DropDir)
 	if err != nil {
 		return fail(e, exitConfig, err)
 	}
-	fmt.Fprintf(out, "  transfer cap %s\n", (time.Duration(cfg.MaxTransferSeconds) * time.Second).String())
+	fmt.Fprintf(out, "  time limit   %s per transfer\n", config.FormatDuration(time.Duration(cfg.MaxTransferSeconds)*time.Second))
 	fmt.Fprintf(out, "  drop dir     %s%s\n", dropDir, existsNote(dropDir))
 
 	fmt.Fprintf(out, "\nlistener\n")

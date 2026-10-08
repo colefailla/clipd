@@ -210,7 +210,7 @@ func TestShellFunctionRefusesDropWithoutTar(t *testing.T) {
 	if strings.Contains(block, "tar cf") {
 		t.Errorf("the function uses tar on a host that has none:\n%s", block)
 	}
-	if !strings.Contains(block, "no tar") {
+	if !strings.Contains(block, "tar is not installed") {
 		t.Errorf("the function does not explain why drop is unavailable:\n%s", block)
 	}
 }
@@ -496,7 +496,7 @@ func TestShellFunctionOnlySendsCompleteArchives(t *testing.T) {
 		wantStatus string
 	}{
 		{name: "complete archive", arguments: "source.txt", wantSent: true},
-		{name: "tar fails after one file", arguments: "source.txt missing.txt", wantStatus: "not completed"},
+		{name: "tar fails after one file", arguments: "source.txt missing.txt", wantStatus: "no files were saved"},
 	}
 	for _, tc := range tests {
 		tc := tc

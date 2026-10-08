@@ -400,7 +400,7 @@ func TestClipboardFailureIsReported(t *testing.T) {
 	h.clip.Err = fmt.Errorf("pbcopy exploded")
 	reply := h.send([]byte("data"))
 
-	if !strings.Contains(reply, "clipboard write failed") {
+	if !strings.Contains(reply, "couldn't write to the clipboard") {
 		t.Errorf("reply = %q, want a clipboard failure message", reply)
 	}
 }

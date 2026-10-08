@@ -440,12 +440,12 @@ exists, because a daemon killed with `SIGKILL` leaves the socket behind and a
 stale one looks identical in a directory listing. Exit code 0 means a clipd
 daemon answered — not merely that something is listening.
 
-**`clipd: …/.clipd/socket was left behind by an earlier SSH session`**: sshd
-left the socket from a previous login, so this session has no forward. `clipd`
-has already removed it; log out and back in. See
-[Leftover sockets](#leftover-sockets) to stop it happening.
+**`clipd: removed the unused socket at …/.clipd/socket`**: sshd left the socket
+from a previous login, so this session has no forward. `clipd` has already
+removed it; log out and back in. See [Leftover sockets](#leftover-sockets) to
+stop it happening.
 
-**`clipd: …/.clipd/socket does not exist`**: this session has no forward. You
+**`clipd: this SSH session has no clipd forward`**: this session has no forward. You
 connected in a way that skips clipd's SSH config block (a different host name,
 `-o ClearAllForwardings=yes`), or reused a `ControlMaster` connection opened
 before setup. Log out and back in; with ControlMaster, close the old master
@@ -459,7 +459,7 @@ the other session's forward for as long as that session stays open. With
 `StreamLocalBindUnlink yes` on the server, the newest session takes the socket
 over instead.
 
-**`clipd: the transfer did not complete`**: the forward is up but the Mac did
+**`clipd: couldn't confirm the transfer`**: the forward is up but the Mac did
 not answer. Run `clipd status` on the Mac. The Mac's log,
 `~/Library/Logs/clipd/clipd.log`, records why a request was rejected.
 

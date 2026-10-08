@@ -452,7 +452,7 @@ func (s *Server) acquire(ctx context.Context, conn net.Conn) bool {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			s.respondError(conn, s.lifetimeExceeded())
 		} else {
-			s.respondError(conn, "busy: shutting down")
+			s.respondError(conn, "clipd is shutting down. Try again in a moment.")
 		}
 		return false
 	}
@@ -492,7 +492,7 @@ func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, r io.Reader
 	defer cancel()
 	if err := s.clip.Write(writeCtx, buf.Bytes()); err != nil {
 		s.warnPeer("clipboard write failed", "error", err)
-		s.respondError(conn, "clipboard write failed")
+		s.respondError(conn, "couldn't write to the clipboard; see clipd's log on the receiving computer")
 		return
 	}
 
@@ -635,8 +635,8 @@ func (s *Server) handleDrop(ctx context.Context, conn net.Conn, r io.Reader, req
 	// Routine success is acknowledged to the sender. Keeping it at Debug avoids
 	// growing launchd's unrotated log by one line for every ordinary drop.
 	s.log.Debug("files dropped", "count", len(res.Names), "bytes", res.Bytes, "dir", s.dropDir)
-	reply := fmt.Sprintf("dropped %s (%d bytes) into %s in %s",
-		dropSummary(res.Names), res.Bytes, s.dropDir, time.Since(started).Round(time.Millisecond))
+	reply := fmt.Sprintf("dropped %s (%s) into %s in %s",
+		dropSummary(res.Names), config.FormatSize(res.Bytes), s.dropDir, time.Since(started).Round(time.Millisecond))
 	switch {
 	case res.Skipped == 1:
 		reply += "; skipped 1 symlink or other special file"
@@ -664,14 +664,7 @@ func (s *Server) dropFailure(err error) string {
 
 // lifetimeExceeded names the setting behind a connection's time limit.
 func (s *Server) lifetimeExceeded() string {
-	limit := s.maxTransfer.String() // "30m0s", "1h0m0s", "1m30s"
-	if strings.HasSuffix(limit, "m0s") {
-		limit = strings.TrimSuffix(limit, "0s")
-	}
-	if strings.HasSuffix(limit, "h0m") {
-		limit = strings.TrimSuffix(limit, "0m")
-	}
-	return fmt.Sprintf("transfer took longer than the %s limit; raise max_transfer_seconds%s", limit, raiseLimit)
+	return fmt.Sprintf("transfer took longer than the %s limit; raise max_transfer_seconds%s", config.FormatDuration(s.maxTransfer), raiseLimit)
 }
 
 // dropSummary bounds replies independently of the configured file count.

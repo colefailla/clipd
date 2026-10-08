@@ -139,7 +139,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		_ = cmd.Run()
 	}()
 
-	fmt.Fprintf(e.stdout, "Probing %s (you may be asked for your password)...\n", destination)
+	fmt.Fprintf(e.stdout, "Checking %s (SSH may ask for a password)...\n", destination)
 	facts, err := probe(ctx, destination, control)
 	if err != nil {
 		return fail(e, exitFailure, err)
@@ -168,12 +168,14 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	fmt.Fprintf(e.stdout, "  remote socket  %s\n", remoteSocket)
 	fmt.Fprintf(e.stdout, "  local socket   %s\n", localSocket)
 	if !facts.hasTar {
-		fmt.Fprintf(e.stdout, "\n  note: %s has no tar; named stdin drops work, but file/directory drops require tar.\n", destination)
+		fmt.Fprintf(e.stdout, "\n  note: %s has no tar. Clipboard copies still work.\n"+
+			"        To send files and folders with 'clipd drop', install tar.\n"+
+			"        You can also send command output with 'command | clipd drop --name filename'.\n", destination)
 	}
 	if unsupportedShell(facts.shell) {
-		fmt.Fprintf(e.stdout, "\n  note: %s does not read %s. The function is POSIX shell, so add\n"+
-			"        it to that shell's own startup file by hand, or run a POSIX shell.\n",
-			filepath.Base(facts.shell), rcFile)
+		fmt.Fprintf(e.stdout, "\n  note: clipd's function doesn't work in %s, your login shell on %s.\n"+
+			"        To use clipd there, run sh, then: . %s\n",
+			filepath.Base(facts.shell), destination, rcFile)
 	}
 
 	if *printOnly {
@@ -207,31 +209,21 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	}
 
 	fmt.Fprintf(e.stdout, `
-Reconnect for the forward to take effect:
+Setup complete. Reconnect to use clipd:
 
   ssh -O exit %s 2>/dev/null; ssh %s
 
-Then, on %s:
+If you use SSH connection sharing, this also closes sessions using that connection.
+
+Then try these on %s:
 
   ls -l | clipd
-  clipd drop notes.txt
-  pg_dump db | clipd drop --name dump.sql
+  clipd notes.txt
+  clipd drop report.pdf
 
-An existing SSH session will not have the forward. If you multiplex with
-ControlMaster, the old master has to go first, which is what the -O exit above
-is for.
-
-When an SSH session ends, sshd leaves the socket behind, and the next login's
-forward fails. clipd notices the next time you use it, removes the leftover,
-and asks you to log out and back in; re-running setup also clears it.
-
-Optional, only on a server you administer: let sshd replace the leftover itself,
-so this never comes up. Run once from this Mac (asks for sudo on %s):
-
-  ssh -t %s "echo 'StreamLocalBindUnlink yes' | sudo tee /etc/ssh/sshd_config.d/clipd.conf && { sudo systemctl reload ssh || sudo systemctl reload sshd; }"
-
-It is a server-wide sshd setting. On a server someone else runs, leave it to them.
-`, destination, destination, destination, destination, destination)
+If clipd removes a leftover socket, log out and reconnect.
+See "Leftover sockets" in the README for more details.
+`, destination, destination, destination)
 	return exitOK
 }
 
@@ -513,8 +505,8 @@ fi
 
 // staleSocketReport explains a socket staleSocketScript removed.
 const staleSocketReport = `if [ "$_clipd_stale" = 1 ]; then
-  command printf 'clipd: %s was left behind by an earlier SSH session, so this session has no clipd forward.\n' "$_clipd_sock" >&2
-  command printf '       Removed it. Log out and back in to reconnect.\n' >&2
+  command printf 'clipd: removed the unused socket at %s.\n' "$_clipd_sock" >&2
+  command printf '       Log out and reconnect so SSH can create the forward.\n' >&2
   return 1
 fi
 `
@@ -522,6 +514,21 @@ fi
 // indent prefixes every line of script.
 func indent(script, prefix string) string {
 	return prefix + strings.ReplaceAll(strings.TrimSuffix(script, "\n"), "\n", "\n"+prefix) + "\n"
+}
+
+// remoteHelp is what `clipd -h` prints on the remote host.
+var remoteHelp = []string{
+	"Usage:",
+	"  command | clipd                          copy command output",
+	"  clipd <file> ...                         copy files' contents",
+	"  clipd drop [--no-progress] <path> ...    send files and folders",
+	"  command | clipd drop --name <filename>   save command output as a file",
+	"",
+	"Drops go to the receiving computer's configured drop directory",
+	"(default: ~/Drop). Folders keep their structure.",
+	"",
+	"Drops show progress in a terminal. Use --no-progress to hide it.",
+	"Run 'clipd status' on the receiving computer to see limits.",
 }
 
 // shellFunction renders the client the remote host will run.
@@ -580,8 +587,11 @@ func shellFunction(client transport, socket string, hasTar bool) string {
 	fmt.Fprintf(&b, "  _clipd_sock=%s\n", shellQuote(socket))
 	fmt.Fprintf(&b, "  _clipd_reply=\n")
 	fmt.Fprintf(&b, "  _clipd_client=0\n")
-	b.WriteString(`  case ${1:-} in (-h|--help|help)
-    command printf '%s\n' 'Usage: command | clipd' '       clipd file ...' '       clipd drop [--no-progress] file-or-directory ...' '       command | clipd drop --name filename' '' 'Drops go to the Mac configured by clipd setup. Directories retain their structure.' 'Interactive drops show progress; --no-progress hides it.' 'On the Mac: clipd status shows limits; clipd help config explains settings.' 'After editing the Mac config, run clipd restart.'
+	b.WriteString("  case ${1:-} in (-h|--help|help)\n    command printf '%s\\n'")
+	for _, line := range remoteHelp {
+		b.WriteString(" " + shellQuote(line))
+	}
+	b.WriteString(`
     return 0 ;;
   esac
   _clipd_progress=false
@@ -589,8 +599,9 @@ func shellFunction(client transport, socket string, hasTar bool) string {
 `)
 
 	b.WriteString(indent(`if [ ! -S "$_clipd_sock" ]; then
-  command printf 'clipd: %s does not exist, so this SSH session has no clipd forward.\n' "$_clipd_sock" >&2
-  command printf '       Log out and back in. If ssh warns "remote port forwarding failed", see Troubleshooting in the clipd README.\n' >&2
+  command printf 'clipd: this SSH session has no clipd forward; %s is missing.\n' "$_clipd_sock" >&2
+  command printf '       Log out and reconnect. If SSH reports "remote port forwarding failed",\n' >&2
+  command printf '       see Troubleshooting in the clipd README.\n' >&2
   return 1
 fi
 `, "  "))
@@ -633,7 +644,8 @@ fi
 		b.WriteString(" ); then :; else _clipd_client=$?; fi\n")
 		fmt.Fprintf(&b, "    else\n")
 		fmt.Fprintf(&b, "      if [ $# -eq 0 ]; then\n")
-		fmt.Fprintf(&b, "        command printf 'clipd drop: no files given (use --name to send stdin)\\n' >&2\n")
+		fmt.Fprintf(&b, "        command printf 'clipd drop: no files given.\\n' >&2\n")
+		fmt.Fprintf(&b, "        command printf \"            Use 'clipd drop <file> ...' or 'command | clipd drop --name <filename>'.\\n\" >&2\n")
 		fmt.Fprintf(&b, "        return 64\n")
 		fmt.Fprintf(&b, "      fi\n")
 		if hasTar {
@@ -668,14 +680,16 @@ fi
           else
             # Above 128 is a signal, normally SIGPIPE from a transport that
             # already failed; the transport failure is what gets reported.
-            [ "$?" -gt 128 ] || command printf 'clipd drop: tar failed; the drop was not completed\n' >&2
+            [ "$?" -gt 128 ] || command printf 'clipd drop: tar failed; no files were saved.\n' >&2
           fi
         } | `)
 			fmt.Fprintf(&b, "command %s | ", client.send)
 			b.WriteString(shellReplyReader)
 			b.WriteString("\n      ) || _clipd_client=$?\n")
 		} else {
-			fmt.Fprintf(&b, "      command printf 'clipd drop: this host has no tar\\n' >&2; return 1\n")
+			fmt.Fprintf(&b, "      command printf 'clipd drop: tar is not installed on this host.\\n' >&2\n")
+			fmt.Fprintf(&b, "      command printf \"            Install tar to send files and folders, or use\\n\" >&2\n")
+			fmt.Fprintf(&b, "      command printf \"            'command | clipd drop --name <filename>' to send command output.\\n\" >&2; return 1\n")
 		}
 		fmt.Fprintf(&b, "    fi\n")
 	}
@@ -725,7 +739,7 @@ fi
 `, "    "))
 	fmt.Fprintf(&b, "    if [ -n \"$_clipd_reply\" ]; then command printf '%%s\\n' \"$_clipd_reply\"; fi\n")
 	fmt.Fprintf(&b, "    if [ \"$_clipd_client\" -ne 3 ]; then\n")
-	fmt.Fprintf(&b, "      command printf 'clipd: the transfer did not complete; check clipd status on the Mac.\\n' >&2\n")
+	fmt.Fprintf(&b, "      command printf \"clipd: couldn't confirm the transfer. Run 'clipd status' on the receiving computer.\\n\" >&2\n")
 	fmt.Fprintf(&b, "    fi\n")
 	fmt.Fprintf(&b, "    return 1\n  fi\n")
 	// The daemon's reply is the whole user interface for the result, so it is

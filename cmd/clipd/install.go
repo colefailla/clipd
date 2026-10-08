@@ -77,9 +77,8 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 	fmt.Fprintf(out, "  socket       %s\n", socket)
 	fmt.Fprintf(out, "  drop dir     %s\n", dropDir)
 
-	fmt.Fprintf(out, "\nNothing is listening on the network: the socket is a file, and it\n")
-	fmt.Fprintf(out, "reaches other machines only when SSH forwards it.\n")
-	fmt.Fprintf(out, "\nTo use it from a remote host:\n\n  clipd setup <ssh-host>\n")
+	fmt.Fprintf(out, "\nclipd listens on a private socket. Remote hosts reach it through SSH.\n")
+	fmt.Fprintf(out, "\nTo configure a host, run:\n\n  clipd setup <host>\n")
 	return exitOK
 }
 

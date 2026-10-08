@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // File layout.
@@ -523,6 +524,19 @@ func (c Config) Validate() error {
 			c.MaxConcurrent, MaxAllowedConcurrent)
 	}
 	return nil
+}
+
+// FormatDuration renders a time limit as people write it: "30m" or "1h"
+// rather than Go's "30m0s" or "1h0m0s".
+func FormatDuration(d time.Duration) string {
+	s := d.String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	return s
 }
 
 // FormatSize renders a byte count for human consumption.
