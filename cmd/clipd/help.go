@@ -155,12 +155,23 @@ Equivalent to:
 
 	"uninstall": `clipd uninstall
 
-macOS only. Stops the daemon and removes its login service.
-It leaves the clipd binary, config file, logs and received files in place.
+macOS only. Stops the daemon and removes its login service. Everything else
+clipd created stays where it is:
 
-Remote shell functions and SSH forwards are also left in place.
-To remove them, delete the marked clipd blocks from your local ~/.ssh/config
-and each host's ~/.bashrc, ~/.zshrc or ~/.profile.`,
+On this computer:
+  ~/.config/clipd/config.json      settings
+  ~/Drop/                          files you received
+  ~/Library/Logs/clipd/            the daemon's log
+  ~/.ssh/config                    one marked clipd block per host
+  ~/.ssh/config.clipd-backup       your SSH config from before the first setup
+
+On each host you set up:
+  ~/.bashrc, ~/.zshrc or ~/.profile   the clipd function, in a marked block
+  ...clipd-backup                     a copy from before the first setup
+  ~/.clipd/                           a private folder for the socket
+
+To remove them, delete the marked clipd blocks and these files. The clipd
+binary stays wherever you installed it.`,
 
 	"status": `clipd status
 

@@ -499,6 +499,7 @@ That unloads and removes the LaunchAgent. Everything else is left in place.
 | `~/.config/clipd/config.json` | configuration |
 | `~/.clipd.sock` | the socket, created by the daemon and removed when it stops |
 | `~/Drop/` | files received by `clipd drop` |
+| `~/Drop/.clipd-stage-*` | hidden, temporary folders while a drop arrives; removed automatically |
 | `~/Library/Logs/clipd/` | the daemon's output, written by launchd |
 | `~/.ssh/config` | one block per host, between `# >>> clipd: <host> >>>` markers |
 | `~/.ssh/config.clipd-backup` | a copy of the SSH config from before the first edit |

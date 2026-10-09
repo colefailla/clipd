@@ -188,43 +188,33 @@ func failf(e *env, code int, format string, args ...any) int {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `clipd — copy text and send files from an SSH host to your Mac
+	fmt.Fprint(w, `clipd — copy text and send files from SSH hosts to this computer
 
-Run 'clipd setup <host>' on your Mac, then use clipd on that host:
+Usage:
+  clipd <command>
 
-  ls -l | clipd            copy command output
-  clipd notes.txt          copy a file's contents
-  clipd drop report.pdf    send a file to ~/Drop
-
-Setup edits your SSH config and the host's shell startup file.
-It installs no remote binary or service.
+Getting started:
+  clipd install            start clipd on this Mac
+  clipd setup <host>       configure an SSH host
 
 Commands:
-  serve       run the daemon in the foreground
-  setup       configure an SSH host
-  status      show daemon status and settings
-  install     install and start the login service (macOS)
-  restart     restart the daemon (macOS)
-  uninstall   stop and remove the login service (macOS)
-  version     show version and build information
-  help        show help for a command
+  status                   check daemon status
+  restart                  restart the daemon
+  serve                    run in the foreground
+  uninstall                remove the login service
+  version                  show version information
+  help [topic]             show help (also: config, security)
 
-Global options:
-  -config <path>     use a different config file
-  -verbose, -v       log more detail from the daemon
+On the remote host:
+  command | clipd          copy command output
+  clipd notes.txt          copy a file's contents
+  clipd drop report.pdf    send files or folders
 
-Environment:
-  CLIPD_CONFIG       path to the config file
+Options:
+  -config <path>           use a different config file
+  -verbose, -v             enable diagnostic logs
 
-The config file is optional; clipd uses defaults when it is missing.
-Default path: ~/.config/clipd/config.json
-With XDG_CONFIG_HOME set: $XDG_CONFIG_HOME/clipd/config.json
-
-'clipd install' creates the config file.
-After changing settings, run 'clipd restart' on macOS.
-
-Run 'clipd help <command>' for command help or
-'clipd help config' for settings and limits.
+Run 'clipd help <topic>' for details.
 `)
 }
 
