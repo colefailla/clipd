@@ -461,12 +461,6 @@ func writeAtomic(path string, data []byte) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return err
 	}
-	// Windows does not permit opening a directory for Sync through os.Open.
-	// The file itself is already synced and atomically renamed there.
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
