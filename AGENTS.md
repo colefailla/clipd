@@ -212,7 +212,7 @@ must not mutate the developer's live environment.
   listeners and every non-socket file.
 - The generated function and setup remove the remote `~/.clipd/socket` only
   when a ping returns no reply, exits with status 1, and the inode is
-  unchanged. OpenBSD `nc` and `socat` must also print a line ending in
+  unchanged. OpenBSD `nc` and `socat` must also print
   `: Connection refused`, kept apart from any reply; macOS `nc` is silent, so
   for it a silent exit 1 is a documented heuristic, not proof. The ping uses
   its own short inactivity timeout (`probeSeconds`), not an absolute deadline;

@@ -64,8 +64,8 @@ the immediate parent directory's mode bits only, not every ancestor, ownership
 or macOS ACLs. On the remote, the generated shell function removes
 `~/.clipd/socket` only when a ping to it returns no reply and the client exits
 with status 1, and only if the file is still the same socket by inode. For
-OpenBSD `nc` and `socat` a diagnostic line must also end in `: Connection
-refused`; a path that merely contains "refused" does not count. macOS `nc`
+OpenBSD `nc` and `socat` the message must also include `: Connection
+refused`; a path that merely contains the word "refused" does not count. macOS `nc`
 prints nothing, and exits 1 silently for some other failures before connecting
 too, so on a macOS remote a silent exit 1 is a heuristic for a stale socket
 rather than proof; a wrong guess removes a live forward and costs a reconnect. A

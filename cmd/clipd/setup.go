@@ -461,8 +461,8 @@ func rcFileFor(f remoteFacts) string {
 // the server sets StreamLocalBindUnlink it then refuses every later forward to
 // that path. A refused connection on a UNIX socket means nothing is bound to
 // it, and the socket is removed only when the probe shows exactly that: exit
-// status 1, no reply, and a diagnostic line ending in ": Connection refused",
-// the form OpenBSD nc and socat print. macOS nc prints nothing, so for it an
+// status 1, no reply, and the ": Connection refused" diagnostic OpenBSD nc and
+// socat print. macOS nc prints nothing, so for it an
 // otherwise silent exit 1 is accepted as the heuristic described on
 // transport.silentRefusal. A timeout or a peer that closes without replying
 // exits 0 and a signal exits above 128, so a live forward survives even when
@@ -477,8 +477,9 @@ func rcFileFor(f remoteFacts) string {
 // vanished, and narrows the window in which a new session could bind a fresh
 // socket between the probe and the rm.
 func staleSocketScript(t transport) string {
-	refusal := `*": Connection refused"|*": Connection refused
-"*`
+	// One line on purpose: shellFunction indents this script, and an indent
+	// inside a pattern spanning two lines would change what it matches.
+	refusal := `*": Connection refused"*`
 	if t.silentRefusal {
 		refusal = `"clipd-probe-status:1:"|` + refusal
 	}

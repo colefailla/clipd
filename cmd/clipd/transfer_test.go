@@ -340,7 +340,9 @@ func testStaleSocketRule(t *testing.T, shell string, code int, output, reply str
 		probe:         `sh -c 'cat >/dev/null; [ -z "$PROBE_OUTPUT" ] || printf "%s\n" "$PROBE_OUTPUT" >&2; [ -z "$PROBE_REPLY" ] || printf "%s\n" "$PROBE_REPLY"; exit "$PROBE_CODE"'`,
 		silentRefusal: silent,
 	}
-	script := "_clipd_sock=" + shellQuote(socket) + "\n" + staleSocketScript(probe) + `printf 'stale=%s\n' "$_clipd_stale"`
+	// Indented as shellFunction embeds it: an indent can change a pattern
+	// that spans lines, which an unindented test would never notice.
+	script := "_clipd_sock=" + shellQuote(socket) + "\n" + indent(staleSocketScript(probe), "      ") + `printf 'stale=%s\n' "$_clipd_stale"`
 	command := exec.Command(shell, "-c", script)
 	command.Env = append(os.Environ(), "PROBE_OUTPUT="+output, "PROBE_REPLY="+reply, fmt.Sprintf("PROBE_CODE=%d", code))
 	out, err := command.CombinedOutput()
@@ -415,7 +417,7 @@ func TestStaleSocketProbeWithRealTransports(t *testing.T) {
 				default:
 					listenUnix(t, socket, state == "silent")
 				}
-				script := "_clipd_sock=" + shellQuote(socket) + "\n" + staleSocketScript(client) + `printf 'stale=%s\n' "$_clipd_stale"`
+				script := "_clipd_sock=" + shellQuote(socket) + "\n" + indent(staleSocketScript(client), "      ") + `printf 'stale=%s\n' "$_clipd_stale"`
 				ctx, cancel := context.WithTimeout(context.Background(), (probeSeconds+5)*time.Second)
 				defer cancel()
 				start := time.Now()

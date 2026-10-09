@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,9 +21,14 @@ import (
 // unaltered.
 func fakeHelpers(t *testing.T, names ...string) (dir string) {
 	t.Helper()
+	// Resolved before PATH is narrowed to dir, which hides cat from the fakes.
+	cat, err := exec.LookPath("cat")
+	if err != nil {
+		t.Fatalf("find cat: %v", err)
+	}
 	dir = t.TempDir()
 	for _, name := range names {
-		script := "#!/bin/sh\ncat >> " + filepath.Join(dir, name+".out") + "\n"
+		script := "#!/bin/sh\n" + cat + " >> " + filepath.Join(dir, name+".out") + "\n"
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
 			t.Fatalf("write fake %s: %v", name, err)
 		}
