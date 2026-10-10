@@ -152,9 +152,12 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 		KeepAlive:       true,
 		StandardOutPath: logPath,
 		StandardErrPath: logPath,
+		// A LaunchAgent gets no locale, and pbcopy then decodes its input as
+		// Mac Roman instead of UTF-8. wincent/clipper ships the same setting.
+		EnvironmentVariables: map[string]string{"LANG": "en_US.UTF-8"},
 	}
 	if opts.ConfigPath != "" {
-		spec.EnvironmentVariables = map[string]string{"CLIPD_CONFIG": opts.ConfigPath}
+		spec.EnvironmentVariables["CLIPD_CONFIG"] = opts.ConfigPath
 	}
 
 	data, err := spec.Marshal()

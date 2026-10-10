@@ -128,6 +128,9 @@ func TestInstallWritesAndLoads(t *testing.T) {
 	if !strings.Contains(body, "<string>serve</string>") {
 		t.Error("plist does not pass the serve subcommand")
 	}
+	if !strings.Contains(body, "<key>LANG</key>\n\t\t<string>en_US.UTF-8</string>") {
+		t.Errorf("plist does not set a UTF-8 LANG for pbcopy:\n%s", body)
+	}
 
 	// The log directory has to exist before launchd tries to redirect into it.
 	if _, err := os.Stat(filepath.Dir(res.LogPath)); err != nil {

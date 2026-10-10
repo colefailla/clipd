@@ -38,8 +38,8 @@ type Spec struct {
 	KeepAlive        bool
 	StandardOutPath  string
 	StandardErrPath  string
-	// EnvironmentVariables is used to pin a non-default config path, since a
-	// LaunchAgent does not inherit the user's shell environment.
+	// EnvironmentVariables sets the locale and pins a non-default config
+	// path, since a LaunchAgent does not inherit the user's shell environment.
 	EnvironmentVariables map[string]string
 }
 
