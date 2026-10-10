@@ -1,0 +1,123 @@
+name: CI
+
+# Runs on every push to main and on every pull request, so a change is
+# verified on a clean machine rather than only on the laptop that wrote it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Third-party actions are pinned to a commit rather than a tag. A tag is a
+# mutable pointer, and these workflows check out the source that becomes the
+# binaries people install with sudo: a moved tag would be arbitrary code
+# execution in a job holding a release token. The tag stays in a trailing
+# comment because a bare SHA is unreadable, and Dependabot updates both
+# together (see .github/dependabot.yml).
+
+jobs:
+  test:
+    # Both platforms, because clipd's code is genuinely split by build tag:
+    # the pbcopy backend and the whole launchagent package are darwin-only and
+    # do not even compile into a Linux build. Testing on Linux alone would
+    # leave the macOS half unverified; testing on macOS alone would not prove
+    # the client still builds for the machine it actually runs on.
+    #
+    # Both Go versions, because the two answer different questions. The floor
+    # declared in go.mod is a promise to anyone running `go install`, and it
+    # only stays true if something keeps compiling against it. `stable` is what
+    # releases are built with, and it is where a new vet check or a behaviour
+    # change shows up first.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ["1.24", "stable"]
+
+    runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -s -d .
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The client is expected to run on Linux even when built from a Mac, so
+      # the cross-target vet runs everywhere rather than only on Linux.
+      - name: Vet (linux target)
+        run: GOOS=linux GOARCH=amd64 go vet ./...
+
+      # -race is the point of running tests in CI at all for this project: the
+      # daemon is concurrent, and a data race is exactly the class of bug that
+      # passes locally and fails in production.
+      - name: Test
+        run: go test -race ./...
+
+  vulncheck:
+    # clipd has no third-party dependencies, so this is entirely about the
+    # standard library it is linked against — archive/tar above all, which
+    # parses attacker-controlled input on every drop. A daemon that unpacks
+    # archives should not be shipped against a stdlib with a known hole in it,
+    # and "we would have noticed" is not a control.
+    #
+    # Run via `go run` rather than added to go.mod, so the module itself stays
+    # dependency-free.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  cross-compile:
+    # A separate job so a broken build for one target is reported as its own
+    # failure rather than hiding behind the test results.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # Releases are built with the current toolchain, so the build that
+          # gates them should use it too.
+          go-version: stable
+
+      - name: Build every release target
+        run: make dist
+
+      - name: Confirm the Linux binaries are static
+        # CGO_ENABLED=0 is what lets a binary built here run on any Debian
+        # without matching libc versions. If that ever regresses, the download
+        # would fail at the user's machine rather than here.
+        run: |
+          for f in dist/clipd_linux_*; do
+            if ! file "$f" | grep -q "statically linked"; then
+              echo "$f is dynamically linked"; file "$f"; exit 1
+            fi
+            echo "ok: $f"
+          done

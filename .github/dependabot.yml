@@ -1,0 +1,17 @@
+version: 2
+
+# Pinning actions to a commit SHA stops a moved tag from becoming code
+# execution in a release job, but it also freezes them: a pinned action never
+# picks up its own security fixes. This is the other half of that trade —
+# Dependabot proposes the new SHA, and the update arrives as a reviewable pull
+# request rather than silently.
+#
+# There is no gomod entry because clipd has no third-party Go dependencies. The
+# standard library is covered by govulncheck in CI instead.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

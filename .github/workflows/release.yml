@@ -1,0 +1,115 @@
+name: Release
+
+# Fires when a version tag is pushed:
+#
+#   git tag v2.1.0 && git push origin v2.1.0
+#
+# and publishes prebuilt binaries for all four targets, so installing clipd
+# does not require a Go toolchain on the target machine.
+on:
+  push:
+    tags: ["v*"]
+
+# Default to nothing; each job opts in to exactly what it needs. This workflow
+# is the one that produces binaries people install with sudo, so the blast
+# radius of a compromised step is worth keeping small.
+permissions: {}
+
+jobs:
+  # A tag that cannot pass its own tests should not become a release — on
+  # either platform. The darwin-only packages (pbcopy, launchagent) are what
+  # the release ships to Macs, and their tests do not even compile on Linux,
+  # so an ubuntu-only gate would prove nothing about them.
+  test:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    # Spelled out rather than left to the workflow-level {}: checkout only
+    # clones without it because this repository is public, which is a property
+    # of the repository rather than of this job.
+    permissions:
+      contents: read
+
+    steps:
+      # Pinned to a commit rather than a tag; see the note in ci.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # The same toolchain the release job builds with, so the gate tests
+          # what actually ships.
+          go-version: stable
+
+      - name: Test
+        run: go test -race ./...
+
+      # Nor should a release ship a known stdlib vulnerability.
+      - name: govulncheck
+        if: matrix.os == 'ubuntu-latest'
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Creating a release means writing to the repository.
+      contents: write
+      # Build provenance: id-token mints the signing certificate, attestations
+      # records the result. Together they let anyone verify that a downloaded
+      # binary came out of this workflow, from this commit, rather than off
+      # someone's laptop.
+      id-token: write
+      attestations: write
+
+    steps:
+      # Pinned to a commit rather than a tag; see the note in ci.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The Makefile derives the version from `git describe --tags`. The
+          # default shallow clone has no tags, so without this every release
+          # would be stamped "dev".
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # Explicitly the current toolchain, not the floor declared in go.mod.
+          # These binaries are what users actually run, and they should not be
+          # linked against a standard library that has stopped receiving
+          # security fixes.
+          go-version: stable
+
+      - name: Build
+        run: make dist
+
+      - name: Checksums
+        # Lets anyone verify a download matches what this workflow produced:
+        #   shasum -a 256 -c SHA256SUMS
+        working-directory: dist
+        run: sha256sum clipd_* > SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/clipd_*
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # gh is preinstalled on GitHub runners, so this needs no third-party
+        # action — which keeps the release path as dependency-free as the
+        # project itself.
+        run: |
+          version="${GITHUB_REF_NAME}"
+          gh release create "$version" \
+            --title "clipd $version" \
+            --generate-notes \
+            dist/clipd_darwin_arm64 \
+            dist/clipd_darwin_amd64 \
+            dist/clipd_linux_amd64 \
+            dist/clipd_linux_arm64 \
+            dist/SHA256SUMS
