@@ -1,15 +1,5 @@
-// Package launchagent installs clipd as a per-user macOS LaunchAgent.
-//
-// A LaunchAgent, not a LaunchDaemon. A LaunchDaemon runs as root in the
-// system domain with no connection to any user's GUI session, and the macOS
-// pasteboard belongs to a GUI session: pbcopy invoked from a LaunchDaemon
-// either fails outright or writes somewhere the logged-in user will never
-// paste from. A LaunchAgent bootstrapped into gui/<uid> runs as the user,
-// inside their session, with exactly the pasteboard access `pbcopy` has when
-// they run it in Terminal. It also means none of this needs root.
-//
-// Plist generation lives in this file with no build tag so it can be tested
-// on any platform; the launchctl interaction is darwin-only.
+// Package launchagent manages a per-user macOS login service. A LaunchAgent
+// runs in the user's GUI session, where pbcopy can access the pasteboard.
 package launchagent
 
 import (
@@ -20,14 +10,10 @@ import (
 	"strings"
 )
 
-// Label is the launchd service label. It doubles as the plist filename, which
-// launchd requires to match.
+// Label identifies the launchd job and names its plist.
 const Label = "com.clipd.agent"
 
-// ErrUnsupported reports that launchd exists only on macOS. On Linux clipd is
-// a client and has nothing to install: the binary on PATH is the whole
-// deployment. It is declared here, untagged, so callers can compare against
-// it on every platform.
+// ErrUnsupported reports an attempt to manage launchd on another platform.
 var ErrUnsupported = errors.New("LaunchAgent management is only available on macOS")
 
 // Spec is the subset of a launchd job description clipd needs.

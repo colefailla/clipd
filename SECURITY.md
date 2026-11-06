@@ -21,7 +21,8 @@ the intended grant rather than escalations:
 
 - Anything running as you on a host you have forwarded the socket to can write
   to your clipboard and send you files. Other accounts on that host cannot,
-  because the socket is mode 0600, but your own processes can.
+  because setup places the socket inside a private 0700 directory. The remote
+  SSH server controls the socket mode; client settings do not enforce it.
 - Anyone with a shell as your user on either machine. The socket and the config
   are protected by filesystem permissions and nothing more.
 
@@ -34,12 +35,12 @@ plain terms. The rest of this file is the precise version.
 ## Guarantees and known exceptions
 
 **Drops.** Streaming drops (current shell functions) write only regular files
-and directories. They validate every relative path and refuse the whole drop for
-an absolute path, `..`, control or bidirectional characters, or a collision
-within one request. Symlinks, hard links, devices and FIFOs are skipped, never
-created or followed, and counted in the reply; one that declares a body, or any
-other entry type, refuses the drop. Files are received into a
-private staging directory inside the drop directory and published only after
+and directories. Paths being received are validated; absolute paths, `..`,
+control or bidirectional characters, and conflicting file paths refuse the
+whole drop. Symlinks, hard links, devices and FIFOs are skipped, never
+created or followed, and counted in the reply. Their names are not used as
+filesystem paths. One that declares a body, or any other unsupported entry
+type, refuses the drop. Files are received into a private staging directory inside the drop directory and published only after
 the whole archive has parsed and the sender's completion marker, sent only after
 `tar` succeeded, has arrived. Published files are `0600`, directories `0700`,
 and existing names are never overwritten or merged. Archive drops from shell
@@ -51,13 +52,15 @@ and the quarantine attribute use pathname APIs, so confinement to the opened
 drop root is not absolute for those two operations. Quarantine is best effort.
 
 **Resources.** Per-request bounds cover connections (64), concurrent work,
-buffered clipboard payloads and their product with concurrency (2 GiB), archive
+clipboard payload sizes and their product with concurrency (2 GiB), archive
 entries, files and bytes, frame and reply sizes, the absolute lifetime of a
 connection (`max_transfer_seconds`), reply writes and log rate. Reads have no
 separate idle timeout: a silent sender holds its connection until that lifetime
 ends, within the connection cap. Reading stops up to five seconds before the
 lifetime ends, so the reason can be written without extending it. Cumulative
-published files are not bounded.
+published files are not bounded. The payload budget is not a process-memory
+ceiling: buffer capacity, allocation overhead and other state use additional
+memory.
 
 **Sockets.** The Mac socket is mode `0600`. A custom socket path is checked for
 the immediate parent directory's mode bits only, not every ancestor, ownership

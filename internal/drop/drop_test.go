@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -899,5 +900,43 @@ func TestZeroByteFileAtExactSizeLimit(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := Extract(streamOf(t, entry{name: "a", body: "123"}, entry{name: "empty"}), Options{Dir: dir, MaxBytes: 3}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCleanStaleScansMultipleBatches(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	old := time.Now().Add(-2 * StaleCleanupInterval)
+	for i := 0; i < 300; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("keep-%d", i)), []byte("keep"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		txn, err := beginTransaction(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filepath.Join(dir, txn.dir), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := CleanStale(dir); n != 300 {
+		t.Fatalf("removed %d of 300 stale directories", n)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 300 {
+		t.Fatalf("remaining entries: %d", len(entries))
+	}
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil || string(data) != "keep" {
+			t.Fatal("published file changed")
+		}
 	}
 }

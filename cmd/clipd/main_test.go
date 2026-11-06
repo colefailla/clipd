@@ -13,16 +13,13 @@ type result struct {
 	stderr string
 }
 
-// runCLI runs the CLI with an isolated environment and captures its output.
+// runCLI runs the CLI and captures its output.
 func runCLI(t *testing.T, args ...string) result {
 	t.Helper()
 	var out, errOut bytes.Buffer
 	e := &env{
 		stdout: &out,
 		stderr: &errOut,
-		// An empty environment keeps the developer's real CLIPD_CONFIG from
-		// leaking into the tests.
-		getenv: func(string) string { return "" },
 	}
 	code := run(context.Background(), args, e)
 	return result{code: code, stdout: out.String(), stderr: errOut.String()}

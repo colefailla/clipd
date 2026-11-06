@@ -103,9 +103,13 @@ ssh -O exit debian 2>/dev/null; ssh debian
 If you use SSH connection sharing, `ssh -O exit` closes the shared connection
 and any sessions using it.
 
-Aliases, hostnames, IP addresses and `user@host` are accepted. Set up each
-spelling you use: `debian` and `debian.local` need separate blocks. Different
+Aliases, hostnames, IPv4 addresses and `user@host` are accepted.
+For an IPv6 address, use an SSH alias with that address as its `HostName`.
+Set up each spelling you use: `debian` and `debian.local` need separate blocks. Different
 accounts, such as `alice@server` and `bob@server`, are configured separately.
+Even without `user@`, setup scopes the forward to the account it connected to.
+If you change the account an alias uses, rerun setup. Rerunning setup also
+replaces older blocks that matched every account at that destination.
 
 Setup selects the appropriate `nc` flags or uses `socat`. It does not install
 missing packages. Fish, csh and tcsh cannot load the function; setup prints how
@@ -211,8 +215,15 @@ limits, `0` also means the default, not unlimited. Unknown settings and invalid
 values are rejected. Config files from older clipd releases are not migrated.
 
 `max_payload_bytes` multiplied by `max_concurrent` must not exceed 2 GiB.
+This bounds payload sizes, not total process memory; buffers and other state
+add overhead. Installation rejects invalid combinations before changing
+the service.
 Concurrent drops can each use up to `max_drop_bytes` of disk space. Received
 files accumulate until you remove them.
+
+For `clipd install`, `address` and `drop_dir` must be absolute paths or begin
+with `~/`. Relative paths are supported by foreground `clipd serve`, where
+they resolve from its working directory.
 
 Settings are read at startup. After editing, run `clipd restart` on macOS or
 stop and restart `clipd serve` on Linux. `clipd status` displays the resolved
@@ -239,8 +250,9 @@ drop. For output larger than the clipboard limit, use
 
 SSH encrypts forwarded traffic, verifies the host key and authenticates your
 account. The daemon listens only on a private UNIX socket, mode `0600`. The
-remote socket is inside a `0700` directory, and setup pins its bind mask to
-`0177`.
+remote socket is inside a `0700` directory. Its own permissions are controlled
+by the remote SSH server, whose default bind mask is `0177` (socket mode `0600`).
+Client-side bind-mask settings do not control a remote forward.
 
 Any process running as your user on a forwarded host can write to your
 clipboard and send files to your computer. Other ordinary accounts cannot
@@ -370,6 +382,23 @@ On each remote host:
 Delete the marked function block and remove `~/.clipd` after closing sessions
 using its forward. If you added the optional sshd setting, remove it and reload
 sshd to undo that change.
+
+## Development
+
+Run `make check` for formatting, vet and race tests. CI requires sh, dash,
+Bash, Zsh, OpenBSD nc (macOS nc on Macs), and socat, installing missing test
+tools so both supported transports are exercised.
+
+`CLIPD_TEST_SSHD=1 go test ./cmd/clipd -run TestSSHForwardLifecycle -v`
+starts a temporary loopback-only sshd with temporary keys and configuration.
+It tests transfer, stale-socket recovery, reconnect, and a live forward with
+the receiver down. It opens no remote shell and does not install a service or
+edit SSH configuration. Run it on a disposable runner with sshd available.
+
+`go test ./internal/drop -run '^$' -bench BenchmarkExtract -benchtime=3x`
+compares an 8 MiB file with 256 files totaling 8 MiB, including file sync and
+macOS quarantine. `-bench BenchmarkQuarantine` measures the native quarantine
+helper separately on macOS. All output files are temporary.
 
 ## Credits
 

@@ -12,10 +12,7 @@ import (
 	"time"
 )
 
-// pbcopyPath is macOS's built-in clipboard writer. Shelling out to it avoids
-// cgo and an NSPasteboard binding for v1; the process cost is irrelevant for
-// an operation a human triggers by hand. Moving to NSPasteboard later is a
-// drop-in replacement behind the Clipboard interface.
+// pbcopyPath is macOS's built-in clipboard writer.
 const pbcopyPath = "/usr/bin/pbcopy"
 
 // New returns the macOS clipboard backend.

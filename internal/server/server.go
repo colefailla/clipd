@@ -31,17 +31,9 @@ import (
 )
 
 const (
-	// defaultMaxConcurrent bounds the messages being carried out at once:
-	// buffering a clipboard payload and forking pbcopy, or extracting an
-	// archive to disk.
-	//
-	// Small, because the peers are the user's own SSH sessions rather than a
-	// network of clients. It is also the second half of the daemon's memory
-	// bound: a clipboard payload is buffered whole, so the ceiling is roughly
-	// this times the payload limit — about 80 MiB at the defaults, and
-	// transiently more, since the buffer grows by doubling and briefly holds
-	// both halves while it does. Raising the payload limit a long way is a
-	// reason to lower this. A drop is streamed to disk and costs nothing here.
+	// defaultMaxConcurrent bounds active copies and drops. Clipboard payloads
+	// are buffered whole; drops stream to disk. Buffer allocation adds overhead
+	// beyond the configured payload-size product.
 	defaultMaxConcurrent = 8
 
 	// defaultMaxConnections bounds sockets in any state, the backstop against
@@ -72,10 +64,8 @@ const (
 	// rejection land before the socket closes.
 	drainTimeout = 5 * time.Second
 
-	// maxClipboardBudget caps what a busy daemon can be made to buffer at once.
-	// A clipboard payload is held whole in memory, so the ceiling that matters
-	// is the payload limit times the work slots, not either one alone.
-	maxClipboardBudget int64 = 2 << 30
+	// maxClipboardBudget bounds payload sizes, excluding allocation overhead.
+	maxClipboardBudget int64 = config.MaxClipboardBudget
 
 	// shutdownGrace is how long the daemon waits for in-flight work before
 	// giving up on it.
@@ -151,12 +141,7 @@ type Server struct {
 	closed   bool
 }
 
-// warnLimiter is a fixed-window rate limiter for peer-driven log lines.
-//
-// A token bucket would be smoother, but a fixed window is a dozen lines and
-// clipd has no third-party dependencies to borrow one from. The distinction
-// does not matter for a limiter whose only job is to keep a misbehaving peer
-// from growing a file without bound.
+// warnLimiter bounds peer-driven log lines per minute and counts suppression.
 type warnLimiter struct {
 	mu          sync.Mutex
 	windowStart time.Time
@@ -675,38 +660,15 @@ func dropSummary(names []string) string {
 	return fmt.Sprintf("%s and %d more", strings.Join(names[:8], ", "), len(names)-8)
 }
 
-// drainRejected reads and discards what the sender is still transmitting, so
-// that closing the connection does not destroy the rejection just written.
-//
-// A socket closed while data is still arriving is torn down abruptly, and the
-// reply sitting in the sender's receive buffer goes with it. Whether the sender
-// sees the message therefore depends on whether it happened to be idle at that
-// instant — which in practice depends on how fast its disk is. The same command
-// against the same directory reports the error six times out of ten and says
-// nothing the other four. Reading the remainder first makes the close orderly
-// and the message reliable.
-//
-// Bounded, because the alternative is unbounded: a sender 50 GB over the limit
-// cannot be waited out, and reading it all would be a denial of service dressed
-// as politeness. Past the cap the abrupt close is accepted and the message may
-// still be lost. net/http makes the same trade at the same size, for the same
-// reason.
-//
-// Bounded in time as well as bytes, so a sender dripping bytes cannot hold the
-// work slot for the rest of the connection's lifetime. lifetimeConn keeps the
-// drain deadline from outliving the connection.
+// drainRejected reads a bounded remainder so pending input is less likely to
+// destroy the error reply when the connection closes. Beyond the byte or time
+// cap, an abrupt close and possible loss of the reply are accepted.
 func drainRejected(conn net.Conn, r io.Reader) {
 	_ = conn.SetReadDeadline(time.Now().Add(drainTimeout))
 	_, _ = io.CopyN(io.Discard, r, drainCap)
 }
 
-// respondOK and respondError write the one line the peer sees.
-//
-// The status token in front of the message is what makes the result
-// machine-readable. The reply used to be undifferentiated prose, so the
-// generated shell function had no way to tell "dropped 3 files" from "archive
-// exceeds the size limit" and every drop exited 0 either way — which made
-// `clipd drop x && rm x` delete a file the daemon had refused.
+// respondOK and respondError preserve the machine-readable status prefixes.
 func (s *Server) respondOK(conn net.Conn, message string) {
 	s.respond(conn, protocol.StatusOK+message)
 }
@@ -715,13 +677,7 @@ func (s *Server) respondError(conn net.Conn, message string) {
 	s.respond(conn, protocol.StatusError+message)
 }
 
-// respond writes a single human-readable line back to the peer.
-//
-// The client is `nc`, which prints whatever it receives and exits once the
-// far end closes. That makes this line the entire user interface for the
-// result: without it a copy is silent whether it worked or not, and the
-// connection appears to hang until the client is told to half-close. Keeping
-// it plain text rather than JSON is what lets an unmodified `nc` display it.
+// respond bounds each reply and its write deadline.
 func (s *Server) respond(conn net.Conn, line string) {
 	if len(line) > protocol.MaxFrameBytes {
 		line = line[:protocol.MaxFrameBytes-4]

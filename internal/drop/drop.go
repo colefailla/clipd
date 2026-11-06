@@ -58,9 +58,8 @@ const (
 	stageMarkerV1  = "clipd staging directory v1\n"
 )
 
-// StaleCleanupInterval is both the minimum age CleanStale will remove and how
-// often the daemon revisits leftovers. It is longer than the server's absolute
-// connection lifetime, so cleanup cannot race a live daemon transfer.
+// StaleCleanupInterval is the cleanup frequency and minimum age. The server
+// raises the minimum age when the configured transfer lifetime is longer.
 const StaleCleanupInterval = time.Hour
 
 // wirePerEntry is the wire budget each archive entry gets for its framing, on
@@ -326,11 +325,7 @@ func CleanStale(dir string, minimumAge ...time.Duration) int {
 	if err != nil {
 		return 0
 	}
-	entries, err := dirFile.ReadDir(-1)
-	_ = dirFile.Close()
-	if err != nil {
-		return 0
-	}
+	defer dirFile.Close()
 
 	age := StaleCleanupInterval
 	if len(minimumAge) > 0 && minimumAge[0] > age {
@@ -338,27 +333,34 @@ func CleanStale(dir string, minimumAge ...time.Duration) int {
 	}
 	cutoff := time.Now().Add(-age)
 	removed := 0
-	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), stageDirPrefix) {
-			continue
+	for {
+		entries, readErr := dirFile.ReadDir(128)
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), stageDirPrefix) {
+				continue
+			}
+			info, err := root.Lstat(entry.Name())
+			if err != nil || !info.IsDir() || info.ModTime().After(cutoff) {
+				continue
+			}
+			if !hasStageMarker(root, entry.Name()) {
+				continue
+			}
+			if removeTransaction(root, entry.Name()) == nil {
+				removed++
+			}
 		}
-		info, err := root.Lstat(entry.Name())
-		if err != nil || !info.IsDir() || info.ModTime().After(cutoff) {
-			continue
-		}
-		if !hasStageMarker(root, entry.Name()) {
-			continue
-		}
-		if removeTransaction(root, entry.Name()) == nil {
-			removed++
+		if readErr != nil {
+			break
 		}
 	}
+
 	return removed
 }
 
 // Save writes a single stream into opts.Dir under name.
 //
-// This is the pipeline case — `pg_dump db | clipd drop dump.sql` — where there
+// This is the pipeline case — `pg_dump db | clipd drop --name dump.sql` — where there
 // is no archive because the bytes never existed as a file. It shares every
 // guarantee Extract has, and for the same reasons: the name is reduced to a
 // bare filename, nothing is overwritten, nothing is made executable, the size
@@ -421,14 +423,8 @@ func Save(r io.Reader, name string, opts Options) (Result, error) {
 	return Result{Names: []string{finalName}, Bytes: n}, nil
 }
 
-// safeName reduces an archive entry's name to a bare filename that cannot
-// escape the destination directory.
-//
-// filepath.Base is what does the work, and it is why nothing here needs to
-// reason about escaping: it discards every directory component, so
-// "../../.ssh/authorized_keys" becomes "authorized_keys" and "/etc/passwd"
-// becomes "passwd". The checks that follow only reject the handful of results
-// that are not usable filenames at all.
+// safeName reduces named stdin input to a validated basename. Archive paths
+// are separately validated component by component by archivePath.
 func safeName(raw string) (string, error) {
 	// Windows-style separators first: a tar written on another platform can
 	// carry them, and Base on Unix would treat the whole thing as one name.
@@ -455,7 +451,7 @@ func safeName(raw string) (string, error) {
 	// is both written to disk and echoed back to the sender's terminal in the
 	// acknowledgement, where an embedded newline forges a second response line
 	// and an ANSI escape drives the terminal directly. Refusing them here fixes
-	// both at once, and no filename worth having contains one.
+	// both at once.
 	if i := strings.IndexFunc(name, isControl); i >= 0 {
 		return "", fmt.Errorf("drop: archive entry %q contains a control character at byte %d",
 			shortName(raw), i)
@@ -562,18 +558,9 @@ func verifyRootPath(root *os.Root) error {
 	return nil
 }
 
-// publish gives a completed transaction file its real name, adding a numeric
-// suffix if that name is taken.
-//
-// os.Link rather than os.Rename, and the distinction is the load-bearing part:
-// rename silently replaces whatever is already at the destination, which is the
-// difference between receiving a drop and losing one. Link fails with EEXIST
-// instead — the same guarantee O_CREATE|O_EXCL gave the version this replaced —
-// and it does not follow a symlink planted at the destination either, so a link
-// an attacker left in Dir cannot redirect the publish out of it.
-//
-// Bounded rather than open-ended so that a sender cannot make the daemon walk
-// an unbounded sequence by repeatedly dropping the same name.
+// publish uses hard links to avoid overwriting an existing destination.
+// Staging links remain available until publication finishes, allowing rollback.
+// Name collision retries are bounded.
 func publish(root *os.Root, staged, name string) (string, error) {
 	if err := verifyRootPath(root); err != nil {
 		return "", err
@@ -615,14 +602,7 @@ func splitName(name string) (stem, ext string) {
 	return strings.TrimSuffix(name, ext), ext
 }
 
-// quarantine marks a file as having come from outside, so that macOS treats it
-// the way it treats a browser download: Gatekeeper checks it, and opening it
-// asks first.
-//
-// Best effort by design. The attribute is defence in depth on top of the
-// extraction rules above, not a substitute for them, and a drop that landed
-// safely should not be reported as failed because an optional label could not
-// be applied.
+// requestContext uses the request deadline when supplied.
 func requestContext(opts Options) context.Context {
 	if opts.Context != nil {
 		return opts.Context
@@ -630,6 +610,8 @@ func requestContext(opts Options) context.Context {
 	return context.Background()
 }
 
+// quarantine applies macOS quarantine before publication. Failure is best effort;
+// the helper is bounded by both its own timeout and the request deadline.
 func quarantine(ctx context.Context, path string) {
 	if runtime.GOOS != "darwin" {
 		return

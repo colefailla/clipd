@@ -1,11 +1,4 @@
-// Command clipd is a terminal-independent remote clipboard.
-//
-// The daemon runs on the Mac and listens on a UNIX domain socket. Forwarding
-// that socket over SSH puts it on a remote machine, where anything able to
-// write bytes — `nc`, an editor, a shell function — can put text on the Mac's
-// clipboard or send it a file. Nothing is installed on the remote side, and
-// nothing is asked of the terminal emulator, so the workflow behaves
-// identically in Terminal.app, iTerm2, Ghostty, tmux or a VS Code panel.
+// Command clipd receives clipboard text and file drops through SSH-forwarded UNIX sockets.
 package main
 
 import (
@@ -39,8 +32,6 @@ const (
 type env struct {
 	stdout io.Writer
 	stderr io.Writer
-
-	getenv func(string) string
 }
 
 // globalOptions are accepted before or after the subcommand.
@@ -76,7 +67,6 @@ func main() {
 	e := &env{
 		stdout: os.Stdout,
 		stderr: os.Stderr,
-		getenv: os.Getenv,
 	}
 	os.Exit(run(context.Background(), os.Args[1:], e))
 }

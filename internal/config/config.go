@@ -1,15 +1,4 @@
-// Package config loads and saves the clipd daemon's settings.
-//
-// The file is small on purpose. Everything clipd used to store about identity
-// — a shared token, a pinned server fingerprint, paths to a TLS keypair — is
-// gone, because SSH now supplies authentication and encryption and the socket's
-// filesystem permissions supply authorisation. What is left describes where to
-// listen, where to put dropped files, and how large a message may be.
-//
-// A consequence worth stating: this file no longer holds a secret. It is still
-// written 0600 inside a 0700 directory, because that costs nothing and because
-// the settings describe how a daemon behaves, but losing it no longer means
-// losing access to anything.
+// Package config loads and saves the receiving daemon's settings.
 package config
 
 import (
@@ -41,12 +30,7 @@ const (
 	FilePerm fs.FileMode = 0o600
 )
 
-// EnvConfig selects the config file, the one environment variable clipd reads.
-//
-// The rest of the CLIPD_* overlay is gone. It existed to vary a client's
-// server address and token per invocation; there is no client and no token
-// now, and every remaining setting belongs to a daemon that launchd starts
-// with no environment at all.
+// EnvConfig overrides the default configuration file path.
 const EnvConfig = "CLIPD_CONFIG"
 
 // Defaults.
@@ -56,9 +40,7 @@ const (
 	// another user between daemon restarts.
 	DefaultAddress = "~/.clipd.sock"
 
-	// DefaultDropDir is where `clipd drop` puts files. A dedicated directory,
-	// never an existing one like ~/Downloads, so that nothing arriving over
-	// the socket can be confused with something the user put there.
+	// DefaultDropDir is the default destination for received files.
 	DefaultDropDir = "~/Drop"
 
 	// DefaultMaxPayloadBytes caps one clipboard message.
@@ -68,8 +50,7 @@ const (
 	DefaultMaxDropBytes int64 = 256 << 20
 	DefaultMaxDropFiles       = 256
 
-	// MaxAllowedPayloadBytes is the ceiling Validate enforces, well above any
-	// plausible paste and well below anything that would trouble a Mac.
+	// MaxAllowedPayloadBytes caps a configured clipboard payload limit.
 	MaxAllowedPayloadBytes int64 = 1 << 30
 
 	// The remaining ceilings exist so that every limit the daemon derives from
@@ -86,6 +67,9 @@ const (
 	// MaxAllowedConcurrent matches the daemon's own connection ceiling. Above
 	// it, work slots outnumber the sockets that could occupy them.
 	MaxAllowedConcurrent = 64
+
+	// MaxClipboardBudget bounds configured payload bytes across work slots.
+	MaxClipboardBudget int64 = 2 << 30
 )
 
 // Config is the on-disk configuration.
@@ -113,9 +97,7 @@ type Config struct {
 	MaxTransferSeconds int `json:"max_transfer_seconds"`
 }
 
-// Default returns the built-in configuration. Unlike the previous version
-// there is nothing left to establish during setup: these values work as they
-// stand, so a daemon with no config file at all is a working daemon.
+// Default returns settings that work without a config file.
 func Default() Config {
 	return Config{
 		Address:            DefaultAddress,
@@ -128,18 +110,7 @@ func Default() Config {
 	}
 }
 
-// DefaultPath returns the config file path for the current user.
-//
-// ~/.config on every platform, rather than os.UserConfigDir's per-OS answer.
-// That function returns ~/Library/Application Support on macOS, which is
-// Apple's convention for application bundles; clipd is a command-line daemon,
-// and the tools it sits beside — git, gh, btop, clipper — all live in
-// ~/.config there. Using one path on both platforms also means one line of
-// documentation instead of two, and no shell command that has to escape a
-// space in the middle of a directory name.
-//
-// XDG_CONFIG_HOME still wins when it is set, which is the whole point of the
-// variable.
+// DefaultPath uses XDG_CONFIG_HOME when set, otherwise ~/.config/clipd/config.json.
 func DefaultPath() (string, error) {
 	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
 		// XDG_CONFIG_HOME is defined as an absolute path. A relative value is
@@ -269,14 +240,7 @@ var legacyKeys = []string{
 	"tls_cert_path", "tls_key_path", "bind_address", "port", "timeout_ms",
 }
 
-// checkLegacy turns the strict parser's complaint into an answer.
-//
-// Strict parsing is right — a typo should fail rather than silently leave a
-// default in place — but "unknown field "server_fingerprint"" tells someone
-// upgrading nothing about what happened or what to do. This is the one case
-// worth naming, and it is a lookup rather than a migration: there is nothing in
-// an old file worth carrying forward, since every current setting has a working
-// default.
+// checkLegacy identifies removed settings and explains how to replace an old config.
 func checkLegacy(path string, data []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -516,6 +480,13 @@ func (c Config) Validate() error {
 	if c.MaxConcurrent > MaxAllowedConcurrent {
 		return fmt.Errorf("max_concurrent: %d exceeds the %d ceiling",
 			c.MaxConcurrent, MaxAllowedConcurrent)
+	}
+	concurrent := c.MaxConcurrent
+	if concurrent == 0 {
+		concurrent = Default().MaxConcurrent
+	}
+	if c.MaxPayloadBytes > MaxClipboardBudget/int64(concurrent) {
+		return errors.New("max_payload_bytes multiplied by max_concurrent must not exceed 2 GiB; lower either setting")
 	}
 	return nil
 }

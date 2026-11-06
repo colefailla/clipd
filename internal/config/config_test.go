@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -490,6 +491,26 @@ func TestTransferLifetimeAndLargeDropConfiguration(t *testing.T) {
 	for _, field := range []string{"max_transfer_seconds", "max_concurrent", "max_drop_bytes"} {
 		if !strings.Contains(string(data), field) {
 			t.Fatalf("missing generated setting %s", field)
+		}
+	}
+}
+
+func TestClipboardBudgetValidatedOnLoadAndSave(t *testing.T) {
+	for _, concurrent := range []int{0, 2, 3, 8, 64} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		cfg := Default()
+		cfg.MaxPayloadBytes = 1 << 30
+		cfg.MaxConcurrent = concurrent
+		valid := concurrent == 2
+		if err := cfg.Save(path); (err == nil) != valid {
+			t.Fatalf("concurrency %d: Save=%v", concurrent, err)
+		}
+		data := fmt.Sprintf(`{"max_payload_bytes":1073741824,"max_concurrent":%d}`, concurrent)
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); (err == nil) != valid {
+			t.Fatalf("concurrency %d: Load=%v", concurrent, err)
 		}
 	}
 }

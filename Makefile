@@ -12,8 +12,7 @@ LDFLAGS := -s -w \
 	-X main.commit=$(COMMIT) \
 	-X main.date=$(DATE)
 
-# -trimpath keeps local filesystem paths out of the binary, which makes builds
-# reproducible across machines.
+# -trimpath omits local source paths. DATE still varies between builds.
 GOFLAGS := -trimpath -ldflags '$(LDFLAGS)'
 
 PREFIX ?= /usr/local
@@ -95,7 +94,7 @@ install: build ## Install into $(PREFIX)/bin (may need sudo)
 reinstall: install ## macOS dev loop: build, install, restart the daemon, show status
 	@[ "$$(uname -s)" = "Darwin" ] || { \
 		echo "reinstall restarts a launchd agent and so is macOS-only;"; \
-		echo "on Linux there is no daemon and 'make install' is the whole job."; \
+		echo "on Linux, use 'make install' and restart 'clipd serve'."; \
 		exit 1; }
 	@# Replacing the binary on disk does not touch the process already running
 	@# it: launchd keeps executing the old inode until the service is

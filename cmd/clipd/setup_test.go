@@ -982,7 +982,7 @@ func TestHostPatternStripsTheUser(t *testing.T) {
 func TestSSHBlockScopesToTheUser(t *testing.T) {
 	t.Parallel()
 
-	withUser, err := sshBlockFor("alice@server", "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
+	withUser, err := sshBlockFor("alice@server", "alice", "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
 	if err != nil {
 		t.Fatalf("sshBlockFor: %v", err)
 	}
@@ -990,25 +990,19 @@ func TestSSHBlockScopesToTheUser(t *testing.T) {
 		t.Errorf("a user-qualified destination did not produce a Match block:\n%s", withUser)
 	}
 
-	bare, err := sshBlockFor("server", "/home/c/.clipd/socket", "/Users/c/.clipd.sock")
+	bare, err := sshBlockFor("server", "alice", "/home/c/.clipd/socket", "/Users/c/.clipd.sock")
 	if err != nil {
 		t.Fatalf("sshBlockFor: %v", err)
 	}
-	if !strings.Contains(bare, `Host "server"`) {
-		t.Errorf("a bare destination did not produce a Host block:\n%s", bare)
+	if !strings.Contains(bare, `Match originalhost "server" user "alice"`) {
+		t.Errorf("a bare destination did not produce an account-scoped block:\n%s", bare)
 	}
-	// Both halves of the socket's protection on a shared remote host.
-	// StreamLocalBindUnlink is deliberately not emitted: for a remote forward the
-	// socket is bound by the remote's sshd, so only its sshd_config governs. The
-	// client-side option was measured against a real host and had no effect.
-	if strings.Contains(bare, "StreamLocalBindUnlink") {
-		t.Errorf("the block emits StreamLocalBindUnlink, which does nothing for a remote forward:\n%s", bare)
-	}
-	for _, want := range []string{"StreamLocalBindMask 0177"} {
-		if !strings.Contains(bare, want) {
-			t.Errorf("the block is missing %q:\n%s", want, bare)
+	for _, option := range []string{"StreamLocalBindUnlink", "StreamLocalBindMask"} {
+		if strings.Contains(bare, option) {
+			t.Errorf("client block emits ineffective remote option %s", option)
 		}
 	}
+
 }
 
 func TestSSHBlockResetsScopeBeforeFollowingDirectives(t *testing.T) {
@@ -1028,7 +1022,7 @@ func TestSSHBlockResetsScopeBeforeFollowingDirectives(t *testing.T) {
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			block, err := sshBlockFor(tc.destination, "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
+			block, err := sshBlockFor(tc.destination, "alice", "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
 			if err != nil {
 				t.Fatalf("sshBlockFor: %v", err)
 			}
@@ -1070,7 +1064,7 @@ func TestSSHBlockResetsScopeBeforeFollowingDirectives(t *testing.T) {
 func TestSSHBlockMatchesTheNameAsTyped(t *testing.T) {
 	t.Parallel()
 
-	block, err := sshBlockFor("alice@myserver", "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
+	block, err := sshBlockFor("alice@myserver", "alice", "/home/alice/.clipd/socket", "/Users/c/.clipd.sock")
 	if err != nil {
 		t.Fatalf("sshBlockFor: %v", err)
 	}
@@ -1087,8 +1081,8 @@ func TestSSHBlockMatchesTheNameAsTyped(t *testing.T) {
 func TestSSHBlockRefusesAWideningPattern(t *testing.T) {
 	t.Parallel()
 
-	for _, destination := range []string{"*", "web?", "!prod", "a b", "-oProxyCommand=id", "alice@-host"} {
-		if _, err := sshBlockFor(destination, "/r/socket", "/l/socket"); err == nil {
+	for _, destination := range []string{"*", "web?", "!prod", "a,b", "a b", "-oProxyCommand=id", "alice@-host"} {
+		if _, err := sshBlockFor(destination, "alice", "/r/socket", "/l/socket"); err == nil {
 			t.Errorf("sshBlockFor(%q) wrote a block for a pattern, not a host", destination)
 		}
 	}
@@ -1100,7 +1094,7 @@ func TestSSHBlockRefusesAWideningPattern(t *testing.T) {
 func TestSSHBlockQuotesAndEscapes(t *testing.T) {
 	t.Parallel()
 
-	block, err := sshBlockFor("server", "/home/100%real/my socket", "/Users/c/.clipd.sock")
+	block, err := sshBlockFor("server", "alice", "/home/100%real/my socket", "/Users/c/.clipd.sock")
 	if err != nil {
 		t.Fatalf("sshBlockFor: %v", err)
 	}
@@ -1294,5 +1288,119 @@ func TestProbeAsksForTheOperatingSystem(t *testing.T) {
 
 	if !strings.Contains(probeScript, "uname -s") {
 		t.Errorf("the probe does not ask the host what it is:\n%s", probeScript)
+	}
+}
+
+func TestInstallPreservesReceivingSocket(t *testing.T) {
+	home, err := os.MkdirTemp("", "clipd-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(home)
+	socket := filepath.Join(home, ".clipd.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	script := fmt.Sprintf(installScript, "$HOME/.profile", "_clipd_stale=0", blockStart+"\n"+blockEnd)
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(os.Environ(), "HOME="+home)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v", out, err)
+	}
+	conn, err := net.DialTimeout("unix", socket, time.Second)
+	if err != nil {
+		t.Fatalf("receiving socket lost: %v", err)
+	}
+	conn.Close()
+}
+
+func TestSetupMigratesBareHostToAccountMatch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".ssh")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	start, end := sshMarkers("server")
+	original := "Host server\n  HostName example.invalid\n  User alice\n" + start + "\nHost server\n  RemoteForward /home/alice/.clipd/socket /local/socket\n  StreamLocalBindMask 0177\nHost *\n" + end + "\n"
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, destination := range []string{"server", "bob@server"} {
+		account := "alice"
+		if destination == "bob@server" {
+			account = "bob"
+		}
+		block, err := sshBlockFor(destination, account, "/home/"+account+"/.clipd/socket", "/local/socket")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := installSSHConfig(context.Background(), destination, block); err != nil {
+			t.Fatal(err)
+		}
+		if _, changed, err := installSSHConfig(context.Background(), destination, block); err != nil || changed {
+			t.Fatalf("repeat setup: changed=%v, err=%v", changed, err)
+		}
+	}
+	for _, destination := range []string{"server", "alice@server", "bob@server", "charlie@server"} {
+		out, err := exec.Command("ssh", "-G", "-F", path, destination).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var forwards []string
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "remoteforward ") {
+				forwards = append(forwards, line)
+			}
+		}
+		if destination == "charlie@server" {
+			if len(forwards) != 0 {
+				t.Fatalf("unexpected forwards: %v", forwards)
+			}
+			continue
+		}
+		account := "alice"
+		if destination == "bob@server" {
+			account = "bob"
+		}
+		if len(forwards) != 1 || !strings.Contains(forwards[0], "/home/"+account+"/.clipd/socket") {
+			t.Fatalf("%s: %v", destination, forwards)
+		}
+	}
+	backup, err := os.ReadFile(path + ".clipd-backup")
+	if err != nil || string(backup) != original {
+		t.Fatal("first backup was not preserved")
+	}
+}
+
+func TestSSHAccountMustBeLiteral(t *testing.T) {
+	for _, account := range []string{"", "*", "a,b", "!alice", "a?", "a b", "a\nUser bob", "a%u"} {
+		if _, err := sshBlockFor("server", account, "/remote/socket", "/local/socket"); err == nil {
+			t.Errorf("accepted %q", account)
+		}
+	}
+}
+
+func TestProbeReadsAndValidatesAccount(t *testing.T) {
+	for _, account := range []string{"alice", "", "*", "alice,bob"} {
+		t.Run(account, func(t *testing.T) {
+			dir := t.TempDir()
+			script := "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' 'home=/home/alice' 'os=Linux' " + shellQuote("user="+account) + "\n"
+			if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			facts, err := probe(context.Background(), "fixture", filepath.Join(dir, "control"))
+			if account == "alice" {
+				if err != nil || facts.user != account {
+					t.Fatalf("facts=%+v err=%v", facts, err)
+				}
+			} else if err == nil {
+				t.Fatalf("accepted account %q", account)
+			}
+		})
 	}
 }

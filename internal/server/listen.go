@@ -29,18 +29,8 @@ const maxPingReply = 512
 // identify itself as clipd — including by saying nothing at all.
 var ErrNotClipd = errors.New("something is listening, but it did not answer as clipd")
 
-// Ping asks whatever is listening at address to identify itself, returning nil
-// only when a clipd daemon answered.
-//
-// This replaces connecting and closing immediately, which looked like a live
-// daemon whatever was on the other end — and which, on the wire, was
-// indistinguishable from a raw clipboard message of zero bytes, so every
-// `clipd status` cleared the clipboard it was reporting on.
-//
-// A dial failure is returned as it is; anything that goes wrong after the
-// connection is accepted is wrapped in ErrNotClipd, so a caller can tell
-// "nothing there" from "something there that is not this daemon". Deleting a
-// socket file is only ever safe on the first.
+// Ping identifies a clipd listener without changing the clipboard.
+// Failures after connecting wrap ErrNotClipd so callers preserve foreign listeners.
 func Ping(network, address string) error {
 	conn, err := net.DialTimeout(network, address, pingTimeout)
 	if err != nil {
@@ -235,12 +225,8 @@ func probeSocket(path string) socketState {
 	return state
 }
 
-// ExpandPath resolves a leading ~ and makes the path absolute.
-//
-// launchd starts agents with / as the working directory, so a relative path
-// that worked in a shell would resolve somewhere else entirely under the
-// daemon. Absolutising here means the value in the config means the same thing
-// in both places.
+// ExpandPath expands a leading ~ and resolves relative paths against the
+// current working directory. Service installation rejects relative paths.
 func ExpandPath(path string) (string, error) {
 	if strings.HasPrefix(path, "~") {
 		u, err := user.Current()

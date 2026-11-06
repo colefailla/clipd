@@ -1,25 +1,6 @@
-// Package protocol defines the small wire format clipd speaks over its
-// listening socket.
-//
-// There are two kinds of message, and which one arrived is decided by the
-// first bytes on the connection:
-//
-//	<anything else>   raw clipboard content, written verbatim
-//	Magic + JSON line a structured request, dispatched on its "type"
-//
-// The raw case is the default on purpose. It is what makes `nc` a complete
-// client: a shell pipeline that knows nothing about clipd can still put text
-// on the clipboard. The structured case exists for everything that needs to
-// say more than "here are some bytes" — today that is only file drops.
-//
-// The design is lifted from wincent/clipper, which solved the same problem
-// first: a magic prefix keeps a framed extension from breaking the unframed
-// clients that came before it, and versioning the prefix itself leaves room
-// to change the frame later without having to guess what an old peer meant.
-//
-// This package contains no networking policy: no dials, no deadlines, no
-// reads from a socket. It parses and formats, and the server decides how long
-// anything is allowed to take.
+// Package protocol parses clipboard and structured requests. Input beginning
+// with Magic carries a JSON envelope; other input is raw clipboard data.
+// The server supplies connection policy and deadlines.
 package protocol
 
 import (
@@ -33,20 +14,10 @@ import (
 	"unicode/utf8"
 )
 
-// Magic introduces a structured request.
-//
-// The trailing v1 versions the frame, not the product: a future incompatible
-// frame uses a different prefix, and this one keeps meaning exactly what it
-// means today. A connection whose opening bytes are anything else is raw
-// clipboard content and must stay that way, or every `nc` alias in the wild
-// breaks at once.
+// Magic identifies the v1 envelope. Non-magic input remains raw clipboard data.
 const Magic = "clipd:magic:v1\n"
 
-// MaxFrameBytes bounds the JSON line following the magic prefix.
-//
-// The envelope describes a request; it never carries the payload. Anything
-// approaching this size is a peer trying to make the daemon buffer without
-// bound, not a request, so the read stops rather than growing.
+// MaxFrameBytes limits the JSON envelope, excluding payload data.
 const MaxFrameBytes = 8 << 10
 
 // Request types.
@@ -60,32 +31,17 @@ const (
 	// completion marker, sent only after tar succeeded.
 	TypeStreamDrop = "drop-stream-v2"
 
-	// TypePing asks the listener to identify itself and does nothing else.
-	//
-	// It exists because the obvious way to ask "is a daemon there" — connect
-	// and close — is indistinguishable on the wire from a raw clipboard
-	// message of zero bytes, so it used to clear the clipboard every time
-	// `clipd status` ran. A request the daemon can recognise answers the
-	// question without touching anything, and answers a second one for free:
-	// whether the thing listening is clipd at all.
+	// TypePing identifies the daemon without changing the clipboard.
 	TypePing = "ping"
 )
 
-// Ping is the complete byte sequence a client sends for a TypePing request.
-//
-// A literal rather than something marshalled, because both callers send
-// exactly this and a fixed slice cannot fail to encode.
+// Ping is the complete identification request.
 var Ping = []byte(Magic + `{"type":"ping"}` + "\n")
 
 // Pong is the message a daemon answers a Ping with, after StatusOK.
 const Pong = "pong"
 
-// Response status prefixes.
-//
-// The daemon's reply is plain text so that an unmodified `nc` displays
-// something useful, but the first token is machine-readable so the generated
-// shell function can turn a result into an exit status. Without it every drop
-// exited 0, including the ones the daemon rejected.
+// Status prefixes are parsed by generated clients and must remain compatible.
 const (
 	StatusOK    = "clipd: ok: "
 	StatusError = "clipd: error: "

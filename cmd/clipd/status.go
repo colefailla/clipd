@@ -73,14 +73,8 @@ func cmdStatus(ctx context.Context, e *env, g *globalOptions, args []string) int
 	return code
 }
 
-// staleConfig reports whether the config has been modified since the daemon
-// last started.
-//
-// The daemon's start time is taken from the socket, which it creates on the way
-// up and removes on the way down. That makes the comparison exact for the
-// question being asked — has the file changed since this daemon read it —
-// without having to ask launchd anything or have the daemon report its own
-// uptime.
+// staleConfig compares config and socket modification times for a running
+// LaunchAgent. This is a hint, not a comparison with the daemon's active settings.
 func staleConfig(ctx context.Context, path string, cfg config.Config) bool {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -137,12 +131,7 @@ func reportListener(out io.Writer, address string) int {
 	}
 	fmt.Fprintf(out, "  mode         %04o\n", info.Mode().Perm())
 
-	// Asking the listener to identify itself is the only way to tell a live
-	// socket from one a killed daemon left behind — a stale file looks
-	// identical in a directory listing but accepts nothing. It is a ping rather
-	// than a bare connect-and-close because that was indistinguishable from a
-	// zero-byte clipboard message, so checking the daemon's status used to
-	// clear the clipboard it was reporting on.
+	// A ping distinguishes a running daemon from a leftover socket file.
 	if err := server.Ping("unix", path); err != nil {
 		if errors.Is(err, server.ErrNotClipd) {
 			fmt.Fprintf(out, "  daemon       %v\n", err)

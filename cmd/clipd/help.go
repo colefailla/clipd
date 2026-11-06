@@ -30,8 +30,10 @@ Running setup again replaces the marked clipd blocks and leaves the rest
 of each file alone. Existing files are backed up to .clipd-backup files
 before the first change.
 
-<host> can be an SSH alias, hostname, IP address or user@host. Use the same
+<host> can be an SSH alias, hostname, IPv4 address or user@host. Use the same
 name you use when connecting. If you connect by two names, set up both.
+For IPv6, use an SSH alias. Forwards match the connected account as well as
+the destination; rerun setup if an alias changes accounts.
 
 Log out and reconnect afterwards to use the forward. Run setup again
 when you need to update the host's clipd function.
@@ -100,6 +102,9 @@ bytes and one hour is 3600 seconds.
 Omitted settings use their defaults. For numeric limits, 0 also uses the
 default; it does not mean unlimited. Unknown settings are rejected.
 max_payload_bytes multiplied by max_concurrent must not exceed 2 GiB.
+
+For 'clipd install', address and drop_dir must be absolute or begin with ~/.
+Relative paths in foreground 'clipd serve' use its working directory.
 
 Settings are read when the daemon starts. On macOS, run 'clipd restart'
 after editing them. On Linux, stop and restart 'clipd serve'.

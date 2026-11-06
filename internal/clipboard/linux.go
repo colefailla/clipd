@@ -13,22 +13,12 @@ import (
 	"time"
 )
 
-// helper describes one clipboard writer and the session it can reach.
-//
-// macOS has exactly one answer, /usr/bin/pbcopy, so New there is a stat. Linux
-// has neither a built-in tool nor a single right choice: Wayland and X11 use
-// different programs, a machine may have both installed and be running either,
-// and a headless one has no clipboard at all. So the choice is made from the
-// session rather than from what happens to be on disk — a tool present but
-// unable to reach the display is worse than no tool, because it fails at the
-// first copy instead of at startup.
+// helper describes a clipboard writer and the display session it requires.
 type helper struct {
 	// name is the executable to look for on PATH.
 	name string
 
-	// args select the clipboard proper. Every one of these tools defaults to
-	// the X11 primary selection or its own idea of a default, which is the
-	// middle-click buffer rather than the clipboard people mean.
+	// args select the clipboard rather than the primary selection where needed.
 	args []string
 
 	// display is the environment variable that has to be set for this tool to
@@ -96,19 +86,8 @@ func (h *helperClipboard) Name() string {
 	return h.path + " " + strings.Join(h.args, " ")
 }
 
-// waitDelay bounds how long Run may linger after the helper has exited.
-//
-// It matters more here than on macOS. An X11 selection belongs to a process:
-// whoever sets the clipboard has to stay alive to hand the contents over when
-// something asks for them. So xclip and xsel fork a child that keeps the
-// selection and exit the parent immediately, and wl-copy does the same unless
-// told otherwise. If that child inherits the stderr pipe, Wait blocks on the
-// pipe long after the process it started has gone.
-//
-// Short rather than generous for exactly that reason: this is a bound on a
-// case that should never happen, not a timeout anything legitimate waits out.
-// The helper's own exit status has already been collected by the time it
-// applies, so nothing is lost by cutting the pipe off.
+// waitDelay bounds waiting for pipes inherited by a clipboard owner's child.
+// X11 and Wayland helpers may fork to keep serving the clipboard selection.
 const waitDelay = 200 * time.Millisecond
 
 func (h *helperClipboard) Write(ctx context.Context, data []byte) error {
