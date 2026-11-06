@@ -1,9 +1,8 @@
 // Package server implements the clipd daemon: accept a connection from the
 // listening socket, decide what kind of message it is, and carry it out.
 //
-// The daemon runs in the foreground and never self-daemonizes. On macOS,
-// launchd owns backgrounding, log redirection and restart-on-crash, so
-// duplicating any of that here would only add ways to disagree with launchd.
+// The daemon runs in the foreground. On macOS, launchd manages
+// background execution, logs and restarts.
 //
 // SSH protects forwarded traffic and UNIX socket permissions authorize access.
 // Connected peers remain untrusted, so payloads, work and time are bounded.
@@ -78,14 +77,8 @@ const (
 	// before the connection closes. See drainRejected.
 	drainCap = 256 << 10
 
-	// warnWindow and warnBudget bound how many peer-driven warnings reach the
-	// log per window.
-	//
-	// launchd appends the daemon's log file forever with no rotation, and every
-	// rejected message would otherwise write a line: a loop sending malformed
-	// frames turns "the clipboard is unavailable" into "the disk is full".
-	// Suppressed lines are counted and reported, so throttling hides the volume
-	// of a problem, never the fact of one.
+	// warnWindow and warnBudget limit peer-driven warnings in the unrotated
+	// service log. Suppressed messages are counted and reported in the next window.
 	warnWindow = time.Minute
 	warnBudget = 20
 )
@@ -481,10 +474,7 @@ func (s *Server) handleClipboard(ctx context.Context, conn net.Conn, r io.Reader
 		return
 	}
 
-	// Debug, not Info. launchd appends this file forever with no rotation, so
-	// a line per copy is unbounded growth that buries the rare failure in
-	// routine success. The acknowledgement below already tells the user, at
-	// the point of use, which is where the answer is actually wanted.
+	// Log successful copies at Debug to limit growth of the unrotated service log.
 	s.log.Debug("clipboard updated", "bytes", buf.Len())
 	s.respondOK(conn, fmt.Sprintf("copied %d bytes", buf.Len()))
 }
@@ -504,10 +494,8 @@ func (s *Server) handleStructured(ctx context.Context, conn net.Conn, r *bufio.R
 		return
 	}
 
-	// Answered before a work slot is taken, because a ping does no work and the
-	// moment a caller most needs an answer is when every slot is busy. It is
-	// also not logged: `clipd status` sends one, and a line per status check
-	// would grow a file launchd never rotates.
+	// Answer pings without a work slot so health checks work at capacity.
+	// Routine health checks are not logged.
 	if req.Type == protocol.TypePing {
 		s.respondOK(conn, protocol.Pong)
 		return
@@ -617,8 +605,7 @@ func (s *Server) handleDrop(ctx context.Context, conn net.Conn, r io.Reader, req
 		drainRejected(conn, r)
 		return
 	}
-	// Routine success is acknowledged to the sender. Keeping it at Debug avoids
-	// growing launchd's unrotated log by one line for every ordinary drop.
+	// Log successful drops at Debug to limit growth of the unrotated service log.
 	s.log.Debug("files dropped", "count", len(res.Names), "bytes", res.Bytes, "dir", s.dropDir)
 	reply := fmt.Sprintf("dropped %s (%s) into %s in %s",
 		dropSummary(res.Names), config.FormatSize(res.Bytes), s.dropDir, time.Since(started).Round(time.Millisecond))

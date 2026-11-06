@@ -62,9 +62,7 @@ func (s Spec) Marshal() ([]byte, error) {
 	writeBool(&b, "RunAtLoad", s.RunAtLoad)
 	writeBool(&b, "KeepAlive", s.KeepAlive)
 
-	// Background tells launchd this job is not user-interactive, so it is
-	// scheduled with lower priority and is throttled appropriately. It is
-	// also what keeps it from ever putting anything on screen.
+	// Classify the service as a background process for launchd scheduling.
 	writeString(&b, "ProcessType", "Background")
 
 	if s.StandardOutPath != "" {
@@ -115,9 +113,7 @@ func writeBool(b *strings.Builder, key string, value bool) {
 	}
 }
 
-// writeEscaped XML-escapes into the builder. xml.EscapeText writes to an
-// io.Writer and strings.Builder never returns a write error, so the error is
-// genuinely impossible here rather than merely unlikely.
+// writeEscaped XML-escapes into the builder. strings.Builder writes cannot fail.
 func writeEscaped(b *strings.Builder, s string) {
 	_ = xml.EscapeText(b, []byte(s))
 }

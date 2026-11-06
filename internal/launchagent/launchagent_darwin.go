@@ -35,12 +35,7 @@ const (
 	rollbackTimeout = 2*launchctlTimeout + time.Second
 )
 
-// launchctlPath is the binary this package drives.
-//
-// A variable rather than a constant so tests can substitute a stand-in that
-// records its arguments and returns a chosen exit code. That makes the
-// install and uninstall paths — the code that manages a real system service —
-// testable without touching the user's actual LaunchAgent.
+// launchctlPath is replaceable in tests to avoid managing the live service.
 var launchctlPath = "/bin/launchctl"
 
 // Options controls installation.
@@ -142,13 +137,8 @@ func Install(ctx context.Context, opts Options) (Result, error) {
 		Label:            Label,
 		ProgramArguments: []string{execPath, "serve"},
 		RunAtLoad:        true,
-		// KeepAlive is unconditional: for a personal utility, "always be
-		// running" is the behaviour the user wants, and tuning
-		// SuccessfulExit conditions would only create states where the
-		// clipboard silently stops working. The cost is that a daemon
-		// failing at startup — a bad config, say — will be restarted in a
-		// loop; launchd throttles that to once every 10 seconds, and the
-		// reason lands in the log file.
+		// Restart after both successful and failed exits.
+		// Persistent startup failures repeat; diagnostics go to the service log.
 		KeepAlive:       true,
 		StandardOutPath: logPath,
 		StandardErrPath: logPath,

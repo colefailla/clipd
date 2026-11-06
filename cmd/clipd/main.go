@@ -17,9 +17,8 @@ var (
 	date    = "unknown"
 )
 
-// Exit codes. Distinct codes let a script branch on $? instead of parsing
-// stderr. 64 is sysexits.h's EX_USAGE, kept apart from the operational codes
-// so "I typed it wrong" never looks like "the daemon is not running".
+// Exit codes distinguish usage, configuration and operational failures.
+// 64 is sysexits.h's EX_USAGE.
 const (
 	exitOK      = 0
 	exitFailure = 1
@@ -149,8 +148,7 @@ func (c *cmdFlags) parse(args []string) (code int, ok bool) {
 	case err == nil:
 		return exitOK, true
 	case errors.Is(err, flag.ErrHelp):
-		// -h is a request, and its output is what the user asked for, so it
-		// goes to stdout where it can be piped into a pager.
+		// Explicit help goes to stdout; usage errors go to stderr.
 		c.printUsage(c.e.stdout)
 		return exitOK, false
 	default:

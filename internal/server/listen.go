@@ -118,8 +118,7 @@ func Listen(address string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", path, err)
 	}
-	// Belt and braces over the process umask: the socket is the entire access
-	// control for this daemon, so its mode is not left to inherited state.
+	// Set socket permissions explicitly, independent of the inherited umask.
 	if err := os.Chmod(path, 0o600); err != nil {
 		_ = ln.Close()
 		return nil, fmt.Errorf("restrict %s: %w", path, err)
@@ -148,20 +147,9 @@ func requirePrivateSocketDir(dir string) error {
 	return nil
 }
 
-// prepareSocketPath clears a socket file left behind by a previous run.
-//
-// A UNIX socket is a filesystem entry that outlives the process holding it, so
-// a daemon killed with SIGKILL — or a Mac that lost power — leaves one behind.
-// Binding then fails with "address already in use", which is indistinguishable
-// from a second daemon actually running, and the daemon crash-loops under
-// launchd's KeepAlive until someone deletes the file by hand.
-//
-// Asking it settles the question. If a clipd daemon answers, it owns the path
-// and this one has no business taking it. If nothing accepts the connection,
-// the file is a corpse and can be removed. This is wincent/clipper's approach,
-// with the addition that the listener has to identify itself: a bare dial
-// proves only that something accepted, which is also true of a daemon that is
-// not clipd, and of a socket whose owner exited a moment ago.
+// prepareSocketPath removes a stale socket after bounded probing.
+// It preserves non-socket files and listeners that accept connections,
+// including those that do not identify themselves as clipd.
 func prepareSocketPath(path string) error {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
@@ -171,9 +159,7 @@ func prepareSocketPath(path string) error {
 		return fmt.Errorf("inspect %s: %w", path, err)
 	}
 	if info.Mode()&os.ModeSocket == 0 {
-		// Not a socket: refuse rather than delete. Whatever it is, the user put
-		// it there, and removing an unrelated file because it occupies a path
-		// the daemon wanted is not a trade the daemon gets to make.
+		// Preserve files that are not sockets.
 		return fmt.Errorf("%s exists and is not a socket; move it or choose another address", path)
 	}
 
@@ -181,11 +167,7 @@ func prepareSocketPath(path string) error {
 	case socketLive:
 		return fmt.Errorf("a clipd daemon is already listening on %s", path)
 	case socketForeign:
-		// Something accepted and did not answer as clipd. Not ours to delete,
-		// for the same reason a non-socket file is not: it belongs to whoever
-		// put it there. A clipd daemon too busy to reply also lands here, which
-		// is the safe way round — refusing to start is recoverable, deleting a
-		// running daemon's socket is not.
+		// Preserve accepting listeners, including clipd instances too busy to reply.
 		return fmt.Errorf("%s is in use by something that did not answer as clipd; stop it or choose another address", path)
 	}
 	if err := os.Remove(path); err != nil {

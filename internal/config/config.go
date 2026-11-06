@@ -88,9 +88,9 @@ type Config struct {
 	MaxDropBytes int64 `json:"max_drop_bytes"`
 	MaxDropFiles int   `json:"max_drop_files"`
 
-	// MaxConcurrent bounds the messages handled at once. Zero means the
-	// server's default. Together with MaxPayloadBytes it sets the daemon's
-	// memory ceiling, since a clipboard payload is buffered whole.
+	// MaxConcurrent bounds simultaneous work. Zero uses the server default.
+	// With MaxPayloadBytes, it bounds buffered clipboard payloads; allocation
+	// overhead and other process memory are additional.
 	MaxConcurrent int `json:"max_concurrent"`
 
 	// MaxTransferSeconds bounds one connection, including receipt and publication.

@@ -20,16 +20,11 @@ import (
 	"unicode/utf8"
 )
 
-// filePerm is the mode every extracted file gets.
-//
-// The archive's own mode is discarded rather than honoured. A sender can set
-// any bits it likes, including the executable ones, and a file that arrived
-// over a socket has no business being executable by default. 0600 also keeps
-// the drop directory readable only by its owner on a shared Mac.
+// filePerm gives the owner read/write access and discards archive modes,
+// including executable bits.
 const filePerm os.FileMode = 0o600
 
-// dirPerm matches: the directory holds files that arrived from another
-// machine, so it is nobody else's business.
+// dirPerm restricts received directories to the owner.
 const dirPerm os.FileMode = 0o700
 
 // maxNameBytes bounds a single filename.
@@ -122,9 +117,8 @@ var (
 	ErrTooManyFiles = errors.New("drop: archive exceeds the file limit")
 )
 
-// A transaction owns one private staging directory and the files accumulated
-// there. Paths are relative to the opened drop root, so os.Root keeps every
-// operation confined even if a directory entry is replaced with a symlink.
+// A transaction owns a private staging directory and its files. Staging uses
+// os.Root-relative operations; publication and quarantine include path-based operations.
 type transaction struct {
 	dir   string
 	files []stagedFile
@@ -358,13 +352,9 @@ func CleanStale(dir string, minimumAge ...time.Duration) int {
 	return removed
 }
 
-// Save writes a single stream into opts.Dir under name.
-//
-// This is the pipeline case — `pg_dump db | clipd drop --name dump.sql` — where there
-// is no archive because the bytes never existed as a file. It shares every
-// guarantee Extract has, and for the same reasons: the name is reduced to a
-// bare filename, nothing is overwritten, nothing is made executable, the size
-// is capped, and a failure leaves nothing behind.
+// Save receives a named stdin drop, staging data before publication.
+// It validates the basename, enforces size limits and preserves existing files.
+// Failures trigger cleanup or rollback; cleanup errors are reported.
 func Save(r io.Reader, name string, opts Options) (Result, error) {
 	if opts.Dir == "" {
 		return Result{}, errors.New("drop: no destination directory")

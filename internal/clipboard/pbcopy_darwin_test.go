@@ -79,15 +79,9 @@ func TestPbcopyReportsFailure(t *testing.T) {
 	}
 }
 
-// TestPbcopyRespectsContext covers the worst case: a helper that outlives the
-// kill signal and leaves a child holding the pipes open.
-//
-// The trailing echo matters. Without it a shell will often exec into the last
-// command, replacing itself, so killing the process kills the sleep too and
-// the hard path never runs. With it, the shell forks, and the orphaned sleep
-// keeps the stderr pipe open after the shell dies — which is exactly what made
-// this test pass locally and hang for 30 seconds on CI. cmd.WaitDelay is what
-// bounds it now.
+// TestPbcopyRespectsContext checks cancellation with inherited pipes still open.
+// The trailing echo prevents the shell from execing sleep. After cancellation,
+// the child keeps stderr open, exercising WaitDelay.
 func TestPbcopyRespectsContext(t *testing.T) {
 	t.Parallel()
 

@@ -4,8 +4,7 @@
 
 Copy command output and send files from an SSH host to your Mac.
 
-clipd works through SSH without relying on terminal clipboard support, and can
-send files as well as text.
+No terminal clipboard integration is required.
 
 On a configured remote host:
 
@@ -97,11 +96,11 @@ still connects to the host but does not write files.
 Reconnect to use the forward:
 
 ```bash
-ssh -O exit debian 2>/dev/null; ssh debian
+ssh debian
 ```
 
-If you use SSH connection sharing, `ssh -O exit` closes the shared connection
-and any sessions using it.
+If you use connection sharing, first run `ssh -O exit debian`. This closes
+the shared connection and its sessions.
 
 Aliases, hostnames, IPv4 addresses and `user@host` are accepted.
 For an IPv6 address, use an SSH alias with that address as its `HostName`.
@@ -236,9 +235,12 @@ with `~/`. Relative paths are supported by foreground `clipd serve`, where
 they resolve from its working directory.
 
 Settings are read at startup. After editing, run `clipd restart` on macOS or
-stop and restart `clipd serve` on Linux. `clipd status` displays the resolved
-config, not the daemon's active settings; for the macOS login service, it also
-warns about config edits made since the daemon started.
+restart `clipd serve` on Linux.
+
+`clipd status` shows the CLI version, receiver response, socket permissions,
+service state and PID, configured limits, and binary, config, drop, plist and
+log paths. Limits come from the selected config file. For the macOS login
+service, status warns when that file has changed since startup.
 
 Install and restart wait up to five seconds for a clipd identification reply.
 Restart checks the socket selected by the installed LaunchAgent, independent of
@@ -246,10 +248,6 @@ Restart checks the socket selected by the installed LaunchAgent, independent of
 prints the log path; it does not remove the installed service. This checks the
 local receiver, without writing to the clipboard or sending a drop. It does not
 verify a remote SSH forward.
-
-Status shows the CLI version, socket permissions, service state and PID,
-installed binary, config, drop, plist and log paths. Its limits describe the
-selected config file, not settings queried from the running receiver.
 
 ### Big files
 

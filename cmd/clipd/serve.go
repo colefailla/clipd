@@ -15,12 +15,8 @@ import (
 	"github.com/colefailla/clipd/internal/server"
 )
 
-// cmdServe runs the clipboard daemon in the foreground.
-//
-// It never detaches. Under the LaunchAgent, launchd is responsible for
-// backgrounding, log redirection and restarts; a process that also tried to
-// daemonize itself would just be a second opinion for launchd to disagree
-// with.
+// cmdServe runs in the foreground. On macOS, launchd manages
+// background execution, logs and restarts.
 func cmdServe(ctx context.Context, e *env, g *globalOptions, args []string) int {
 	flags := newFlagSet(e, g, "serve", "Usage: clipd serve [options]")
 	address := flags.String("address", "", "socket path to listen on (default from config)")

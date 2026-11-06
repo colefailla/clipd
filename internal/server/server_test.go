@@ -570,15 +570,9 @@ func TestNamedDropCannotEscape(t *testing.T) {
 	}
 }
 
-// TestRejectionSurvivesAnInFlightPayload pins the drain.
-//
-// A payload small enough to fit in the socket buffers is fully sent before the
-// daemon rejects it, so the reply is never at risk. This one is large enough
-// that the sender is still writing when the rejection is issued — and closing
-// a socket with data still arriving tears it down abruptly, taking the reply
-// with it. In the field the same command reported the error six times in ten
-// and said nothing the other four, the difference being how fast the source
-// disk was.
+// TestRejectionSurvivesAnInFlightPayload checks that rejection reaches an active
+// sender. The payload exceeds socket buffers so the sender is still writing
+// when rejected; closing without draining can discard the error reply.
 func TestRejectionSurvivesAnInFlightPayload(t *testing.T) {
 	t.Parallel()
 
