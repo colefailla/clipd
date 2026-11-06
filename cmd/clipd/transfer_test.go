@@ -246,7 +246,7 @@ func TestClientRemovesStaleSocket(t *testing.T) {
 				if !strings.Contains(string(out), "removed the unused socket") {
 					t.Fatalf("%s: stale socket not explained: %s", use, out)
 				}
-				if strings.Contains(string(out), "tar failed") || strings.Contains(string(out), "couldn't confirm") || strings.Contains(string(out), "could not read") {
+				if strings.Contains(string(out), "tar failed") || strings.Contains(string(out), "could not confirm") || strings.Contains(string(out), "could not read") {
 					t.Fatalf("%s: misleading failure message: %s", use, out)
 				}
 				if _, err := os.Lstat(socket); !os.IsNotExist(err) {
@@ -284,15 +284,24 @@ func TestClientPreservesLiveSocketWithoutReply(t *testing.T) {
 			conn.Close()
 		}
 	}()
-	out, err := exec.Command("sh", "-c", shellFunction(client, socket, true)+"\nprintf hi | clipd\n").CombinedOutput()
-	if err == nil {
-		t.Fatalf("succeeded without a reply: %s", out)
-	}
-	if !strings.Contains(string(out), "couldn't confirm the transfer") || strings.Contains(string(out), "removed the unused socket") {
-		t.Fatalf("live socket failure misreported: %s", out)
-	}
-	if _, err := os.Lstat(socket); err != nil {
-		t.Fatalf("live socket was removed: %v", err)
+	for _, operation := range []string{"copy", "drop"} {
+		command := "printf hi | clipd"
+		if operation == "drop" {
+			command += " drop --name report.txt"
+		}
+		out, err := exec.Command("sh", "-c", "set -u\n"+shellFunction(client, socket, true)+"\n"+command+"\n").CombinedOutput()
+		if err == nil {
+			t.Fatalf("succeeded without a reply: %s", out)
+		}
+		if !strings.Contains(string(out), "could not confirm the "+operation) || strings.Contains(string(out), "removed the unused socket") {
+			t.Fatalf("live socket failure misreported: %s", out)
+		}
+		if operation == "drop" && !strings.Contains(string(out), "Files may have arrived.") {
+			t.Fatalf("missing uncertain outcome warning: %s", out)
+		}
+		if _, err := os.Lstat(socket); err != nil {
+			t.Fatalf("live socket was removed: %v", err)
+		}
 	}
 }
 

@@ -8,13 +8,7 @@ import (
 	"github.com/colefailla/clipd/internal/launchagent"
 )
 
-// cmdRestart stops and starts the LaunchAgent.
-//
-// It exists because the config is read once, at startup. Editing the file does
-// nothing until the daemon reloads, and the incantation for that —
-// `launchctl kickstart -k gui/$(id -u)/com.clipd.agent` — is not something
-// anyone would arrive at unaided. Without a command for it, "change a limit"
-// is a two-step operation whose second step is undiscoverable.
+// cmdRestart restarts the installed service and checks its configured socket.
 func cmdRestart(ctx context.Context, e *env, g *globalOptions, args []string) int {
 	flags := newFlagSet(e, g, "restart", "Usage: clipd restart")
 	if code, ok := flags.parse(args); !ok {
@@ -24,9 +18,20 @@ func cmdRestart(ctx context.Context, e *env, g *globalOptions, args []string) in
 		return fail(e, exitFailure, launchagent.ErrUnsupported)
 	}
 
-	if err := launchagent.Restart(ctx); err != nil {
+	spec, err := readInstalledAgent(ctx)
+	if err != nil {
 		return fail(e, exitFailure, err)
 	}
-	fmt.Fprintf(e.stdout, "Restarted the clipd daemon.\n")
+	socket, err := serviceSocket(spec)
+	if err != nil {
+		return failf(e, exitFailure, "cannot check the installed service: %v", err)
+	}
+	if err := restartAgent(ctx); err != nil {
+		return fail(e, exitFailure, err)
+	}
+	if err := checkReceiver(ctx, socket); err != nil {
+		return healthFailure(e, ctx, "restart requested", spec.StandardErrPath, err)
+	}
+	fmt.Fprintf(e.stdout, "Restarted the macOS login service. clipd is responding.\n")
 	return exitOK
 }

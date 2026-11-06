@@ -486,7 +486,7 @@ func (c Config) Validate() error {
 		concurrent = Default().MaxConcurrent
 	}
 	if c.MaxPayloadBytes > MaxClipboardBudget/int64(concurrent) {
-		return errors.New("max_payload_bytes multiplied by max_concurrent must not exceed 2 GiB; lower either setting")
+		return fmt.Errorf("configured clipboard limits exceed the 2 GiB combined budget\n\n  max_payload_bytes  %s\n  max_concurrent     %d\n  combined           %s\n\nLower max_payload_bytes or max_concurrent.", FormatSize(c.MaxPayloadBytes), concurrent, FormatSize(c.MaxPayloadBytes*int64(concurrent)))
 	}
 	return nil
 }

@@ -103,6 +103,7 @@ clipd() (
 	fmt.Fprintf(&b, "  _clipd_sock=%s\n", shellQuote(socket))
 	b.WriteString(`  _clipd_reply=
   _clipd_client=0
+  _clipd_operation=copy
 `)
 	b.WriteString("  case ${1:-} in (-h|--help|help)\n    command printf '%s\\n'")
 	for _, line := range remoteHelp {
@@ -116,15 +117,15 @@ clipd() (
 `)
 
 	b.WriteString(indent(`if [ ! -S "$_clipd_sock" ]; then
-  command printf 'clipd: this SSH session has no clipd forward; %s is missing.\n' "$_clipd_sock" >&2
-  command printf '       Log out and reconnect. If SSH reports "remote port forwarding failed",\n' >&2
-  command printf '       see Troubleshooting in the clipd README.\n' >&2
+  command printf 'clipd: no SSH forward at %s\n' "$_clipd_sock" >&2
+  command printf 'Reconnect using the destination configured with clipd setup.\n' >&2
   return 1
 fi
 `, "  "))
 	// ${1:-} rather than $1, so that a shell running under `set -u` does not
 	// abort on a plain `printf x | clipd`, which passes no arguments at all.
 	b.WriteString(`  if [ "${1:-}" = "drop" ]; then
+    _clipd_operation=drop
     shift
     if [ "${1:-}" = "--no-progress" ]; then _clipd_progress=false; shift; fi
 `)
@@ -259,7 +260,11 @@ fi
 `, "    "))
 	b.WriteString(`    if [ -n "$_clipd_reply" ]; then command printf '%s\n' "$_clipd_reply"; fi
     if [ "$_clipd_client" -ne 3 ]; then
-      command printf "clipd: couldn't confirm the transfer. Run 'clipd status' on the receiving computer.\n" >&2
+      command printf 'clipd: could not confirm the %s.\n' "$_clipd_operation" >&2
+      if [ "$_clipd_operation" = drop ]; then
+        command printf 'Files may have arrived. Check the destination before retrying.\n' >&2
+      fi
+      command printf "Run 'clipd status' on the receiving computer.\n" >&2
     fi
     return 1
   fi

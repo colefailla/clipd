@@ -230,6 +230,17 @@ stop and restart `clipd serve` on Linux. `clipd status` displays the resolved
 config, not the daemon's active settings; for the macOS login service, it also
 warns about config edits made since the daemon started.
 
+Install and restart wait up to five seconds for a clipd identification reply.
+Restart checks the socket selected by the installed LaunchAgent, independent of
+`-config` or `CLIPD_CONFIG` in the invoking shell. A failed check exits 1 and
+prints the log path; it does not remove the installed service. This checks the
+local receiver, without writing to the clipboard or sending a drop. It does not
+verify a remote SSH forward.
+
+Status shows the CLI version, socket permissions, service state and PID,
+installed binary, config, drop, plist and log paths. Its limits describe the
+selected config file, not settings queried from the running receiver.
+
 ### Big files
 
 An error identifies the limit you hit. For example, to allow drops up to
@@ -302,10 +313,10 @@ binding. If the server disables socket forwarding, clipd cannot use it.
 | Message | Next step |
 |---|---|
 | `clipd: removed the unused socket at ...` | Log out and reconnect so SSH can create the forward. |
-| `clipd: this SSH session has no clipd forward` | Connect using the destination you set up. Check for `ClearAllForwardings=yes` or an older shared connection. |
+| `clipd: no SSH forward at ...` | Connect using the destination you set up. Check for `ClearAllForwardings=yes` or an older shared connection. |
 | `Warning: remote port forwarding failed` | Check for a leftover socket or another session holding the forward. That session's forward may still work while it is open. With server-side `StreamLocalBindUnlink yes`, the newest session takes over the socket path. |
-| `clipd: couldn't confirm the transfer` | Check the receiver with `clipd status` and read its log. This can be a transport failure or an invalid or missing reply. |
-| `clipd: error: ... limit` | Adjust the setting identified in the error and restart the receiver. See [Big files](#big-files). |
+| `clipd: could not confirm the copy.` / `clipd: could not confirm the drop.` | Check the receiver with `clipd status` and read its log. This can be a transport failure or an invalid or missing reply. For drops, check the destination before retrying; files may have arrived. |
+| `clipd: error: drop exceeds max_drop_bytes (...)` | Adjust the setting identified in the error and restart the receiver. See [Big files](#big-files). |
 
 For an older ControlMaster connection, close it with `ssh -O exit <host>` and
 reconnect. This closes sessions sharing that connection.

@@ -1,21 +1,27 @@
 package main
 
 var helpTopics = map[string]string{
-	"serve": `clipd serve [options]
+	"serve": `Usage: clipd serve [options]
 
-Run the daemon in this terminal. Press Ctrl-C to stop it.
-
-On macOS, 'clipd install' runs it in the background and starts it at login.
-On a Linux desktop, use this command in a graphical session with wl-copy,
-xclip or xsel installed. macOS uses pbcopy.
+Run the receiver in the foreground. Press Ctrl-C to stop.
 
 Options:
-  -address <path>     socket path (default: from config)
-  -drop-dir <path>    folder for received files (default: from config)
+  -address <path>   UNIX socket path
+  -drop-dir <path>  destination for received files
+  -config <path>    config file
+  -verbose, -v     enable diagnostic logs
 
-Without a config file, the defaults are ~/.clipd.sock and ~/Drop.`,
+Built-in defaults:
+  socket  ~/.clipd.sock
+  drops   ~/Drop
 
-	"setup": `clipd setup [options] <host>
+Configuration overrides defaults; command options override configuration.
+Relative paths resolve from the current working directory.
+
+macOS: use 'clipd install' to run at login.
+Linux: run in a graphical session with wl-copy, xclip, or xsel.`,
+
+	"setup": `Usage: clipd setup [options] <host>
 
 Run on the receiving computer to configure an SSH host.
 Setup connects to the host, checks for nc or socat, and writes:
@@ -133,11 +139,14 @@ These limits do not cap the total size of files you keep over time.
 
 SECURITY.md in the repository describes the guarantees and known exceptions.`,
 
-	"install": `clipd install [options]
+	"install": `Usage: clipd install [options]
 
 macOS only. Starts clipd now and at login, and restarts it if it crashes.
 Installs ~/Library/LaunchAgents/com.clipd.agent.plist for your user account.
 No sudo is needed.
+
+Waits up to 5 seconds for the receiver to respond. If it does not respond,
+exits 1 and leaves the service installed; check the reported log path.
 
 It also writes the selected config file with all settings filled in,
 preserving existing values. The default is ~/.config/clipd/config.json;
@@ -146,19 +155,23 @@ XDG_CONFIG_HOME, -config or CLIPD_CONFIG can select another path.
 Options:
   -exec <path>   clipd binary to run (default: this binary)`,
 
-	"restart": `clipd restart
+	"restart": `Usage: clipd restart
 
 macOS only. Stops and restarts the installed clipd login service.
 Run this after editing the config so the daemon reads the new settings.
 
+Waits up to 5 seconds for the receiver on the installed service's socket.
+Uses the service's configuration, regardless of this shell's -config or
+CLIPD_CONFIG. Exits 1 if the receiver does not respond; check the log.
+
 'clipd status' warns if the config file has been edited since the service
 started.
 
-Equivalent to:
+Requests a restart with:
 
   launchctl kickstart -k gui/$(id -u)/com.clipd.agent`,
 
-	"uninstall": `clipd uninstall
+	"uninstall": `Usage: clipd uninstall
 
 macOS only. Stops the daemon and removes its login service. Everything else
 clipd created stays where it is:
@@ -178,7 +191,7 @@ On each host you set up:
 To remove them, delete the marked clipd blocks and these files. The clipd
 binary stays wherever you installed it.`,
 
-	"status": `clipd status
+	"status": `Usage: clipd status
 
 Shows the resolved config and checks whether the daemon answers.
 On macOS, it also shows the login service's state and log path.
@@ -194,14 +207,24 @@ Exits 0 when the daemon answers and 1 when it does not.
 Config and command errors have separate exit codes.
 You can use 'clipd status && ...' in scripts.`,
 
-	"version": `clipd version
+	"version": `Usage: clipd version
 
 Shows the version, commit and build date, plus the Go version and platform
 it was built for.`,
 
-	"help": `clipd help [topic]
+	"help": `Usage: clipd help [topic]
 
 With no topic, shows the overview.
 Topics: serve, setup, drop, config, security, install, restart, uninstall,
 status, version.`,
+}
+
+// Keep both help entry points identical, including global options.
+func commandHelp(name, text string) string {
+	switch name {
+	case "setup", "install", "status", "uninstall":
+		return text + "\n\nGlobal options:\n  -config <path>  use a different config file\n  -verbose, -v    enable diagnostic logs"
+	default:
+		return text
+	}
 }

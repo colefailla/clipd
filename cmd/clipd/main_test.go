@@ -32,7 +32,7 @@ func TestBareInvocationPrintsUsage(t *testing.T) {
 	if got.code != exitUsage {
 		t.Errorf("exit code = %d, want %d", got.code, exitUsage)
 	}
-	if !strings.Contains(got.stderr, "clipd setup") {
+	if !strings.Contains(got.stderr, "setup <host>") {
 		t.Errorf("stderr = %q, want usage text", got.stderr)
 	}
 	if got.stdout != "" {
@@ -150,6 +150,16 @@ func TestVersionPrintsBuildInformation(t *testing.T) {
 	for _, want := range []string{"clipd", "commit", "built", "platform"} {
 		if !strings.Contains(got.stdout, want) {
 			t.Errorf("stdout = %q, want it to mention %q", got.stdout, want)
+		}
+	}
+}
+
+func TestCommandHelpMatchesFlagHelp(t *testing.T) {
+	for _, command := range []string{"serve", "setup", "status", "install", "restart", "uninstall", "version"} {
+		topic := runCLI(t, "help", command)
+		flag := runCLI(t, command, "-h")
+		if topic.code != 0 || flag.code != 0 || topic.stdout != flag.stdout || flag.stderr != "" {
+			t.Errorf("%s: topic=%+v flag=%+v", command, topic, flag)
 		}
 	}
 }

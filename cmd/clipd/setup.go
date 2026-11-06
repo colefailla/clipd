@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -34,14 +35,7 @@ func sshMarkers(destination string) (start, end string) {
 
 // cmdSetup configures a remote host to talk to this daemon.
 func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int {
-	flags := newFlagSet(e, g, "setup",
-		"Usage: clipd setup [options] <ssh-host>\n\n"+
-			"Probes the host, installs a 'clipd' shell function there, and adds the\n"+
-			"matching RemoteForward to your local SSH config.\n\n"+
-			"Edits ~/.ssh/config and the remote ~/.bashrc, ~/.zshrc or ~/.profile.\n"+
-			"Creates first-version .clipd-backup files and private remote ~/.clipd.\n"+
-			"No remote binary/service or daemon config file is created.\n"+
-			"Run clipd help setup for settings, recovery and removal details.")
+	flags := newFlagSet(e, g, "setup", "Usage: clipd setup [options] <host>")
 	printOnly := flags.Bool("print", false, "show what would be changed, without changing anything")
 	if code, ok := flags.parse(args); !ok {
 		return code
@@ -78,7 +72,7 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		_ = cmd.Run()
 	}()
 
-	fmt.Fprintf(e.stdout, "Checking %s (SSH may ask for a password)...\n", destination)
+	fmt.Fprintf(e.stdout, "Checking %s... SSH may ask for a password.\n", destination)
 	facts, err := probe(ctx, destination, control)
 	if err != nil {
 		return fail(e, exitFailure, err)
@@ -101,11 +95,15 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 		return fail(e, exitConfig, err)
 	}
 
-	fmt.Fprintf(e.stdout, "\n  remote shell   %s\n", facts.shell)
-	fmt.Fprintf(e.stdout, "  remote client  %s\n", client.send)
-	fmt.Fprintf(e.stdout, "  remote rc      %s\n", rcFile)
+	fmt.Fprintf(e.stdout, "\n  account        %s\n", facts.user)
+	fmt.Fprintf(e.stdout, "  shell          %s\n", facts.shell)
+	fmt.Fprintf(e.stdout, "  transport      %s\n", strings.Fields(client.send)[0])
+	fmt.Fprintf(e.stdout, "  remote rc      %s\n", strings.Replace(rcFile, "$HOME", facts.home, 1))
 	fmt.Fprintf(e.stdout, "  remote socket  %s\n", remoteSocket)
 	fmt.Fprintf(e.stdout, "  local socket   %s\n", localSocket)
+	if home, err := os.UserHomeDir(); err == nil {
+		fmt.Fprintf(e.stdout, "  SSH config     %s\n", filepath.Join(home, ".ssh", "config"))
+	}
 	if !facts.hasTar {
 		fmt.Fprintf(e.stdout, "\n  note: %s has no tar. Clipboard copies still work.\n"+
 			"        To send files and folders with 'clipd drop', install tar.\n"+
@@ -118,8 +116,8 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	}
 
 	if *printOnly {
-		fmt.Fprintf(e.stdout, "\n--- would append to %s on %s ---\n%s", rcFile, destination, block)
-		fmt.Fprintf(e.stdout, "\n--- would append to ~/.ssh/config ---\n%s", sshBlock)
+		fmt.Fprintf(e.stdout, "\n--- proposed block for %s on %s ---\n%s", rcFile, destination, block)
+		fmt.Fprintf(e.stdout, "\n--- proposed block for ~/.ssh/config ---\n%s", sshBlock)
 		return exitOK
 	}
 
@@ -127,42 +125,32 @@ func cmdSetup(ctx context.Context, e *env, g *globalOptions, args []string) int 
 	if err != nil {
 		return fail(e, exitFailure, err)
 	}
-	fmt.Fprintf(e.stdout, "\nInstalled the clipd function in %s on %s.\n", rcFile, destination)
 	if removed {
-		fmt.Fprintf(e.stdout, "Removed a socket an earlier SSH session left behind on %s.\n", destination)
+		fmt.Fprintf(e.stdout, "\nRemoved the stale remote socket.\n")
 	}
 
-	sshPath, changed, err := installSSHConfig(ctx, destination, sshBlock)
+	_, changed, err := installSSHConfig(ctx, destination, sshBlock)
 	if err != nil {
-		// The remote edit has already happened. Saying so is the difference
-		// between a user who knows the two halves disagree and one who finds
-		// out later from a forward that never appears.
+		// Setup cannot roll back the remote edit when the local update fails.
 		return failf(e, exitFailure,
-			"%v\n       The clipd function was already installed on %s; re-run setup once this is fixed.",
-			err, destination)
+			"%v\n\nThe remote function was updated on %s.\nFix the local SSH config error, then rerun:\n  clipd setup %s",
+			err, destination, destination)
 	}
 	if changed {
-		fmt.Fprintf(e.stdout, "Added the socket forward to %s.\n", sshPath)
+		fmt.Fprintf(e.stdout, "\nUpdated the remote function and local SSH config.\n")
 	} else {
-		fmt.Fprintf(e.stdout, "The socket forward in %s was already current.\n", sshPath)
+		fmt.Fprintf(e.stdout, "\nUpdated the remote function.\nLocal SSH config is already current.\n")
 	}
 
 	fmt.Fprintf(e.stdout, `
-Setup complete. Reconnect to use clipd:
+Reconnect:
+  ssh %s
 
-  ssh -O exit %s 2>/dev/null; ssh %s
+If you use connection sharing, first run:
+  ssh -O exit %s
 
-If you use SSH connection sharing, this also closes sessions using that connection.
-
-Then try these on %s:
-
-  ls -l | clipd
-  clipd notes.txt
-  clipd drop report.pdf
-
-If clipd removes a leftover socket, log out and reconnect.
-See "Leftover sockets" in the README for more details.
-`, destination, destination, destination)
+This closes the shared connection and its sessions.
+`, destination, destination)
 	return exitOK
 }
 

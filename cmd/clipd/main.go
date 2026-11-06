@@ -116,7 +116,7 @@ func run(ctx context.Context, args []string, e *env) int {
 // equivalent.
 func registerGlobalFlags(fs *flag.FlagSet, g *globalOptions) {
 	fs.StringVar(&g.configPath, "config", g.configPath, "path to the clipd config file")
-	fs.BoolVar(&g.verbose, "verbose", g.verbose, "report progress on stderr")
+	fs.BoolVar(&g.verbose, "verbose", g.verbose, "enable diagnostic logs")
 	fs.BoolVar(&g.verbose, "v", g.verbose, "shorthand for -verbose")
 }
 
@@ -129,6 +129,7 @@ func registerGlobalFlags(fs *flag.FlagSet, g *globalOptions) {
 type cmdFlags struct {
 	*flag.FlagSet
 	usage string
+	name  string
 	e     *env
 }
 
@@ -138,7 +139,7 @@ func newFlagSet(e *env, g *globalOptions, name, usage string) *cmdFlags {
 	fs.SetOutput(e.stderr)
 	registerGlobalFlags(fs, g)
 	fs.Usage = func() {}
-	return &cmdFlags{FlagSet: fs, usage: usage, e: e}
+	return &cmdFlags{FlagSet: fs, usage: usage, name: name, e: e}
 }
 
 // parse handles a subcommand's arguments, translating flag package outcomes
@@ -159,10 +160,11 @@ func (c *cmdFlags) parse(args []string) (code int, ok bool) {
 }
 
 func (c *cmdFlags) printUsage(w io.Writer) {
-	fmt.Fprintf(w, "%s\n\nOptions:\n", c.usage)
-	c.FlagSet.SetOutput(w)
-	defer c.FlagSet.SetOutput(c.e.stderr)
-	c.FlagSet.PrintDefaults()
+	if text, ok := helpTopics[c.name]; ok {
+		fmt.Fprintln(w, commandHelp(c.name, text))
+		return
+	}
+	fmt.Fprintln(w, c.usage)
 }
 
 // fail prints an error to stderr in the conventional `clipd: message` form
@@ -178,33 +180,32 @@ func failf(e *env, code int, format string, args ...any) int {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `clipd — copy text and send files from SSH hosts to this computer
+	fmt.Fprint(w, `clipd — receive clipboard text and files over SSH
 
 Usage:
-  clipd <command>
-
-Getting started:
-  clipd install            start clipd on this Mac
-  clipd setup <host>       configure an SSH host
+  clipd <command> [options]
 
 Commands:
-  status                   check daemon status
-  restart                  restart the daemon
-  serve                    run in the foreground
-  uninstall                remove the login service
-  version                  show version information
-  help [topic]             show help (also: config, security)
+  install       install and start the macOS login service
+  setup <host>  configure a remote SSH host
+  serve         run the receiver in the foreground
+  status        check whether the receiver responds
+  restart       restart the macOS login service
+  uninstall     remove the macOS login service
+  version       show version information
+  help [topic]  show command help
 
-On the remote host:
+On a configured remote host:
   command | clipd          copy command output
   clipd notes.txt          copy a file's contents
   clipd drop report.pdf    send files or folders
 
-Options:
-  -config <path>           use a different config file
-  -verbose, -v             enable diagnostic logs
+Global options:
+  -config <path>  use a different config file
+  -verbose, -v    enable diagnostic logs
 
-Run 'clipd help <topic>' for details.
+Run 'clipd help <command>' for details.
+Additional topics: config, security, drop.
 `)
 }
 
@@ -219,6 +220,6 @@ func cmdHelp(_ context.Context, e *env, _ *globalOptions, args []string) int {
 		fmt.Fprintf(e.stderr, "clipd: no help for %q\n", args[0])
 		return exitUsage
 	}
-	fmt.Fprintln(e.stdout, text)
+	fmt.Fprintln(e.stdout, commandHelp(args[0], text))
 	return exitOK
 }

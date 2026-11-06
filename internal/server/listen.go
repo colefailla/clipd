@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -32,25 +33,41 @@ var ErrNotClipd = errors.New("something is listening, but it did not answer as c
 // Ping identifies a clipd listener without changing the clipboard.
 // Failures after connecting wrap ErrNotClipd so callers preserve foreign listeners.
 func Ping(network, address string) error {
-	conn, err := net.DialTimeout(network, address, pingTimeout)
+	return PingContext(context.Background(), network, address)
+}
+
+// PingContext bounds connection and identification by the caller's deadline.
+func PingContext(ctx context.Context, network, address string) error {
+	ctx, cancel := context.WithTimeout(ctx, pingTimeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-
-	if err := exchangePing(conn); err != nil {
-		// Both errors stay in the chain: callers test for ErrNotClipd, and
-		// probeSocket also needs to know whether the failure was a timeout.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	deadline, _ := ctx.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("%w (%w)", ErrNotClipd, err)
+	}
+	if err := pingReply(conn); err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		return fmt.Errorf("%w (%w)", ErrNotClipd, err)
 	}
 	return nil
 }
 
-// exchangePing sends the ping frame and checks the reply.
 func exchangePing(conn net.Conn) error {
 	if err := conn.SetDeadline(time.Now().Add(pingTimeout)); err != nil {
 		return err
 	}
+	return pingReply(conn)
+}
+
+func pingReply(conn net.Conn) error {
 	if _, err := conn.Write(protocol.Ping); err != nil {
 		return err
 	}

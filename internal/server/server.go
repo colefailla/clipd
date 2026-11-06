@@ -638,7 +638,7 @@ const raiseLimit = " in clipd's config on the receiving computer, then restart c
 func (s *Server) dropFailure(err error) string {
 	switch {
 	case errors.Is(err, drop.ErrTooLarge):
-		return fmt.Sprintf("drop exceeds the %s limit; increase max_drop_bytes%s", config.FormatSize(s.maxDropBytes), raiseLimit)
+		return fmt.Sprintf("drop exceeds max_drop_bytes (%s); increase it in the receiver's config and restart clipd", config.FormatSize(s.maxDropBytes))
 	case errors.Is(err, drop.ErrTooManyFiles):
 		return fmt.Sprintf("drop has more than %d files; raise max_drop_files%s", s.maxDropFiles, raiseLimit)
 	case isTimeout(err), errors.Is(err, context.DeadlineExceeded):

@@ -618,7 +618,7 @@ func TestDropRejectionSurvivesAnInFlightArchive(t *testing.T) {
 	if reply == "" {
 		t.Fatal("the drop rejection was lost")
 	}
-	if !strings.Contains(reply, "limit") {
+	if !strings.Contains(reply, "max_drop_bytes (64 KiB)") {
 		t.Errorf("reply = %q, want it to mention the limit", reply)
 	}
 }

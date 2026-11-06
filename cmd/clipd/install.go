@@ -40,7 +40,7 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 		{"address", cfg.Address}, {"drop_dir", cfg.DropDir},
 	} {
 		if !filepath.IsAbs(setting.path) && !strings.HasPrefix(setting.path, "~/") {
-			return failf(e, exitConfig, "%s: installation requires an absolute path or a path beginning with ~/", setting.name)
+			return failf(e, exitConfig, "cannot install with %s %q\nUse an absolute path or a path beginning with ~/.", setting.name, setting.path)
 		}
 	}
 	socket, err := server.ExpandPath(cfg.Address)
@@ -70,17 +70,19 @@ func cmdInstall(ctx context.Context, e *env, g *globalOptions, args []string) in
 		return fail(e, exitFailure, err)
 	}
 
+	if err := checkReceiver(ctx, socket); err != nil {
+		return healthFailure(e, ctx, "service installed", res.LogPath, err)
+	}
 	out := e.stdout
-	fmt.Fprintf(out, "Installed the clipd LaunchAgent.\n\n")
+	fmt.Fprintf(out, "Installed the macOS login service. clipd is responding.\n\n")
 	fmt.Fprintf(out, "  binary       %s\n", res.ExecutablePath)
 	fmt.Fprintf(out, "  plist        %s\n", res.PlistPath)
 	fmt.Fprintf(out, "  log          %s\n", res.LogPath)
 	fmt.Fprintf(out, "  config       %s\n", path)
 	fmt.Fprintf(out, "  socket       %s\n", socket)
-	fmt.Fprintf(out, "  drop dir     %s\n", dropDir)
+	fmt.Fprintf(out, "  drops        %s\n", dropDir)
 
-	fmt.Fprintf(out, "\nclipd listens on a private socket. Remote hosts reach it through SSH.\n")
-	fmt.Fprintf(out, "\nTo configure a host, run:\n\n  clipd setup <host>\n")
+	fmt.Fprintf(out, "\nConfigure a remote host:\n  clipd setup <host>\n")
 	return exitOK
 }
 

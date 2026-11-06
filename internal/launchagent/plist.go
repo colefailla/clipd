@@ -23,7 +23,8 @@ type Spec struct {
 	RunAtLoad        bool
 	KeepAlive        bool
 	StandardOutPath  string
-	StandardErrPath  string
+	StandardErrPath  string `json:"StandardErrorPath"`
+	WorkingDirectory string
 	// EnvironmentVariables sets the locale and pins a non-default config
 	// path, since a LaunchAgent does not inherit the user's shell environment.
 	EnvironmentVariables map[string]string
