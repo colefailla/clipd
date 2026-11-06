@@ -72,7 +72,7 @@ const (
 	MaxClipboardBudget int64 = 2 << 30
 )
 
-// Config is the on-disk configuration.
+// Config holds resolved settings, with sizes expressed in bytes.
 type Config struct {
 	// Address is the daemon's UNIX socket path. It must start with /, ~ or .;
 	// see IsSocketPath.
@@ -193,7 +193,8 @@ func Load(path string) (Config, error) {
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()
 	var file Config
-	if err := dec.Decode(&file); err != nil {
+	disk := fileConfig{Config: &file}
+	if err := dec.Decode(&disk); err != nil {
 		return cfg, fmt.Errorf("parse %s: %w", path, err)
 	}
 	// A config file holds one object. Decoder.More is only meaningful while
@@ -205,6 +206,15 @@ func Load(path string) (Config, error) {
 			return cfg, fmt.Errorf("parse %s: trailing data after the configuration object: %w", path, err)
 		}
 		return cfg, fmt.Errorf("parse %s: trailing data after the configuration object", path)
+	}
+
+	file.MaxPayloadBytes, err = parseSize(disk.MaxPayloadBytes, "max_payload_bytes")
+	if err != nil {
+		return cfg, fmt.Errorf("parse %s: %w", path, err)
+	}
+	file.MaxDropBytes, err = parseSize(disk.MaxDropBytes, "max_drop_bytes")
+	if err != nil {
+		return cfg, fmt.Errorf("parse %s: %w", path, err)
 	}
 
 	if file.Address != "" {
@@ -287,7 +297,7 @@ func (c Config) Save(path string) error {
 		}
 	}
 
-	data, err := json.MarshalIndent(c, "", "  ")
+	data, err := json.MarshalIndent(fileConfig{Config: &c, MaxPayloadBytes: sizeJSON(c.MaxPayloadBytes), MaxDropBytes: sizeJSON(c.MaxDropBytes)}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
 	}

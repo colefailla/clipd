@@ -96,14 +96,20 @@ Use -config <path> or CLIPD_CONFIG to select a different file.
   setting                default        meaning
   address                ~/.clipd.sock  UNIX socket path
   drop_dir               ~/Drop         folder for received files
-  max_payload_bytes      10485760       bytes per clipboard copy (10 MiB; max 1 GiB)
-  max_drop_bytes         268435456      bytes per drop (256 MiB; max 1 TiB)
+  max_payload_bytes      "10 MiB"       bytes per clipboard copy (max 1 GiB)
+  max_drop_bytes         "256 MiB"      bytes per drop (max 1 TiB)
   max_drop_files         256            files per drop (max 65536)
   max_concurrent         8              copies and drops at once (max 64)
   max_transfer_seconds   1800           seconds per transfer (30 minutes; max 24 hours)
 
-Sizes are bytes; times are seconds. For example, 10 GiB is 10737418240
-bytes and one hour is 3600 seconds.
+Byte limits accept integer bytes or quoted whole-number sizes: "5 GB" or
+"5 GiB". Separate the number and unit with a space. Units are case-insensitive:
+B, KB, MB, GB, TB, KiB, MiB, GiB, TiB. GB is 1000000000 bytes;
+GiB is 1073741824 bytes. Fractions are not accepted; use "1536 MiB" for 1.5 GiB.
+Times remain integer seconds; one hour is 3600.
+
+Install writes exact whole-unit sizes where possible. Existing numeric configs
+still work. Before downgrading to an older binary, convert strings to bytes.
 
 Omitted settings use their defaults. For numeric limits, 0 also uses the
 default; it does not mean unlimited. Unknown settings are rejected.
@@ -117,7 +123,7 @@ after editing them. On Linux, stop and restart 'clipd serve'.
 
 'clipd status' shows the resolved config and, for the macOS login service,
 warns when the file has been edited since the daemon started.
-Config files from older clipd releases are not migrated.`,
+Obsolete settings from pre-socket releases are rejected.`,
 
 	"security": `clipd help security
 

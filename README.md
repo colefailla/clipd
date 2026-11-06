@@ -204,15 +204,25 @@ writes the selected file with all settings filled in.
 |---|---|---|
 | `address` | `~/.clipd.sock` | UNIX socket path; TCP addresses are rejected |
 | `drop_dir` | `~/Drop` | folder for received files |
-| `max_payload_bytes` | `10485760` (10 MiB) | bytes per clipboard copy; max 1 GiB |
-| `max_drop_bytes` | `268435456` (256 MiB) | bytes per drop; max 1 TiB |
+| `max_payload_bytes` | `"10 MiB"` | bytes per clipboard copy; max 1 GiB |
+| `max_drop_bytes` | `"256 MiB"` | bytes per drop; max 1 TiB |
 | `max_drop_files` | `256` | files per drop; max 65536 |
 | `max_concurrent` | `8` | copies and drops at once; max 64 |
 | `max_transfer_seconds` | `1800` (30 minutes) | seconds per transfer; max 86400 (24 hours) |
 
-Sizes are bytes; times are seconds. Omitted settings use defaults. For numeric
+The two byte limits accept integer bytes (such as `5368709120`) or quoted
+whole-number sizes (such as `"5 GiB"`). Separate the number and unit with a
+space. Units are case-insensitive: B, KB, MB, GB, TB, KiB, MiB, GiB, TiB.
+GB means 1,000,000,000 bytes; GiB means 1,073,741,824 bytes.
+Fractions are not accepted; use `"1536 MiB"` for exactly 1.5 GiB.
+
+`clipd install` writes exact whole-unit sizes where possible and integer bytes
+otherwise. Older binaries only accept numeric byte values; convert size strings
+back to numbers before downgrading. Existing numeric configs still work.
+
+Times are seconds. Omitted settings use defaults. For numeric
 limits, `0` also means the default, not unlimited. Unknown settings and invalid
-values are rejected. Config files from older clipd releases are not migrated.
+values are rejected. Obsolete settings from pre-socket releases are rejected.
 
 `max_payload_bytes` multiplied by `max_concurrent` must not exceed 2 GiB.
 This bounds payload sizes, not total process memory; buffers and other state
@@ -248,7 +258,7 @@ An error identifies the limit you hit. For example, to allow drops up to
 
 ```json
 {
-  "max_drop_bytes": 21474836480,
+  "max_drop_bytes": "20 GiB",
   "max_transfer_seconds": 3600
 }
 ```
